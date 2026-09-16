@@ -10,5 +10,5 @@ pkgbase = opencode-start-menu
 	makedepends = rust
 	depends = opencode
 	depends = sudo
-	source = opencode-start-menu-1.0.0.tar.gz::URL_A_DEFINIR
+	source = opencode-start-menu-1.0.0.tar.gz::https://github.com/OPA-Technologies/opencode-start-menu/releases/download/v1.0.0/op-1.0.0-src.tar.gz
 	sha256sums = eeead512e53cbae7130e1d69f7666103f28b15ae253794cb3c9d0834a122e036

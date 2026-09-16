@@ -1,7 +1,6 @@
 # shellcheck disable=SC2034,SC2154,SC2164
 # Mainteneur : Opa <opa@localhost>
-# À renseigner avant soumission AUR : remplacer URL_A_DEFINIR par l'URL
-# publique du tarball op-$pkgver-src.tar.gz (source plainte AUR).
+# Source publique : release v$pkgver du repo GitHub (tarball src, sha256 suivi ci-dessous).
 pkgname=opencode-start-menu
 pkgver=1.0.0
 pkgrel=1
@@ -11,7 +10,7 @@ arch=('x86_64' 'aarch64')
 license=('GPL-3.0-or-later')
 depends=('opencode' 'sudo')
 makedepends=('cargo' 'rust')
-source=("opencode-start-menu-$pkgver.tar.gz::URL_A_DEFINIR")
+source=("opencode-start-menu-$pkgver.tar.gz::https://github.com/OPA-Technologies/opencode-start-menu/releases/download/v$pkgver/op-$pkgver-src.tar.gz")
 sha256sums=('eeead512e53cbae7130e1d69f7666103f28b15ae253794cb3c9d0834a122e036')
 
 build()
