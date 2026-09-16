@@ -10,6 +10,8 @@ URL: https://opencode.ai
 
 Source0: opencode-start-menu-%{version}.tar.gz
 
+BuildRequires: cargo
+
 %description
 Lanceur TUI des projets opencode : liste, recherche, lancement en session.
 
@@ -21,13 +23,12 @@ cargo build --release --locked
 
 %install
 install -Dm755 target/release/opencode-start-menu %{buildroot}/usr/bin/op
-install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 %clean
 rm -rf %{buildroot}
 
 %files
 /usr/bin/op
-%license %{_licensedir}/%{name}/LICENSE
+%license LICENSE
 
 %changelog
