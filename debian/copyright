@@ -1,0 +1,27 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: opencode-start-menu
+Upstream-Contact: Opa <opa@localhost>
+Source: <https://opencode.ai>
+
+Files: *
+Copyright: 2026 Opa <opa@localhost>
+License: GPL-3.0-or-later
+
+Files: LICENSE
+Copyright: 2007 Free Software Foundation, Inc. <https://fsf.org/>
+License: GPL-3.0-or-later
+ The license text is verbatim from https://www.gnu.org/licenses/gpl-3.0.txt
+
+License: GPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public
+ License version 3 can be found in '/usr/share/common-licenses/GPL-3'.

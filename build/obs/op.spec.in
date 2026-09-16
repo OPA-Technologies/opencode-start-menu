@@ -1,0 +1,33 @@
+#
+# Spec générique pour Open Build Service (openSUSE/Fedora/...).
+# Le binaire est construit depuis le source tarball (Source0).
+Name: opencode-start-menu
+Version: @VERSION@
+Release: 1
+Summary: OpenCode Start Menu - launcher interactif de projets opencode
+License: GPL-3.0-or-later
+URL: https://opencode.ai
+
+Source0: opencode-start-menu-%{version}.tar.gz
+
+%description
+Lanceur TUI des projets opencode : liste, recherche, lancement en session.
+
+%prep
+%setup -q
+
+%build
+cargo build --release --locked
+
+%install
+install -Dm755 target/release/opencode-start-menu %{buildroot}/usr/bin/op
+install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
+
+%clean
+rm -rf %{buildroot}
+
+%files
+/usr/bin/op
+%license %{_licensedir}/%{name}/LICENSE
+
+%changelog

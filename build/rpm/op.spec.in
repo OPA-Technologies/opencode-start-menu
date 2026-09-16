@@ -1,0 +1,28 @@
+Name: opencode-start-menu
+Version: @VERSION@
+Release: 1
+Summary: OpenCode Start Menu - launcher interactif de projets opencode
+License: GPL-3.0-or-later
+URL: https://opencode.ai
+BuildArch: @ARCH@
+BuildRoot: %{_tmppath}/%{name}-buildroot
+Source0: op
+Source1: LICENSE
+
+%description
+Lanceur TUI des projets opencode : liste, recherche, lancement en session.
+
+%build
+
+%install
+install -Dm755 %{SOURCE0} %{buildroot}/usr/local/bin/op
+install -Dm644 %{SOURCE1} %{buildroot}/usr/share/licenses/%{name}/LICENSE
+
+%clean
+rm -rf %{buildroot}
+
+%files
+/usr/local/bin/op
+%license /usr/share/licenses/%{name}/LICENSE
+
+%changelog

@@ -1,0 +1,14 @@
+pkgbase = opencode-start-menu
+	pkgdesc = Launcher TUI des projets opencode
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://opencode.ai
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = rust
+	depends = opencode
+	depends = sudo
+	source = opencode-start-menu-1.0.0.tar.gz::URL_A_DEFINIR
+	sha256sums = eeead512e53cbae7130e1d69f7666103f28b15ae253794cb3c9d0834a122e036

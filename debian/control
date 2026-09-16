@@ -1,0 +1,12 @@
+Source: opencode-start-menu
+Section: utils
+Priority: optional
+Maintainer: Opa <opa@localhost>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.6.2
+
+Package: opencode-start-menu
+Architecture: any
+Depends: ${misc:Depends}
+Description: OpenCode Start Menu - launcher interactif de projets opencode
+ Lanceur TUI des projets opencode : liste, recherche, lancement en session.
