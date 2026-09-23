@@ -199,51 +199,75 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
-    let (name, desc, modified, status, version) = if app.is_new_selected() {
+    let (name, id, path, desc, modified, status, version) = if app.is_new_selected() {
         (
-            "Nouveau projet",
-            "Créer un nouveau projet",
-            "—",
-            "à définir",
-            "à définir",
+            "Nouveau projet".to_string(),
+            "à définir".to_string(),
+            "à définir".to_string(),
+            "Créer un nouveau projet".to_string(),
+            "—".to_string(),
+            "à définir".to_string(),
+            "à définir".to_string(),
         )
     } else if let Some(idx) = app.selected_project_idx() {
         let p = &app.projects[idx];
         (
-            p.name.as_str(),
-            p.description.as_str(),
-            p.modified.as_str(),
-            if p.status.is_empty() { "—" } else { &p.status },
-            if p.version.is_empty() { "—" } else { &p.version },
+            p.name.clone(),
+            if p.id.is_empty() { "—".to_string() } else { p.id.clone() },
+            p.path.display().to_string(),
+            p.description.clone(),
+            p.modified.clone(),
+            if p.status.is_empty() { "—".to_string() } else { p.status.clone() },
+            if p.version.is_empty() { "—".to_string() } else { p.version.clone() },
         )
     } else {
-        ("", "", "", "", "")
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
     };
 
     let text = vec![
         Line::from(vec![
+            Span::styled("Nom          : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&name)),
+        ]),
+        Line::from(vec![
+            Span::styled("ID           : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&id)),
+        ]),
+        Line::from(vec![
+            Span::styled("Chemin       : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&path)),
+        ]),
+        Line::from(vec![
             Span::styled("Description  : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(desc)),
+            Span::raw(sanitize(&desc)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Modifié le   : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(modified)),
+            Span::raw(sanitize(&modified)),
         ]),
         Line::from(vec![
             Span::styled("Statut       : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(status)),
+            Span::raw(sanitize(&status)),
         ]),
         Line::from(vec![
             Span::styled("Version      : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(version)),
+            Span::raw(sanitize(&version)),
         ]),
     ];
 
     let paragraph = Paragraph::new(text)
         .block(
             Block::default()
-                .title(format!(" Détails — {} ", sanitize(name)))
+                .title(format!(" Détails — {} ", sanitize(&name)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
@@ -251,6 +275,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(paragraph, area);
 }
+
 
 fn render_help(f: &mut Frame, area: Rect, input_mode: &InputMode, _creation_state: &ProjectCreationState) {
     let help_text = match input_mode {
