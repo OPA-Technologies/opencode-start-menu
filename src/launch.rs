@@ -3,64 +3,120 @@ use std::{path::Path, process::Command};
 
 use crate::lock;
 
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-pub(crate) fn run_launch_sequence(name: &str, dir: &Path, sudo: bool) -> Result<()>
+/// Nature du lancement OpenCode demandé par le menu.
+pub(crate) enum LaunchKind
   {
-    // Le TUI est lancé avec --continue : il rouvre la dernière session du
-    // projet directement dans la vue chat (sinon l'écran d'accueil reste
-    // « stealth » tant qu'un texte n'est pas saisi). Les instructions du
-    // résumé sont transmises via OPENCODE_AUTO_RESUME : le plugin global
-    // projects-starter.ts les détecte, injecte la bulle « Generating
-    // Resume and Todo... » (visible) et cache les instructions dans le
-    // champ « system » du prompt.
-    let _lock = lock::acquire(dir)?;
+    /// Relance du projet : verrou, résumé via OPENCODE_AUTO_RESUME et
+    /// `opencode --continue` (avec `sudo -i` quand demandé).
+    Resume,
 
-    if sudo && !cfg!(unix) {
-        return Err(anyhow!(
-            "le mode --root (sudo) n'est pas supporté sur cette plateforme"
-        ));
-    }
+    /// Session « à blanc » : `opencode` vierge, sans verrou, sans résumé,
+    /// sans todo, sans liste de projets, sans `--continue`, sans sudo.
+    Bare,
+  }
 
-    let prompt = format!(
-      "Résumé d'avancement du projet « {name} ».\n\
-      Produis un résumé concis et structuré :\n\
-      1. Où en est le projet (statut, dernières modifications, tâches récentes).\n\
-      2. Points de vigilance éventuels.\n\
-      3. Prochaines étapes : crée une todo list (todowrite) des 3 à 5\n\
-      actions concrètes à faire ensuite.\n\
-      Utilise git log --oneline -15, git status, git diff --stat, ls,\n\
-      et les fichiers de config. Réponds en français, format court."
-    );
+fn shell_quote(s: &str) -> String
+  {
+    format!("'{}'", s.replace('\'', "'\\''"))
+  }
 
-    let status = if sudo
+fn report(status: std::process::ExitStatus) -> Result<()>
+  {
+    if status.success()
       {
-        let cmd = format!(
-          "cd {} && OPENCODE_AUTO_RESUME={} opencode --continue",
-          shell_quote(&dir.to_string_lossy()),
-          shell_quote(&prompt),
-        );
-        Command::new("sudo").args(["-i", "-c", &cmd]).status()
+        Ok(())
       }
     else
       {
-        Command::new("opencode")
-          .env("OPENCODE_AUTO_RESUME", &prompt)
-          .arg("--continue")
-          .current_dir(dir)
-          .status()
+        Err(anyhow!(
+          "opencode a échoué (code de sortie {:?})",
+          status.code()
+        ))
+      }
+  }
+
+/// Lance l'exécutable `opencode` dans le dossier `dir`.
+///
+/// Résume : le TUI est lancé avec `--continue` : il rouvre la dernière
+/// session du projet directement dans la vue chat (sinon l'écran d'accueil
+/// reste « stealth » tant qu'un texte n'est pas saisi). Les instructions du
+/// résumé sont transmises via OPENCODE_AUTO_RESUME : le plugin global
+/// projects-starter.ts les détecte, injecte la bulle « Generating Resume
+/// and Todo... » (visible) et cache les instructions dans le champ
+/// « system » du prompt.
+///
+/// Vierge : `opencode` est lancé sans argument dans `dir` ; aucun résumé,
+/// aucune todo, aucune liste de projets, aucune session à rouvrir.
+pub(crate) fn run_launch_sequence(
+  kind: LaunchKind,
+  name: &str,
+  dir: &Path,
+  sudo: bool,
+) -> Result<()>
+  {
+    // Verrou : indispensable pour un résumé (empêche deux lancements
+    // simultanés du même projet). Inutile pour une session vierge : aucun
+    // registre de projet n'est touché, on ne fait que lancer opencode.
+    let _lock = match kind
+      {
+        LaunchKind::Resume => Some(lock::acquire(dir)?),
+        LaunchKind::Bare => None,
       };
 
-    match status
+    if matches!(kind, LaunchKind::Resume) && sudo && !cfg!(unix)
       {
-        Ok(code) if code.success() => Ok(()),
-        Ok(code) => Err(anyhow!(
-          "opencode a échoué (code de sortie {:?})",
-          code.code()
-        )),
-        Err(e) => Err(anyhow!("échec du lancement d'opencode : {e}")),
+        return Err(anyhow!(
+          "le mode --root (sudo) n'est pas supporté sur cette plateforme"
+        ));
+      }
+
+    match kind
+      {
+        LaunchKind::Bare =>
+          {
+            let status = Command::new("opencode")
+              .current_dir(dir)
+              .status()
+              .map_err(|e| anyhow!("échec du lancement d'opencode : {e}"))?;
+            report(status)
+          }
+
+        LaunchKind::Resume =>
+          {
+            let prompt = format!(
+              "Résumé d'avancement du projet « {name} ».\n\
+              Produis un résumé concis et structuré :\n\
+              1. Où en est le projet (statut, dernières modifications, tâches récentes).\n\
+              2. Points de vigilance éventuels.\n\
+              3. Prochaines étapes : crée une todo list (todowrite) des 3 à 5\n\
+              actions concrètes à faire ensuite.\n\
+              Utilise git log --oneline -15, git status, git diff --stat, ls,\n\
+              et les fichiers de config. Réponds en français, format court."
+            );
+
+            let status = if sudo
+              {
+                let cmd = format!(
+                  "cd {} && OPENCODE_AUTO_RESUME={} opencode --continue",
+                  shell_quote(&dir.to_string_lossy()),
+                  shell_quote(&prompt),
+                );
+                Command::new("sudo")
+                  .args(["-i", "-c", &cmd])
+                  .status()
+                  .map_err(|e| anyhow!("échec du lancement d'opencode : {e}"))?
+              }
+            else
+              {
+                Command::new("opencode")
+                  .env("OPENCODE_AUTO_RESUME", &prompt)
+                  .arg("--continue")
+                  .current_dir(dir)
+                  .status()
+                  .map_err(|e| anyhow!("échec du lancement d'opencode : {e}"))?
+              };
+            report(status)
+          }
       }
   }
 

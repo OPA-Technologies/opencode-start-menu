@@ -23,7 +23,7 @@ mod perms;
 mod registry;
 mod ui;
 
-use crate::launch::run_launch_sequence;
+use crate::launch::{run_launch_sequence, LaunchKind};
 use crate::registry::ProjectEntry;
 
 #[derive(Parser, Debug)]
@@ -64,6 +64,7 @@ pub(crate) struct App {
     pending_launch: Option<PathBuf>,
     pending_sudo: bool,
     pending_name: Option<String>,
+    pending_bare: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -109,6 +110,7 @@ impl App {
             pending_launch: None,
             pending_sudo: false,
             pending_name: None,
+            pending_bare: false,
         };
         match registry::load_registry(&app.registry_path) {
             Ok(projects) => app.projects = projects,
@@ -158,12 +160,13 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.filtered.is_empty() {
+        let total = self.entry_count();
+        if total == 0 {
             return;
         }
         let i = match self.list_state.selected() {
             Some(i) => {
-                if i >= self.filtered.len() + (self.show_new as usize) - 1 {
+                if i + 1 >= total {
                     0
                 } else {
                     i + 1
@@ -175,13 +178,14 @@ impl App {
     }
 
     fn previous(&mut self) {
-        if self.filtered.is_empty() {
+        let total = self.entry_count();
+        if total == 0 {
             return;
         }
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.filtered.len() + (self.show_new as usize) - 1
+                    total - 1
                 } else {
                     i - 1
                 }
@@ -191,23 +195,47 @@ impl App {
         self.list_state.select(Some(i));
     }
 
-    pub(crate) fn selected_project_idx(&self) -> Option<usize> {
-        self.list_state.selected().and_then(|sel| {
-            if sel < self.filtered.len() {
-                Some(self.filtered[sel])
-            } else {
-                None
-            }
-        })
+    /// Nombre d'entrées affichées : projets filtrés + éventuel « Nouveau
+    /// projet » + entrée permanente « Sans projet ».
+    fn entry_count(&self) -> usize {
+        self.filtered.len() + (self.show_new as usize) + 1
     }
 
+    pub(crate) fn is_bare_selected(&self) -> bool {
+        self.list_state.selected() == Some(self.filtered.len() + (self.show_new as usize))
+    }
+
+    /// Prépare une session vierge dans `$HOME` : aucun verrou, aucun résumé,
+    /// aucune todo, aucune liste de projets, aucun `--continue`, aucun sudo.
+    pub(crate) fn set_bare_launch(&mut self) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        self.pending_launch = Some(home);
+        self.pending_bare = true;
+        self.pending_sudo = false;
+        self.pending_name = Some("Sans projet".to_string());
+    }
+
+    /// L'entrée « Nouveau projet » (index `filtered.len()`) est sélectionnée.
     pub(crate) fn is_new_selected(&self) -> bool {
-        self.show_new
-            && self.list_state.selected() == Some(self.filtered.len())
+        self.show_new && self.list_state.selected() == Some(self.filtered.len())
+    }
+
+    /// Index du projet (`self.projects[idx]`) correspondant à la sélection,
+    /// ou `None` si l'entrée « Nouveau projet » ou « Sans projet » est choisie.
+    pub(crate) fn selected_project_idx(&self) -> Option<usize> {
+        let sel = self.list_state.selected()?;
+        if sel < self.filtered.len() {
+            Some(self.filtered[sel])
+        } else {
+            None
+        }
     }
 
     fn confirm_selection(&mut self) -> Option<InputMode> {
-        if self.is_new_selected() {
+        if self.is_bare_selected() {
+            self.set_bare_launch();
+            None
+        } else if self.is_new_selected() {
             Some(InputMode::CreatingProject(ProjectCreationState::default()))
         } else if let Some(idx) = self.selected_project_idx() {
             self.launch(idx);
@@ -313,7 +341,7 @@ fn main() -> Result<()> {
         if let Some(dir) = app.pending_launch.take() {
             let name = app.pending_name.take()
                 .unwrap_or_else(|| dir.display().to_string());
-            run_launch_sequence(&name, &dir, app.pending_sudo)?;
+            run_launch_sequence(LaunchKind::Resume, &name, &dir, app.pending_sudo)?;
         }
         return Ok(());
     }
@@ -459,7 +487,13 @@ fn run_tui(mut app: App) -> Result<()> {
             terminal.backend_mut().flush()?;
 
             // Résumé + lancement d'opencode
-            if let Err(e) = run_launch_sequence(&name, &dir, sudo) {
+            let kind = if app.pending_bare {
+                LaunchKind::Bare
+            } else {
+                LaunchKind::Resume
+            };
+            app.pending_bare = false;
+            if let Err(e) = run_launch_sequence(kind, &name, &dir, sudo) {
                 app.status_message = Some(format!("Échec du lancement : {e}"));
             }
 

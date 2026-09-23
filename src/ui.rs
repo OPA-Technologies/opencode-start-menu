@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use std::path::PathBuf;
@@ -271,8 +271,8 @@ fn render_help(f: &mut Frame, area: Rect, input_mode: &InputMode, _creation_stat
 }
 
 fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState) {
-    let dialog_width = size.width.min(70);
-    let dialog_height = 14;
+    let dialog_width = size.width.min(72);
+    let dialog_height = 16;
     let x = (size.width.saturating_sub(dialog_width)) / 2;
     let y = (size.height.saturating_sub(dialog_height)) / 2;
 
@@ -283,13 +283,28 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         height: dialog_height,
     };
 
+    // Fond opaque : efface la zone puis repeint tout en gris foncé
+    f.render_widget(Clear, area);
+
+    let opaque = Style::default().bg(Color::DarkGray);
+
     let block = Block::default()
         .title(" Nouveau projet ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+        .style(opaque);
 
-    let lines = vec![
+    let prompt_desc = match state.step {
+        0 => "Attendu : identifiant court et unique — lettres/chiffres/tirets (ex : mon-projet)",
+        1 => "Attendu : nom d'affichage du projet (Entrée = reprend l'ID)",
+        2 => "Attendu : chemin du dossier (Entrée = ~/projets/<id>)",
+        3 => "Attendu : description courte du projet (facultatif)",
+        4 => "Attendu : 1=Alpha, 2=Beta, 3=Validation, 4=Clôturé (Entrée = aucun)",
+        5 => "Attendu : version (ex : 0.1), facultatif",
+        _ => "Attendu : o/N pour ouvrir le projet dès maintenant",
+    };
+
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("ID            : ", Style::default().fg(Color::DarkGray)),
@@ -325,10 +340,19 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
             Span::styled("█", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
+        Line::from(Span::styled(prompt_desc, Style::default().fg(Color::Yellow))).centered(),
         Line::from("Échap pour annuler  ·  Entrée pour valider").centered(),
     ];
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    // Remplit les lignes restantes pour un fond entièrement opaque
+    while lines.len() < dialog_height.saturating_sub(2) as usize {
+        lines.push(Line::from(""));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(opaque)
+        .wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
@@ -393,7 +417,7 @@ fn render_module_dialog(
         .title(" Module ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(Color::DarkGray));
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
