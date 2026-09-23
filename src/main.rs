@@ -417,6 +417,10 @@ fn run_tui(mut app: App) -> Result<()> {
                             InputMode::Normal
                         }
                     }
+                    KeyCode::Char('v') => {
+                        app.set_bare_launch();
+                        InputMode::Normal
+                    }
                     _ => InputMode::Normal,
                 },
                 InputMode::SelectModule {

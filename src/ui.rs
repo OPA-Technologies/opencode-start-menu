@@ -173,6 +173,18 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
         ))));
     }
 
+    // Entrée permanente « Sans projet » (index filtered.len()+show_new)
+    let bare_sel = app.is_bare_selected();
+    let bare_style = if bare_sel {
+        Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  Sans projet  (v)",
+        bare_style,
+    ))));
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -307,35 +319,35 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("ID            : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("ID            : ", Style::default().fg(Color::Cyan)),
             Span::raw(&state.id),
         ]),
         Line::from(vec![
-            Span::styled("Nom           : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Nom           : ", Style::default().fg(Color::Cyan)),
             Span::raw(&state.name),
         ]),
         Line::from(vec![
-            Span::styled("Chemin        : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Chemin        : ", Style::default().fg(Color::Cyan)),
             Span::raw(&state.path),
         ]),
         Line::from(vec![
-            Span::styled("Description   : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Description   : ", Style::default().fg(Color::Cyan)),
             Span::raw(&state.description),
         ]),
         Line::from(vec![
-            Span::styled("Statut        : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Statut        : ", Style::default().fg(Color::Cyan)),
             Span::raw(match &state.status {
                 Some(s) => s.clone(),
                 None => "(aucun)".to_string(),
             }),
         ]),
         Line::from(vec![
-            Span::styled("Version       : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Version       : ", Style::default().fg(Color::Cyan)),
             Span::raw(&state.version),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Saisie : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Saisie : ", Style::default().fg(Color::Cyan)),
             Span::raw(&state.input_buffer),
             Span::styled("█", Style::default().fg(Color::White)),
         ]),
@@ -365,7 +377,7 @@ fn render_module_dialog(
 ) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("Projet : ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Projet : ", Style::default().fg(Color::Cyan)),
         Span::styled(
             sanitize(project_name),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
