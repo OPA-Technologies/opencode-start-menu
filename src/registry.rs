@@ -17,6 +17,12 @@ pub(crate) struct Project {
     status: String,
     #[serde(default)]
     version: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    used_pct: String,
+    #[serde(default)]
+    spent: String,
     #[serde(default = "default_true")]
     active: bool,
 }
@@ -39,6 +45,9 @@ pub(crate) struct ProjectEntry {
     pub(crate) description: String,
     pub(crate) status: String,
     pub(crate) version: String,
+    pub(crate) token: String,
+    pub(crate) used_pct: String,
+    pub(crate) spent: String,
     pub(crate) modified: String,
 }
 
@@ -66,6 +75,9 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 description: p.description,
                 status: p.status,
                 version: p.version,
+                token: p.token,
+                used_pct: p.used_pct,
+                spent: p.spent,
                 modified,
             }
         })
@@ -86,6 +98,9 @@ pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()
                 description: p.description.clone(),
                 status: p.status.clone(),
                 version: p.version.clone(),
+                token: p.token.clone(),
+                used_pct: p.used_pct.clone(),
+                spent: p.spent.clone(),
                 active: true,
             },
         );
@@ -191,6 +206,9 @@ mod tests
                 description: "desc".to_string(),
                 status: "En-cours Beta".to_string(),
                 version: "1.0.0".to_string(),
+                token: String::new(),
+                used_pct: String::new(),
+                spent: String::new(),
                 modified: "—".to_string(),
             }],
         )
@@ -225,6 +243,9 @@ mod tests
                     description: String::new(),
                     status: String::new(),
                     version: String::new(),
+                    token: String::new(),
+                    used_pct: String::new(),
+                    spent: String::new(),
                     modified: "—".to_string(),
                 }],
             )

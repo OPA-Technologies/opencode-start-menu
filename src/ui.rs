@@ -199,7 +199,7 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
-    let (name, id, path, desc, modified, status, version) = if app.is_new_selected() {
+    let (name, id, path, desc, modified, status, version, token, used_pct, spent) = if app.is_new_selected() {
         (
             "Nouveau projet".to_string(),
             "à définir".to_string(),
@@ -208,6 +208,9 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             "—".to_string(),
             "à définir".to_string(),
             "à définir".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
         )
     } else if let Some(idx) = app.selected_project_idx() {
         let p = &app.projects[idx];
@@ -219,6 +222,9 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             p.modified.clone(),
             if p.status.is_empty() { "—".to_string() } else { p.status.clone() },
             if p.version.is_empty() { "—".to_string() } else { p.version.clone() },
+            if p.token.is_empty() { "—".to_string() } else { p.token.clone() },
+            if p.used_pct.is_empty() { "—".to_string() } else { p.used_pct.clone() },
+            if p.spent.is_empty() { "—".to_string() } else { p.spent.clone() },
         )
     } else {
         (
@@ -229,40 +235,71 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
         )
     };
 
-    let text = vec![
-        Line::from(vec![
-            Span::styled("Nom          : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&name)),
-        ]),
-        Line::from(vec![
-            Span::styled("ID           : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&id)),
-        ]),
-        Line::from(vec![
-            Span::styled("Chemin       : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&path)),
-        ]),
-        Line::from(vec![
-            Span::styled("Description  : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&desc)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Modifié le   : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&modified)),
-        ]),
-        Line::from(vec![
-            Span::styled("Statut       : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&status)),
-        ]),
-        Line::from(vec![
-            Span::styled("Version      : ", Style::default().fg(Color::DarkGray)),
-            Span::raw(sanitize(&version)),
-        ]),
-    ];
+    let sep = || {
+        Line::from(vec![Span::styled(
+            "══════════",
+            Style::default().fg(Color::DarkGray),
+        )])
+        .centered()
+    };
+
+    let mut text: Vec<Line> = Vec::new();
+    // Groupe 1
+    text.push(Line::from(vec![
+        Span::styled("Nom          : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&name)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("ID           : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&id)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("Chemin       : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&path)),
+    ]));
+    text.push(sep());
+    text.push(Line::from(""));
+    // Groupe 2
+    text.push(Line::from(vec![
+        Span::styled("Description  : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&desc)),
+    ]));
+    text.push(sep());
+    text.push(Line::from(""));
+    // Groupe 3
+    text.push(Line::from(vec![
+        Span::styled("Version      : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&version)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("Statut       : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&status)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("Modifié le   : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&modified)),
+    ]));
+    text.push(sep());
+    text.push(Line::from(""));
+    // Groupe 4
+    text.push(Line::from(vec![
+        Span::styled("Token        : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&token)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("%Utilisé     : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&used_pct)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("$Dépensé     : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&spent)),
+    ]));
 
     let paragraph = Paragraph::new(text)
         .block(

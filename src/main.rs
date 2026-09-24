@@ -728,6 +728,9 @@ fn handle_creation_input(
                     description: state.description.clone(),
                     status: status.clone().unwrap_or_default(),
                     version: state.version.clone(),
+                    token: String::new(),
+                    used_pct: String::new(),
+                    spent: String::new(),
                     modified: "—".to_string(),
                 });
                 registry::save_registry(&app.registry_path, &app.projects)?;
