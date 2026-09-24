@@ -85,7 +85,7 @@ pub(crate) enum InputMode {
 
 #[derive(Clone, Default)]
 pub(crate) struct ProjectCreationState {
-    pub(crate) step: usize,
+    pub(crate) active_field: usize,
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) path: String,
@@ -93,6 +93,10 @@ pub(crate) struct ProjectCreationState {
     pub(crate) status: Option<String>,
     pub(crate) version: String,
     pub(crate) input_buffer: String,
+    pub(crate) input_offset: usize,
+    pub(crate) confirm_status: bool,
+    pub(crate) rewrite_mode: bool,
+    pub(crate) known_statuses: Vec<String>,
 }
 
 impl App {
@@ -117,6 +121,11 @@ impl App {
             Err(e) => {
                 app.status_message = Some(format!("Registre illisible : {e}"));
             }
+        }
+        // Rescan au démarrage : chaque projet est relu depuis son Cargo.toml disque,
+        // pour que la liste reflète l'état réel du répertoire éponyme dès l'affichage.
+        if let Err(e) = rescan_repertoire(&mut app) {
+            app.status_message = Some(format!("Rescan au démarrage échoué : {e}"));
         }
         app.filtered = (0..app.projects.len()).collect();
         if !app.projects.is_empty() {
@@ -380,6 +389,10 @@ fn run_tui(mut app: App) -> Result<()> {
 
             input_mode = match input_mode {
                 InputMode::Normal => match key.code {
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        rescan_repertoire(&mut app)?;
+                        InputMode::Normal
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.next();
@@ -522,25 +535,120 @@ fn run_tui(mut app: App) -> Result<()> {
     Ok(())
 }
 
+// Remonte le buffer du champ actif depuis sa valeur propre.
+fn load_creation_field(state: &mut ProjectCreationState) {
+    state.input_buffer = match state.active_field {
+        0 => state.id.clone(),
+        1 => state.name.clone(),
+        2 => state.path.clone(),
+        3 => state.description.clone(),
+        4 => state.status.clone().unwrap_or_default(),
+        5 => state.version.clone(),
+        _ => String::new(),
+    };
+    state.input_offset = state.input_buffer.len();
+    state.rewrite_mode = true;
+}
+
+fn rescan_repertoire(app: &mut App) -> Result<()> {
+    let mut changed = 0usize;
+    for entry in &mut app.projects {
+        let cargo = entry.path.join("Cargo.toml");
+        if let Ok(content) = fs::read_to_string(&cargo) {
+            let mut new_version = None;
+            for line in content.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("version") {
+                    if let Some(r2) = rest.trim_start().strip_prefix('=') {
+                        let v = r2.trim().trim_matches('"');
+                        if !v.is_empty() {
+                            new_version = Some(v.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+            if let Some(v) = new_version {
+                entry.version = v;
+                changed += 1;
+            }
+        }
+    }
+    if changed > 0 {
+        registry::save_registry(&app.registry_path, &app.projects)?;
+        app.status_message =
+            Some(format!("Rescan : {changed} version(s) resynchronisée(s) depuis le disque"));
+    } else {
+        app.status_message = Some("Rescan : base déjà alignée sur le disque".to_string());
+    }
+    app.filtered = (0..app.projects.len()).collect();
+    Ok(())
+}
+
 fn handle_creation_input(
     key: event::KeyEvent,
     state: &mut ProjectCreationState,
     app: &mut App,
 ) -> Result<InputMode> {
+    const FIELD_COUNT: usize = 6;
     match key.code {
         KeyCode::Esc => {
             return Ok(InputMode::Normal);
         }
+        KeyCode::Up | KeyCode::Down => {
+            if state.confirm_status {
+                state.confirm_status = false;
+            }
+            let delta = if key.code == KeyCode::Up {
+                usize::MAX
+            } else {
+                1
+            };
+            if delta == 1 && state.active_field < FIELD_COUNT {
+                state.active_field += 1;
+            } else if delta == usize::MAX && state.active_field > 0 {
+                state.active_field -= 1;
+            }
+            load_creation_field(state);
+            return Ok(InputMode::CreatingProject(state.clone()));
+        }
+        KeyCode::Left => {
+            if state.input_offset > 0 {
+                state.input_offset -= 1;
+            }
+            state.rewrite_mode = false;
+            return Ok(InputMode::CreatingProject(state.clone()));
+        }
+        KeyCode::Right => {
+            if state.input_offset < state.input_buffer.len() {
+                state.input_offset += 1;
+            }
+            state.rewrite_mode = false;
+            return Ok(InputMode::CreatingProject(state.clone()));
+        }
+        KeyCode::Backspace => {
+            if state.input_offset > 0 {
+                let idx = state.input_offset - 1;
+                state.input_buffer.remove(idx);
+                state.input_offset = idx;
+                state.rewrite_mode = false;
+            }
+            return Ok(InputMode::CreatingProject(state.clone()));
+        }
         KeyCode::Enter => {
-            match state.step {
+            // Confirmation d'un nouveau statut hors liste : o/N décidé lors de la frappe.
+            if state.confirm_status {
+                return Ok(InputMode::CreatingProject(state.clone()));
+            }
+            match state.active_field {
                 0 => {
                     let id = state.input_buffer.trim().replace(' ', "-");
                     if id.is_empty() {
                         return Ok(InputMode::Normal);
                     }
                     state.id = id;
-                    state.step = 1;
-                    state.input_buffer.clear();
+                    state.active_field = 1;
+                    load_creation_field(state);
                 }
                 1 => {
                     state.name = if state.input_buffer.trim().is_empty() {
@@ -548,92 +656,134 @@ fn handle_creation_input(
                     } else {
                         state.input_buffer.trim().to_string()
                     };
-                    state.step = 2;
-                    state.input_buffer.clear();
+                    state.active_field = 2;
+                    load_creation_field(state);
                 }
                 2 => {
                     state.path = state.input_buffer.trim().to_string();
-                    state.step = 3;
-                    state.input_buffer.clear();
+                    state.active_field = 3;
+                    load_creation_field(state);
                 }
                 3 => {
                     state.description = state.input_buffer.trim().to_string();
-                    state.step = 4;
-                    state.input_buffer.clear();
+                    state.active_field = 4;
+                    load_creation_field(state);
                 }
                 4 => {
-                    // Status selection
-                    match state.input_buffer.trim() {
-                        "1" => state.status = Some("En-cours Alpha".to_string()),
-                        "2" => state.status = Some("En-cours Beta".to_string()),
-                        "3" => state.status = Some("En-cours Validation Final".to_string()),
-                        "4" => state.status = Some("Clôturé".to_string()),
-                        _ => state.status = None,
-                    }
-                    state.step = 5;
-                    state.input_buffer.clear();
+                    let value = state.input_buffer.trim().to_string();
+                    if value.is_empty() {
+                        state.status = None;
+                        state.active_field = 5;
+                        load_creation_field(state);
+                    } else if state.known_statuses.iter().any(|s| s == &value) {
+                        state.status = Some(value);
+                        state.active_field = 5;
+                        load_creation_field(state);
+                    } else {
+                        state.confirm_status = true;
+                            }
                 }
                 5 => {
                     state.version = state.input_buffer.trim().to_string();
-                    // Save project
-                    let dir = if state.path.is_empty() {
-                        dirs::home_dir()
-                            .unwrap_or_else(|| PathBuf::from("."))
-                            .join("projets")
-                            .join(&state.id)
-                    } else {
-                        PathBuf::from(shellexpand::tilde(&state.path).to_string())
-                    };
+                    state.active_field = 6;
+                    load_creation_field(state);
+                }
+                // Champ de confirmation final o/N : créer le projet (bloc conservé).
+                _ => {                let dir = if state.path.is_empty() {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("projets")
+                        .join(&state.id)
+                } else {
+                    PathBuf::from(shellexpand::tilde(&state.path).to_string())
+                };
 
-                    fs::create_dir_all(&dir)?;
-                    if !dir.join("opencode.json").exists() {
-                        fs::write(
-                            dir.join("opencode.json"),
-                            r#"{
+                fs::create_dir_all(&dir)?;
+                if !dir.join("opencode.json").exists() {
+                    fs::write(
+                        dir.join("opencode.json"),
+                        r#"{
   "$schema": "https://opencode.ai/config.json",
   "instructions": ["~/.config/opencode/instructions.md"]
 }"#,
-                        )?;
-                    }
-
-                    app.projects.push(ProjectEntry {
-                        id: state.id.clone(),
-                        name: state.name.clone(),
-                        path: dir.clone(),
-                        description: state.description.clone(),
-                        status: state.status.clone().unwrap_or_default(),
-                        version: state.version.clone(),
-                        modified: "—".to_string(),
-                    });
-                    registry::save_registry(&app.registry_path, &app.projects)?;
-
-                    // Launch?
-                    state.step = 6;
-                    state.input_buffer.clear();
+                    )?;
                 }
-                6 => {
-                    if matches!(state.input_buffer.to_lowercase().as_str(), "o" | "oui" | "y" | "yes") {
-                        let dir = if state.path.is_empty() {
-                            dirs::home_dir()
-                                .unwrap_or_else(|| PathBuf::from("."))
-                                .join("projets")
-                                .join(&state.id)
+
+                let status = state
+                    .status
+                    .clone()
+                    .or_else(|| {
+                        let v = state.input_buffer.trim();
+                        if v.is_empty() {
+                            None
                         } else {
-                            PathBuf::from(shellexpand::tilde(&state.path).to_string())
-                        };
-                        app.pending_launch = Some(dir);
-                        app.pending_sudo = false;
-                    }
-                    return Ok(InputMode::Normal);
+                            Some(v.to_string())
+                        }
+                    });
+
+                app.projects.push(ProjectEntry {
+                    id: state.id.clone(),
+                    name: state.name.clone(),
+                    path: dir.clone(),
+                    description: state.description.clone(),
+                    status: status.clone().unwrap_or_default(),
+                    version: state.version.clone(),
+                    modified: "—".to_string(),
+                });
+                registry::save_registry(&app.registry_path, &app.projects)?;
+
+                if matches!(
+                    state.input_buffer.to_lowercase().as_str(),
+                    "o" | "oui" | "y" | "yes"
+                ) && status.is_some()
+                {
+                    app.pending_launch = Some(dir);
+                    app.pending_sudo = false;
                 }
-                _ => {}
+                return Ok(InputMode::Normal);
+                }
             }
-        }
-        KeyCode::Backspace => {
-            state.input_buffer.pop();
+            return Ok(InputMode::CreatingProject(state.clone()));
         }
         KeyCode::Char(c) => {
-            state.input_buffer.push(c);
+            // Décision o/N sur la confirmation d'un statut hors liste.
+            if state.confirm_status {
+                match c {
+                    'o' | 'O' => {
+                        let value = state.input_buffer.trim().to_string();
+                        let value = if value.is_empty() {
+                            state.status.clone().unwrap_or_default()
+                        } else {
+                            if !state.known_statuses.contains(&value) {
+                                state.known_statuses.push(value.clone());
+                            }
+                            value
+                        };
+                        state.status = Some(value.clone());
+                        state.confirm_status = false;
+                        state.active_field = 5;
+                        load_creation_field(state);
+                    }
+                    'n' | 'N' => {
+                        state.status = None;
+                        state.input_buffer.clear();
+                        state.confirm_status = false;
+                        state.active_field = 4;
+                        state.rewrite_mode = true;
+                    }
+                    _ => {}
+                }
+                return Ok(InputMode::CreatingProject(state.clone()));
+            }
+            if state.rewrite_mode && state.input_offset >= state.input_buffer.len() {
+                state.input_buffer = c.to_string();
+                state.input_offset = 1;
+                state.rewrite_mode = false;
+            } else {
+                state.input_buffer.insert(state.input_offset, c);
+                state.input_offset += 1;
+            }
+            return Ok(InputMode::CreatingProject(state.clone()));
         }
         _ => {}
     }

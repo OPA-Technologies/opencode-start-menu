@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -284,19 +284,14 @@ fn render_help(f: &mut Frame, area: Rect, input_mode: &InputMode, _creation_stat
             "↑/↓ Choisir module  ·  Entrée Ouvrir  ·  Échap Annuler"
         }
         InputMode::CreatingProject(state) => {
-            const PROMPTS: &[&str] = &[
-                "ID (lettres/chiffres/tirets) : ",
-                "Nom (Entrée = ID) : ",
-                "Chemin (Entrée = ~/projets/<id>) : ",
-                "Description : ",
-                "Statut (1=Alpha, 2=Beta, 3=Validation, 4=Clôturé, Entrée=aucun) : ",
-                "Version (ex: 0.1) : ",
-                "Ouvrir maintenant ? (o/N) : ",
-            ];
-            if state.step < PROMPTS.len() {
-                PROMPTS[state.step]
-            } else {
-                "Terminé"
+            match state.active_field {
+                0 => "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant",
+                1 => "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant",
+                2 => "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant",
+                3 => "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant",
+                4 => "↑/↓ changer de champ  ·  ↔ déplacer le curseur  ·  Entrée : confirmer ou nouveau statut",
+                5 => "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant",
+                _ => "o = créer et ouvrir  ·  N = ouvrir sans créer  ·  Entrée = o"
             }
         }
     };
@@ -307,12 +302,21 @@ fn render_help(f: &mut Frame, area: Rect, input_mode: &InputMode, _creation_stat
     f.render_widget(paragraph, area);
 }
 
-fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState) {
-    let dialog_width = size.width.min(72);
-    let dialog_height = 16;
-    let x = (size.width.saturating_sub(dialog_width)) / 2;
-    let y = (size.height.saturating_sub(dialog_height)) / 2;
+/// Champ de formulaire : texte affiché (ou « (vide) » si aucun contenu).
+fn field_text(v: &str) -> String {
+    let t = v.trim();
+    if t.is_empty() {
+        "(vide)".to_string()
+    } else {
+        t.to_string()
+    }
+}
 
+fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState) {
+    let dialog_width = size.width.min(76);
+    let dialog_height = 15;
+    let x = (size.width.saturating_sub(dialog_width)) / 2;
+    let y = (size.height.saturating_sub(dialog_height)) / 2     ;
     let area = Rect {
         x,
         y,
@@ -331,55 +335,62 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         .border_style(Style::default().fg(Color::Cyan))
         .style(opaque);
 
-    let prompt_desc = match state.step {
-        0 => "Attendu : identifiant court et unique — lettres/chiffres/tirets (ex : mon-projet)",
-        1 => "Attendu : nom d'affichage du projet (Entrée = reprend l'ID)",
-        2 => "Attendu : chemin du dossier (Entrée = ~/projets/<id>)",
-        3 => "Attendu : description courte du projet (facultatif)",
-        4 => "Attendu : 1=Alpha, 2=Beta, 3=Validation, 4=Clôturé (Entrée = aucun)",
-        5 => "Attendu : version (ex : 0.1), facultatif",
-        _ => "Attendu : o/N pour ouvrir le projet dès maintenant",
+    // Lignes : libellé aligné + valeur. Le champ actif est surligné (REVERSED).
+    let active = state.active_field.min(6);
+    let fields: [(&str, String); 6] = [
+        ("ID           ", field_text(&state.id)),
+        ("Nom          ", field_text(&state.name)),
+        ("Chemin       ", field_text(&state.path)),
+        ("Description  ", field_text(&state.description)),
+        ("Statut       ", state.status.clone().unwrap_or_else(|| "(aucun)".to_string())),
+        ("Version      ", field_text(&state.version)),
+    ];
+
+    let lbl_style = |i: usize| -> Style {
+        if i == active {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Cyan)
+        }
     };
 
     let mut lines = vec![
         Line::from(""),
-        Line::from(vec![
-            Span::styled("ID            : ", Style::default().fg(Color::Cyan)),
-            Span::raw(&state.id),
-        ]),
-        Line::from(vec![
-            Span::styled("Nom           : ", Style::default().fg(Color::Cyan)),
-            Span::raw(&state.name),
-        ]),
-        Line::from(vec![
-            Span::styled("Chemin        : ", Style::default().fg(Color::Cyan)),
-            Span::raw(&state.path),
-        ]),
-        Line::from(vec![
-            Span::styled("Description   : ", Style::default().fg(Color::Cyan)),
-            Span::raw(&state.description),
-        ]),
-        Line::from(vec![
-            Span::styled("Statut        : ", Style::default().fg(Color::Cyan)),
-            Span::raw(match &state.status {
-                Some(s) => s.clone(),
-                None => "(aucun)".to_string(),
-            }),
-        ]),
-        Line::from(vec![
-            Span::styled("Version       : ", Style::default().fg(Color::Cyan)),
-            Span::raw(&state.version),
-        ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Saisie : ", Style::default().fg(Color::Cyan)),
-            Span::raw(&state.input_buffer),
-            Span::styled("█", Style::default().fg(Color::White)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(prompt_desc, Style::default().fg(Color::Yellow))).centered(),
-        Line::from("Échap pour annuler  ·  Entrée pour valider").centered(),
     ];
+    for (i, (lbl, val)) in fields.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(*lbl, lbl_style(i)),
+            Span::styled(" : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(val),
+        ]));
+    }
+
+    // Ligne de confirmation finale o/N (toujours visible, actif si active_field == 6)
+    let confirm_lbl = Span::styled("Ouvrir ?     ", lbl_style(6));
+    let confirm_hint: &str = if active == 6 { "o/N" } else { "o/N" };
+    lines.push(Line::from(vec![
+        confirm_lbl,
+        Span::styled(" : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(confirm_hint),
+    ]));
+
+
+    // Confirmation d'un nouveau statut (hors liste du registre)
+    if state.confirm_status {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "Créer un nouveau statut « {} » ? (o/N)",
+                    state.input_buffer.trim()
+                ),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from("Échap pour annuler  ·  ↑/↓ pour changer de champ").centered());
 
     // Remplit les lignes restantes pour un fond entièrement opaque
     while lines.len() < dialog_height.saturating_sub(2) as usize {
@@ -391,8 +402,13 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         .style(opaque)
         .wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
-}
 
+    // Curseur réel : placé devant la valeur du champ actif.
+    // La ligne du champ actif = 1 (bordure) + 2 (2 lignes vides) + active ; x = bordure + libellé aligné.
+    let cursor_y = area.y + 3 + active as u16;          // bordure(1) + ligne vide(1) + index champ
+    let cursor_x = area.x + 2 + 16; // après le libellé aligné (14) + " : "
+    f.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
 fn render_module_dialog(
     f: &mut Frame,
     size: Rect,
