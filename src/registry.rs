@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -23,6 +24,8 @@ pub(crate) struct Project {
     used_pct: String,
     #[serde(default)]
     spent: String,
+    #[serde(default)]
+    last_model: String,
     #[serde(default = "default_true")]
     active: bool,
 }
@@ -48,6 +51,7 @@ pub(crate) struct ProjectEntry {
     pub(crate) token: String,
     pub(crate) used_pct: String,
     pub(crate) spent: String,
+    pub(crate) last_model: String,
     pub(crate) modified: String,
 }
 
@@ -78,12 +82,57 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 token: p.token,
                 used_pct: p.used_pct,
                 spent: p.spent,
+                last_model: p.last_model,
                 modified,
             }
         })
         .collect::<Vec<ProjectEntry>>();
 
     Ok(projects)
+}
+
+pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<String>)> {
+    let mut usage = HashMap::new();
+    let Ok(conn) = Connection::open(db_path) else {
+        return usage;
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT directory, COALESCE(cost,0), \
+         COALESCE(tokens_input,0) + COALESCE(tokens_output,0) + COALESCE(tokens_reasoning,0), \
+         model, time_created \
+         FROM session WHERE directory IS NOT NULL ORDER BY time_created DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return usage,
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, i64>(2)? as u64,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    });
+    match rows {
+        Ok(iter) => {
+            for r in iter.flatten() {
+                let (dir, cost, tokens, model, _t) = r;
+                let e = usage.entry(PathBuf::from(dir)).or_insert((0u64, 0.0f64, None::<String>));
+                e.0 += tokens;
+                e.1 += cost;
+                if e.2.is_none() {
+                    e.2 = model.and_then(|m| {
+                        serde_json::from_str::<serde_json::Value>(&m)
+                            .ok()
+                            .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                    });
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    usage
 }
 
 pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
@@ -101,6 +150,7 @@ pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()
                 token: p.token.clone(),
                 used_pct: p.used_pct.clone(),
                 spent: p.spent.clone(),
+                last_model: p.last_model.clone(),
                 active: true,
             },
         );
@@ -110,6 +160,50 @@ pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()
     write_private(&tmp, &serde_json::to_string_pretty(&registry)?)?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -> Result<usize> {
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut added = 0usize;
+    let known: HashSet<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    for dir in dirs {
+        if known.contains(&dir) {
+            continue;
+        }
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let modified = last_modified(&dir).unwrap_or_else(|| "—".to_string());
+        projects.push(ProjectEntry {
+            id: name.clone(),
+            name,
+            path: dir.clone(),
+            description: String::new(),
+            status: String::new(),
+            version: String::new(),
+            token: String::new(),
+            used_pct: String::new(),
+            spent: String::new(),
+            last_model: String::new(),
+            modified,
+        });
+        added += 1;
+    }
+    Ok(added)
 }
 
 fn write_private(path: &Path, content: &str) -> Result<()> {
@@ -209,6 +303,7 @@ mod tests
                 token: String::new(),
                 used_pct: String::new(),
                 spent: String::new(),
+                last_model: String::new(),
                 modified: "—".to_string(),
             }],
         )
@@ -246,6 +341,7 @@ mod tests
                     token: String::new(),
                     used_pct: String::new(),
                     spent: String::new(),
+                    last_model: String::new(),
                     modified: "—".to_string(),
                 }],
             )

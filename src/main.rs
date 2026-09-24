@@ -59,6 +59,7 @@ pub(crate) struct App {
     mode: LaunchMode,
     pub(crate) status_message: Option<String>,
     registry_path: PathBuf,
+    opencode_db_path: PathBuf,
     pub(crate) terminal_size: (u16, u16),
     pub(crate) banner_width: u16,
     pending_launch: Option<PathBuf>,
@@ -101,6 +102,9 @@ pub(crate) struct ProjectCreationState {
 
 impl App {
     fn new(registry_path: PathBuf) -> Self {
+        let opencode_db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("opencode/opencode.db");
         let mut app = Self {
             projects: Vec::new(),
             filtered: Vec::new(),
@@ -109,6 +113,7 @@ impl App {
             mode: LaunchMode::Normal,
             status_message: None,
             registry_path,
+            opencode_db_path,
             terminal_size: (80, 24),
             banner_width: 77,
             pending_launch: None,
@@ -552,6 +557,11 @@ fn load_creation_field(state: &mut ProjectCreationState) {
 
 fn rescan_repertoire(app: &mut App) -> Result<()> {
     let mut changed = 0usize;
+    let mut added = 0usize;
+    if let Some(root) = projects_root(&app.projects) {
+        added = registry::reindex_from_disk(&root, &mut app.projects)?;
+    }
+    let usage = registry::load_usage(&app.opencode_db_path);
     for entry in &mut app.projects {
         let cargo = entry.path.join("Cargo.toml");
         if let Ok(content) = fs::read_to_string(&cargo) {
@@ -573,16 +583,63 @@ fn rescan_repertoire(app: &mut App) -> Result<()> {
                 changed += 1;
             }
         }
+        if let Some((tokens, cost, model)) = usage.get(&entry.path) {
+            let token_str = format!("{tokens}");
+            let pct;
+            if *tokens >= 1_000_000 {
+                pct = "99+".to_string();
+            } else {
+                pct = format!("{}", (*tokens * 100) / 1_000_000);
+            }
+            entry.token = token_str;
+            entry.used_pct = pct;
+            entry.spent = if *cost > 0.0 {
+                format!("${:.2}", cost)
+            } else {
+                "—".to_string()
+            };
+            entry.last_model = model.clone().unwrap_or_default();
+            changed += 1;
+        } else {
+            entry.token = String::new();
+            entry.used_pct = String::new();
+            entry.spent = String::new();
+            entry.last_model = String::new();
+        }
     }
-    if changed > 0 {
+    if added > 0 || changed > 0 {
         registry::save_registry(&app.registry_path, &app.projects)?;
-        app.status_message =
-            Some(format!("Rescan : {changed} version(s) resynchronisée(s) depuis le disque"));
+        if added > 0 {
+            app.status_message = Some(format!(
+                "Reindex : {added} nouveau(x) projet(s) ajouté(s) + {changed} entrée(s) resynchronisée(s)"
+            ));
+        } else {
+            app.status_message = Some(format!(
+                "Rescan : {changed} entrée(s) resynchronisée(s) depuis disque + base opencode"
+            ));
+        }
     } else {
         app.status_message = Some("Rescan : base déjà alignée sur le disque".to_string());
     }
     app.filtered = (0..app.projects.len()).collect();
     Ok(())
+}
+
+fn projects_root(projects: &[ProjectEntry]) -> Option<PathBuf> {
+    if projects.is_empty() {
+        return dirs::home_dir().map(|h| h.join("projets"));
+    }
+    let mut counts = std::collections::HashMap::<PathBuf, usize>::new();
+    for p in projects {
+        if let Some(parent) = p.path.parent() {
+            *counts.entry(parent.to_path_buf()).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(_, c)| c)
+        .map(|(dir, _)| dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join("projets")))
 }
 
 fn handle_creation_input(
@@ -731,6 +788,7 @@ fn handle_creation_input(
                     token: String::new(),
                     used_pct: String::new(),
                     spent: String::new(),
+                    last_model: String::new(),
                     modified: "—".to_string(),
                 });
                 registry::save_registry(&app.registry_path, &app.projects)?;

@@ -199,7 +199,7 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
-    let (name, id, path, desc, modified, status, version, token, used_pct, spent) = if app.is_new_selected() {
+    let (name, id, path, desc, modified, status, version, token, used_pct, spent, last_model) = if app.is_new_selected() {
         (
             "Nouveau projet".to_string(),
             "à définir".to_string(),
@@ -208,6 +208,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             "—".to_string(),
             "à définir".to_string(),
             "à définir".to_string(),
+            "—".to_string(),
             "—".to_string(),
             "—".to_string(),
             "—".to_string(),
@@ -225,9 +226,11 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             if p.token.is_empty() { "—".to_string() } else { p.token.clone() },
             if p.used_pct.is_empty() { "—".to_string() } else { p.used_pct.clone() },
             if p.spent.is_empty() { "—".to_string() } else { p.spent.clone() },
+            if p.last_model.is_empty() { "—".to_string() } else { p.last_model.clone() },
         )
     } else {
         (
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -288,6 +291,10 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
     text.push(sep());
     text.push(Line::from(""));
     // Groupe 4
+    text.push(Line::from(vec![
+        Span::styled("Modèle       : ", Style::default().fg(Color::DarkGray)),
+        Span::raw(sanitize(&last_model)),
+    ]));
     text.push(Line::from(vec![
         Span::styled("Token        : ", Style::default().fg(Color::DarkGray)),
         Span::raw(sanitize(&token)),
