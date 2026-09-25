@@ -558,6 +558,19 @@ fn load_creation_field(state: &mut ProjectCreationState) {
 fn rescan_repertoire(app: &mut App) -> Result<()> {
     let mut changed = 0usize;
     let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut written = false;
+    app.projects.retain(|p| {
+        if p.path.exists() && !registry::is_excluded(&p.path) {
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    if removed > 0 {
+        written = true;
+    }
     if let Some(root) = projects_root(&app.projects) {
         added = registry::reindex_from_disk(&root, &mut app.projects)?;
     }
@@ -607,9 +620,17 @@ fn rescan_repertoire(app: &mut App) -> Result<()> {
             entry.last_model = String::new();
         }
     }
-    if added > 0 || changed > 0 {
+    if added > 0 || changed > 0 || written {
         registry::save_registry(&app.registry_path, &app.projects)?;
-        if added > 0 {
+        if removed > 0 && added > 0 {
+            app.status_message = Some(format!(
+                "Reindex : {removed} retiré(s) · {added} ajouté(s) · {changed} resynchronisée(s)"
+            ));
+        } else if removed > 0 {
+            app.status_message = Some(format!(
+                "Rescan : {removed} projet(s) orphelin(s) retiré(s)"
+            ));
+        } else if added > 0 {
             app.status_message = Some(format!(
                 "Reindex : {added} nouveau(x) projet(s) ajouté(s) + {changed} entrée(s) resynchronisée(s)"
             ));

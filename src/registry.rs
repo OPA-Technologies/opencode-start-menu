@@ -162,6 +162,22 @@ pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()
     Ok(())
 }
 
+pub(crate) fn is_excluded(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| {
+            let n = n.to_string_lossy();
+            contains_casefold(&n, EXCLUDED_DIRS)
+        })
+        .unwrap_or(false)
+}
+
+fn contains_casefold(name: &str, list: &[&str]) -> bool {
+    let lower = name.to_lowercase();
+    list.iter().any(|e| e.to_lowercase() == lower)
+}
+
+const EXCLUDED_DIRS: &[&str] = &["jdk-21"];
+
 pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -> Result<usize> {
     if !root.is_dir() {
         return Ok(0);
@@ -177,7 +193,7 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
     }
     dirs.sort();
     for dir in dirs {
-        if known.contains(&dir) {
+        if known.contains(&dir) || is_excluded(&dir) {
             continue;
         }
         let name = dir
