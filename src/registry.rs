@@ -91,7 +91,7 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
     Ok(projects)
 }
 
-pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<String>)> {
+pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<(String, String)>)> {
     let mut usage = HashMap::new();
     let Ok(conn) = Connection::open(db_path) else {
         return usage;
@@ -99,7 +99,7 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<S
     let mut stmt = match conn.prepare(
         "SELECT directory, COALESCE(cost,0), \
          COALESCE(tokens_input,0) + COALESCE(tokens_output,0) + COALESCE(tokens_reasoning,0), \
-         model, time_created \
+         model, agent, time_created \
          FROM session WHERE directory IS NOT NULL ORDER BY time_created DESC",
     ) {
         Ok(s) => s,
@@ -111,28 +111,45 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<S
             row.get::<_, f64>(1)?,
             row.get::<_, i64>(2)? as u64,
             row.get::<_, Option<String>>(3)?,
-            row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     });
     match rows {
         Ok(iter) => {
             for r in iter.flatten() {
-                let (dir, cost, tokens, model, _t) = r;
-                let e = usage.entry(PathBuf::from(dir)).or_insert((0u64, 0.0f64, None::<String>));
+                let (dir, cost, tokens, model, agent, _t) = r;
+                let e = usage
+                    .entry(PathBuf::from(dir))
+                    .or_insert((0u64, 0.0f64, None::<(String, String)>));
                 e.0 += tokens;
                 e.1 += cost;
                 if e.2.is_none() {
-                    e.2 = model.and_then(|m| {
+                    let model_id = model.and_then(|m| {
                         serde_json::from_str::<serde_json::Value>(&m)
                             .ok()
                             .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
                     });
+                    let agent_cap = agent.map(|a| capitalize(&a));
+                    e.2 = match (model_id, agent_cap) {
+                        (Some(m), Some(a)) => Some((m, a)),
+                        (Some(m), None) => Some((m, String::new())),
+                        _ => None,
+                    };
                 }
             }
         }
         Err(_) => {}
     }
     usage
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()> {

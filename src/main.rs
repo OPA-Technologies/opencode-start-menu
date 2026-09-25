@@ -611,7 +611,11 @@ fn rescan_repertoire(app: &mut App) -> Result<()> {
             } else {
                 "—".to_string()
             };
-            entry.last_model = model.clone().unwrap_or_default();
+            entry.last_model = match model {
+                Some((m, a)) if !a.is_empty() => format!("{m} / {a}"),
+                Some((m, _)) => m.clone(),
+                None => String::new(),
+            };
             changed += 1;
         } else {
             entry.token = String::new();
