@@ -55,7 +55,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App, input_mode: &InputMode, creation_
     if let Some(msg) = &app.status_message {
         let area = Rect {
             x: 2,
-            y: 2,
+            y: 8,
             width: size.width.saturating_sub(4),
             height: 3,
         };
