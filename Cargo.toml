@@ -1,6 +1,6 @@
 [package]
 name = "opencode-start-menu"
-version = "0.9.9-beta"
+version = "0.9.12"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -19,3 +19,5 @@ walkdir = "2.5"
 shellexpand = "3.0"
 fs2 = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
+num-format = "0.4"
+sys-locale = "0.3"

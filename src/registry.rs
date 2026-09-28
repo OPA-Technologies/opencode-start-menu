@@ -9,6 +9,29 @@ use std::{
 
 use crate::perms;
 
+// Nouvelles structures pour les données d'usage
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LastSession {
+    pub tokens: u64,
+    pub cost: f64,
+    pub model: String,
+    pub agent: String,
+    pub time_created: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CumulativeUsage {
+    pub total_tokens: u64,
+    pub total_cost: f64,
+    pub session_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectUsage {
+    pub cumulative: CumulativeUsage,
+    pub last_session: Option<LastSession>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct Project {
     name: String,
@@ -26,12 +49,61 @@ pub(crate) struct Project {
     spent: String,
     #[serde(default)]
     last_model: String,
+    #[serde(default)]
+    total_tokens: String,
+    #[serde(default)]
+    total_cost: String,
+    #[serde(default)]
+    session_count: String,
+    #[serde(default)]
+    last_session_tokens: String,
+    #[serde(default)]
+    last_session_cost: String,
+    #[serde(default)]
+    last_agent: String,
+    #[serde(default)]
+    last_time_created: String,
+    #[serde(default)]
+    status_debug: String,
+    #[serde(default)]
+    version_debug: String,
+    #[serde(default)]
+    status_release: String,
+    #[serde(default)]
+    version_release: String,
+    #[serde(default)]
+    last_compile_debug_secs: u64,
+    #[serde(default)]
+    last_compile_release_secs: u64,
+    // Champ historique (uniquement pour migrer les anciens registres).
+    #[serde(default)]
+    last_compile_secs: u64,
     #[serde(default = "default_true")]
     active: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+pub(crate) const STATUSES: &[&str] = &[
+    "Study",
+    "Alpha",
+    "Beta",
+    "Debug",
+    "Beta-Release",
+    "Release",
+    "Stable",
+    "Deprecated",
+];
+
+pub(crate) fn validate_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+pub(crate) fn validate_status(s: &str) -> bool {
+    STATUSES.iter().any(|known| *known == s)
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -53,6 +125,24 @@ pub(crate) struct ProjectEntry {
     pub(crate) spent: String,
     pub(crate) last_model: String,
     pub(crate) modified: String,
+    // Nouveaux champs pour les données d'usage
+    pub(crate) total_tokens: String,
+    pub(crate) total_cost: String,
+    pub(crate) session_count: String,
+    pub(crate) last_session_tokens: String,
+    pub(crate) last_session_cost: String,
+    pub(crate) last_agent: String,
+    pub(crate) last_time_created: String,
+    pub(crate) status_debug: String,
+    pub(crate) version_debug: String,
+    pub(crate) status_release: String,
+    pub(crate) version_release: String,
+    pub(crate) debug_modified: String,
+    pub(crate) release_modified: String,
+    /// Références (epoch secondes) de la dernière compilation détectée par
+    /// variante (mtimes de target/debug et target/release). 0 = jamais.
+    pub(crate) last_compile_debug_secs: u64,
+    pub(crate) last_compile_release_secs: u64,
 }
 
 pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
@@ -72,6 +162,30 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
         .map(|(id, p)| {
             let dir = PathBuf::from(shellexpand::tilde(&p.path).to_string());
             let modified = last_modified(&dir).unwrap_or_else(|| "—".to_string());
+            let debug_modified =
+                variant_modified(&dir, "debug").unwrap_or_else(|| "jamais compilée".to_string());
+            let release_modified =
+                variant_modified(&dir, "release").unwrap_or_else(|| "jamais compilée".to_string());
+            // Migration des anciens champs uniques status/version vers les variantes
+            // Debug/Release si les nouvelles valeurs sont absentes.
+            let status_debug =
+                if p.status_debug.is_empty() { p.status.clone() } else { p.status_debug.clone() };
+            let version_debug =
+                if p.version_debug.is_empty() { p.version.clone() } else { p.version_debug.clone() };
+            let status_release =
+                if p.status_release.is_empty() { status_debug.clone() } else { p.status_release.clone() };
+            let version_release =
+                if p.version_release.is_empty() { version_debug.clone() } else { p.version_release.clone() };
+            // Migration de la référence unique historique : si les deux
+            // références par variante sont absentes (0), le registre étant
+            // alors pré-dissociation, l'ancienne référence est attribuée aux
+            // deux variantes (aucune n'est considérée « en retard » au départ).
+            let (last_debug_secs, last_release_secs) =
+                if p.last_compile_debug_secs == 0 && p.last_compile_release_secs == 0 {
+                    (p.last_compile_secs, p.last_compile_secs)
+                } else {
+                    (p.last_compile_debug_secs, p.last_compile_release_secs)
+                };
             ProjectEntry {
                 id,
                 name: p.name,
@@ -84,6 +198,21 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 spent: p.spent,
                 last_model: p.last_model,
                 modified,
+                total_tokens: p.total_tokens,
+                total_cost: p.total_cost,
+                session_count: p.session_count,
+                last_session_tokens: p.last_session_tokens,
+                last_session_cost: p.last_session_cost,
+                last_agent: p.last_agent,
+                last_time_created: p.last_time_created,
+                status_debug,
+                version_debug,
+                status_release,
+                version_release,
+                debug_modified,
+                release_modified,
+                last_compile_debug_secs: last_debug_secs,
+                last_compile_release_secs: last_release_secs,
             }
         })
         .collect::<Vec<ProjectEntry>>();
@@ -91,7 +220,8 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
     Ok(projects)
 }
 
-pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<(String, String)>)> {
+// Nouvelle fonction pour charger les données d'usage (cumulées + dernière session)
+pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
     let mut usage = HashMap::new();
     let Ok(conn) = Connection::open(db_path) else {
         return usage;
@@ -118,24 +248,32 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, (u64, f64, Option<(
     match rows {
         Ok(iter) => {
             for r in iter.flatten() {
-                let (dir, cost, tokens, model, agent, _t) = r;
-                let e = usage
+                let (dir, cost, tokens, model, agent, t) = r;
+                let entry = usage
                     .entry(PathBuf::from(dir))
-                    .or_insert((0u64, 0.0f64, None::<(String, String)>));
-                e.0 += tokens;
-                e.1 += cost;
-                if e.2.is_none() {
+                    .or_insert_with(|| ProjectUsage {
+                        cumulative: CumulativeUsage::default(),
+                        last_session: None,
+                    });
+                // Cumuler les totaux
+                entry.cumulative.total_tokens += tokens;
+                entry.cumulative.total_cost += cost;
+                entry.cumulative.session_count += 1;
+                // Dernière session (la première rencontrée car ORDER BY time_created DESC)
+                if entry.last_session.is_none() {
                     let model_id = model.and_then(|m| {
                         serde_json::from_str::<serde_json::Value>(&m)
                             .ok()
                             .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
                     });
                     let agent_cap = agent.map(|a| capitalize(&a));
-                    e.2 = match (model_id, agent_cap) {
-                        (Some(m), Some(a)) => Some((m, a)),
-                        (Some(m), None) => Some((m, String::new())),
-                        _ => None,
-                    };
+                    entry.last_session = Some(LastSession {
+                        tokens,
+                        cost,
+                        model: model_id.unwrap_or_default(),
+                        agent: agent_cap.unwrap_or_default(),
+                        time_created: t,
+                    });
                 }
             }
         }
@@ -168,6 +306,21 @@ pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()
                 used_pct: p.used_pct.clone(),
                 spent: p.spent.clone(),
                 last_model: p.last_model.clone(),
+                total_tokens: p.total_tokens.clone(),
+                total_cost: p.total_cost.clone(),
+                session_count: p.session_count.clone(),
+                last_session_tokens: p.last_session_tokens.clone(),
+                last_session_cost: p.last_session_cost.clone(),
+                last_agent: p.last_agent.clone(),
+                last_time_created: p.last_time_created.clone(),
+                status_debug: p.status_debug.clone(),
+                version_debug: p.version_debug.clone(),
+                status_release: p.status_release.clone(),
+                version_release: p.version_release.clone(),
+                last_compile_debug_secs: p.last_compile_debug_secs,
+                last_compile_release_secs: p.last_compile_release_secs,
+                // Ancien champ : remis à zéro après migration (géré par default).
+                last_compile_secs: 0,
                 active: true,
             },
         );
@@ -221,6 +374,10 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
             continue;
         }
         let modified = last_modified(&dir).unwrap_or_else(|| "—".to_string());
+        let debug_modified =
+            variant_modified(&dir, "debug").unwrap_or_else(|| "jamais compilée".to_string());
+        let release_modified =
+            variant_modified(&dir, "release").unwrap_or_else(|| "jamais compilée".to_string());
         projects.push(ProjectEntry {
             id: name.clone(),
             name,
@@ -233,6 +390,21 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
             spent: String::new(),
             last_model: String::new(),
             modified,
+            total_tokens: String::new(),
+            total_cost: String::new(),
+            session_count: String::new(),
+            last_session_tokens: String::new(),
+            last_session_cost: String::new(),
+            last_agent: String::new(),
+            last_time_created: String::new(),
+            status_debug: String::new(),
+            version_debug: String::new(),
+            status_release: String::new(),
+            version_release: String::new(),
+            debug_modified,
+            release_modified,
+            last_compile_debug_secs: 0,
+            last_compile_release_secs: 0,
         });
         added += 1;
     }
@@ -255,7 +427,7 @@ fn ensure_regular(path: &Path) -> Result<()> {
       }
 }
 
-fn last_modified(dir: &Path) -> Option<String> {
+pub(crate) fn last_modified_time(dir: &Path) -> Option<std::time::SystemTime> {
     if !dir.exists() {
         return None;
     }
@@ -273,18 +445,33 @@ fn last_modified(dir: &Path) -> Option<String> {
         }
     }
     best.or_else(|| fs::metadata(dir).ok().and_then(|m| m.modified().ok()))
-        .map(|t| {
-            let dt: chrono::DateTime<chrono::Local> = t.into();
-            dt.format("%d/%m/%Y %H:%M").to_string()
-        })
 }
+
+fn format_mod_time(t: std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    dt.format("%d/%m/%Y %H:%M").to_string()
+}
+
+fn last_modified(dir: &Path) -> Option<String> {
+    last_modified_time(dir).map(format_mod_time)
+}
+
+pub(crate) fn variant_modified(dir: &Path, profile: &str) -> Option<String> {
+    last_modified_time(&dir.join("target").join(profile)).map(format_mod_time)
+}
+
+/// mtime (SystemTime) du fichier le plus récent sous `target/{profile}`.
+pub(crate) fn variant_modified_time(dir: &Path, profile: &str) -> Option<std::time::SystemTime>
+  {
+    last_modified_time(&dir.join("target").join(profile))
+  }
 
 #[cfg(test)]
 mod tests
   {
     use std::{fs, path::PathBuf};
 
-    use super::{load_registry, save_registry, ProjectEntry};
+    use super::{load_registry, save_registry, validate_status, validate_version, ProjectEntry, STATUSES};
 
     fn temp_registry(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -338,6 +525,21 @@ mod tests
                 spent: String::new(),
                 last_model: String::new(),
                 modified: "—".to_string(),
+                total_tokens: String::new(),
+                total_cost: String::new(),
+                session_count: String::new(),
+                last_session_tokens: String::new(),
+                last_session_cost: String::new(),
+                last_agent: String::new(),
+                last_time_created: String::new(),
+                status_debug: String::new(),
+                version_debug: String::new(),
+                status_release: String::new(),
+                version_release: String::new(),
+                debug_modified: String::new(),
+                release_modified: String::new(),
+                last_compile_debug_secs: 0,
+                last_compile_release_secs: 0,
             }],
         )
         .unwrap();
@@ -376,6 +578,21 @@ mod tests
                     spent: String::new(),
                     last_model: String::new(),
                     modified: "—".to_string(),
+                    total_tokens: String::new(),
+                    total_cost: String::new(),
+                    session_count: String::new(),
+                    last_session_tokens: String::new(),
+                    last_session_cost: String::new(),
+                    last_agent: String::new(),
+                    last_time_created: String::new(),
+                    status_debug: String::new(),
+                    version_debug: String::new(),
+                    status_release: String::new(),
+                    version_release: String::new(),
+                    debug_modified: String::new(),
+                    release_modified: String::new(),
+                    last_compile_debug_secs: 0,
+                    last_compile_release_secs: 0,
                 }],
             )
             .unwrap();
@@ -395,6 +612,127 @@ mod tests
 
         assert!(load_registry(&link).is_err());
         assert!(save_registry(&link, &[]).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn validate_version_accepts_x_y_z() {
+        assert!(validate_version("1.2.3"));
+        assert!(validate_version("0.0.1"));
+        assert!(validate_version("123.0.45"));
+        assert!(!validate_version("1.2"));
+        assert!(!validate_version("1.2.3.4"));
+        assert!(!validate_version("1..3"));
+        assert!(!validate_version("1.2.beta"));
+        assert!(!validate_version(""));
+        assert!(!validate_version("1.2-3"));
+    }
+
+    #[test]
+    fn validate_status_against_fixed_set() {
+        assert!(STATUSES.contains(&"Beta"));
+        for known in STATUSES {
+            assert!(validate_status(known));
+        }
+        assert!(!validate_status("En cours"));
+        assert!(!validate_status("Preview"));
+        assert!(!validate_status(""));
+    }
+
+    #[test]
+    fn load_migrates_legacy_status_version_to_both_variants() {
+        let dir = temp_registry("migrate");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+
+        let legacy = r#"{"projects":{"old":{"name":"Legacy","path":"/tmp/nonexistent-proj","description":"d","status":"En-cours Beta","version":"2.1.0"}}}"#;
+        fs::write(&path, legacy).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status_debug, "En-cours Beta");
+        assert_eq!(loaded[0].version_debug, "2.1.0");
+        assert_eq!(loaded[0].status_release, "En-cours Beta");
+        assert_eq!(loaded[0].version_release, "2.1.0");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_migrates_legacy_last_compile_secs_to_both_refs() {
+        let dir = temp_registry("migrate_compile");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+
+        // Registre ancien avec last_compile_secs non-nul, sans les nouveaux champs
+        let legacy = r#"{"projects":{"old":{"name":"Legacy","path":"/tmp/nonexistent-proj","description":"d","status":"Debug","version":"1.0.0","last_compile_secs":1234567890}}}"#;
+        fs::write(&path, legacy).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        // L'ancienne référence doit être dupliquée vers les deux variantes
+        assert_eq!(loaded[0].last_compile_debug_secs, 1234567890);
+        assert_eq!(loaded[0].last_compile_release_secs, 1234567890);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_keeps_existing_debug_release_variants() {
+        let dir = temp_registry("keepvar");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+
+        let json = r#"{"projects":{"old":{"name":"Legacy","path":"/tmp/nonexistent-proj","description":"d","status":"legacy","version":"9.9.9","status_debug":"Debug","version_debug":"1.1.1","status_release":"Release","version_release":"2.2.2"}}}"#;
+        fs::write(&path, json).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded[0].status_debug, "Debug");
+        assert_eq!(loaded[0].version_debug, "1.1.1");
+        assert_eq!(loaded[0].status_release, "Release");
+        assert_eq!(loaded[0].version_release, "2.2.2");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn variant_modified_returns_none_without_target_dir() {
+        let dir = temp_registry("vartgt");
+        assert_eq!(super::variant_modified(&dir, "debug"), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_registry_fills_variant_dates() {
+        let dir = temp_registry("vardates");
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("target/debug")).unwrap();
+        fs::write(proj.join("target/debug/art.rlib"), b"x").unwrap();
+
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+        let json = format!(
+            r#"{{"projects":{{"proj":{{"name":"proj","path":"{}","description":"d","status":"","version":"1.0.0"}}}}}}"#,
+            proj.display()
+        );
+        fs::write(&path, json).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_ne!(loaded[0].debug_modified, "jamais compilée");
+        assert_eq!(loaded[0].release_modified, "jamais compilée");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn variant_modified_formats_latest_target_mtime() {
+        let dir = temp_registry("vartgt2");
+        let debug = dir.join("target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        fs::write(debug.join("old.rlib"), b"x").unwrap();
+        fs::write(debug.join("new.rlib"), b"x").unwrap();
+        let new_mtime = fs::metadata(debug.join("new.rlib")).unwrap().modified().unwrap();
+        let label = super::variant_modified(&dir, "debug").expect("date debug");
+        let expected = super::format_mod_time(new_mtime);
+        assert_eq!(label, expected, "doit refléter le mtime le plus récent");
+        assert_eq!(super::variant_modified(&dir, "release"), None);
         fs::remove_dir_all(&dir).unwrap();
     }
   }
