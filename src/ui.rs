@@ -278,6 +278,8 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         last_model,
         last_agent,
         last_time_created,
+        last_session_context_pct,
+        total_tokens_m,
     ) = if app.is_new_selected() {
         (
             "Nouveau projet".to_string(),
@@ -295,11 +297,20 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             "—".to_string(),
             "—".to_string(),
             "—".to_string(),
+            "—".to_string(),
+            "0".to_string(),
         )
     } else if let Some(idx) = app.selected_project_idx() {
         let p = &app.projects[idx];
         let or_dash =
             |s: &str| if s.is_empty() { "—".to_string() } else { s.to_string() };
+        // Tokens en millions pour l'affichage "XM / 100M (Y%)"
+        let total_tokens_m = if p.total_tokens.is_empty() {
+            "0".to_string()
+        } else {
+            let tokens = p.total_tokens.replace(' ', "").parse::<u64>().unwrap_or(0);
+            (tokens / 1_000_000).to_string()
+        };
         (
             p.name.clone(),
             if p.id.is_empty() { "—".to_string() } else { p.id.clone() },
@@ -316,9 +327,13 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             or_dash(&p.last_model),
             or_dash(&p.last_agent),
             or_dash(&p.last_time_created),
+            or_dash(&p.last_session_context_pct),
+            total_tokens_m,
         )
     } else {
         (
+            String::new(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -427,15 +442,21 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("Totaux"),
     ])
     .style(header_style);
+    // Construire la ligne Tokens Totaux : "XM / 100M (Y%)"
+    let tokens_total_display = format!(
+        "{}M / 100M ({}%)",
+        total_tokens_m,
+        used_pct
+    );
     let rows = vec![
         Row::new(vec![
             Cell::from("Tokens").style(label_style),
             Cell::from(sanitize(&last_session_tokens)),
-            Cell::from(sanitize(&total_tokens)),
+            Cell::from(sanitize(&tokens_total_display)),
         ]),
         Row::new(vec![
-            Cell::from("% Utilisé").style(label_style),
-            Cell::from(sanitize(&used_pct)),
+            Cell::from("Contexte").style(label_style),
+            Cell::from(sanitize(&last_session_context_pct)),
             Cell::from("—"),
         ]),
         Row::new(vec![
@@ -491,7 +512,7 @@ fn render_help(
       {
         InputMode::Normal =>
           {
-            "↑/↓ Naviguer  ·  Entrée Ouvrir  ·  m Module  ·  e Modifier  ·  n Nouveau projet  ·  q Quitter"
+            "↑/↓ Naviguer  ·  Entrée Ouvrir  ·  m Module  ·  e Modifier  ·  n Nouveau projet  ·  q Quitter  ·  Budget% (100M) = tokens cumulés / 100M"
           }
         InputMode::SelectModule { .. } =>
           {

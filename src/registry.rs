@@ -17,6 +17,7 @@ pub(crate) struct LastSession {
     pub model: String,
     pub agent: String,
     pub time_created: i64,
+    pub context_pct: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +79,9 @@ pub(crate) struct Project {
     // Champ historique (uniquement pour migrer les anciens registres).
     #[serde(default)]
     last_compile_secs: u64,
+    // Marque si la version a été éditée manuellement (pour éviter AutoPatch bump).
+    #[serde(default)]
+    version_manually_edited: bool,
     #[serde(default = "default_true")]
     active: bool,
 }
@@ -133,6 +137,7 @@ pub(crate) struct ProjectEntry {
     pub(crate) last_session_cost: String,
     pub(crate) last_agent: String,
     pub(crate) last_time_created: String,
+    pub(crate) last_session_context_pct: String,
     pub(crate) status_debug: String,
     pub(crate) version_debug: String,
     pub(crate) status_release: String,
@@ -143,6 +148,9 @@ pub(crate) struct ProjectEntry {
     /// variante (mtimes de target/debug et target/release). 0 = jamais.
     pub(crate) last_compile_debug_secs: u64,
     pub(crate) last_compile_release_secs: u64,
+    /// Marque si la version a été éditée manuellement dans le menu
+    /// (pour éviter le bump AutoPatch au prochain rescan).
+    pub(crate) version_manually_edited: bool,
 }
 
 pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
@@ -205,6 +213,7 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 last_session_cost: p.last_session_cost,
                 last_agent: p.last_agent,
                 last_time_created: p.last_time_created,
+                last_session_context_pct: String::new(),
                 status_debug,
                 version_debug,
                 status_release,
@@ -213,6 +222,7 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 release_modified,
                 last_compile_debug_secs: last_debug_secs,
                 last_compile_release_secs: last_release_secs,
+                version_manually_edited: p.version_manually_edited,
             }
         })
         .collect::<Vec<ProjectEntry>>();
@@ -226,10 +236,15 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
     let Ok(conn) = Connection::open(db_path) else {
         return usage;
     };
+    // Migration : ajouter la colonne context_pct si elle n'existe pas.
+    let _ = conn.execute(
+        "ALTER TABLE session ADD COLUMN context_pct INTEGER DEFAULT 0",
+        [],
+    );
     let mut stmt = match conn.prepare(
         "SELECT directory, COALESCE(cost,0), \
          COALESCE(tokens_input,0) + COALESCE(tokens_output,0) + COALESCE(tokens_reasoning,0), \
-         model, agent, time_created \
+         model, agent, time_created, COALESCE(context_pct,0) \
          FROM session WHERE directory IS NOT NULL ORDER BY time_created DESC",
     ) {
         Ok(s) => s,
@@ -243,12 +258,13 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, i64>(5)?,
+            row.get::<_, u8>(6)?,
         ))
     });
     match rows {
         Ok(iter) => {
             for r in iter.flatten() {
-                let (dir, cost, tokens, model, agent, t) = r;
+                let (dir, cost, tokens, model, agent, t, context_pct) = r;
                 let entry = usage
                     .entry(PathBuf::from(dir))
                     .or_insert_with(|| ProjectUsage {
@@ -273,6 +289,7 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
                         model: model_id.unwrap_or_default(),
                         agent: agent_cap.unwrap_or_default(),
                         time_created: t,
+                        context_pct,
                     });
                 }
             }
@@ -321,6 +338,7 @@ pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()
                 last_compile_release_secs: p.last_compile_release_secs,
                 // Ancien champ : remis à zéro après migration (géré par default).
                 last_compile_secs: 0,
+                version_manually_edited: p.version_manually_edited,
                 active: true,
             },
         );
@@ -397,6 +415,7 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
             last_session_cost: String::new(),
             last_agent: String::new(),
             last_time_created: String::new(),
+            last_session_context_pct: String::new(),
             status_debug: String::new(),
             version_debug: String::new(),
             status_release: String::new(),
@@ -405,6 +424,7 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
             release_modified,
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            version_manually_edited: false,
         });
         added += 1;
     }
@@ -532,6 +552,7 @@ mod tests
                 last_session_cost: String::new(),
                 last_agent: String::new(),
                 last_time_created: String::new(),
+                last_session_context_pct: String::new(),
                 status_debug: String::new(),
                 version_debug: String::new(),
                 status_release: String::new(),
@@ -540,6 +561,7 @@ mod tests
                 release_modified: String::new(),
                 last_compile_debug_secs: 0,
                 last_compile_release_secs: 0,
+                version_manually_edited: false,
             }],
         )
         .unwrap();
@@ -585,6 +607,7 @@ mod tests
                     last_session_cost: String::new(),
                     last_agent: String::new(),
                     last_time_created: String::new(),
+                    last_session_context_pct: String::new(),
                     status_debug: String::new(),
                     version_debug: String::new(),
                     status_release: String::new(),
@@ -593,6 +616,7 @@ mod tests
                     release_modified: String::new(),
                     last_compile_debug_secs: 0,
                     last_compile_release_secs: 0,
+                    version_manually_edited: false,
                 }],
             )
             .unwrap();
@@ -672,6 +696,23 @@ mod tests
         // L'ancienne référence doit être dupliquée vers les deux variantes
         assert_eq!(loaded[0].last_compile_debug_secs, 1234567890);
         assert_eq!(loaded[0].last_compile_release_secs, 1234567890);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_migrates_version_manually_edited_default_false() {
+        let dir = temp_registry("migrate_edited");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+
+        // Registre ancien sans le champ version_manually_edited
+        let legacy = r#"{"projects":{"old":{"name":"Legacy","path":"/tmp/nonexistent-proj","description":"d","status":"Debug","version":"1.0.0"}}}"#;
+        fs::write(&path, legacy).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        // Le champ doit être par défaut à false
+        assert!(!loaded[0].version_manually_edited);
         fs::remove_dir_all(&dir).unwrap();
     }
 

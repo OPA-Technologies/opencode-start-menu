@@ -1,0 +1,11 @@
+[package]
+name = "opencode-wrap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "macros", "rt-multi-thread"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+dirs = "5.0"
+anyhow = "1.0"
+regex = "1.10"

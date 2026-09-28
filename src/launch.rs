@@ -35,7 +35,7 @@ fn report(status: std::process::ExitStatus) -> Result<()>
       }
   }
 
-/// Lance l'exécutable `opencode` dans le dossier `dir`.
+/// Lance l'exécutable `opencode` (via le wrapper `opencode-wrap`) dans le dossier `dir`.
 ///
 /// Résume : le TUI est lancé avec `--continue` : il rouvre la dernière
 /// session du projet directement dans la vue chat (sinon l'écran d'accueil
@@ -45,8 +45,11 @@ fn report(status: std::process::ExitStatus) -> Result<()>
 /// and Todo... » (visible) et cache les instructions dans le champ
 /// « system » du prompt.
 ///
-/// Vierge : `opencode` est lancé sans argument dans `dir` ; aucun résumé,
+/// Vierge : `opencode-wrap` est lancé sans argument dans `dir` ; aucun résumé,
 /// aucune todo, aucune liste de projets, aucune session à rouvrir.
+///
+/// Le wrapper `opencode-wrap` capture le % de contexte à la sortie d'opencode
+/// et l'enregistre dans la base SQLite pour l'affichage dans opencode-start-menu.
 pub(crate) fn run_launch_sequence(
   kind: LaunchKind,
   name: &str,
@@ -70,14 +73,19 @@ pub(crate) fn run_launch_sequence(
         ));
       }
 
+    // Utiliser opencode-wrap au lieu d'opencode directement
+    // Le wrapper capture le % contexte à la sortie et met à jour la DB.
+    let dir_str = dir.to_string_lossy().to_string();
+    let project_dir = dir_str.clone();
+
     match kind
       {
         LaunchKind::Bare =>
           {
-            let status = Command::new("opencode")
+            let status = Command::new("opencode-wrap")
               .current_dir(dir)
               .status()
-              .map_err(|e| anyhow!("échec du lancement d'opencode : {e}"))?;
+              .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?;
             report(status)
           }
 
@@ -96,24 +104,28 @@ pub(crate) fn run_launch_sequence(
 
             let status = if sudo
               {
+                // Avec sudo, on passe le chemin du projet via variable d'environnement
+                // pour que le wrapper sache quelle session mettre à jour
                 let cmd = format!(
-                  "cd {} && OPENCODE_AUTO_RESUME={} opencode --continue",
+                  "cd {} && OPENCODE_AUTO_RESUME={} OPENCODE_PROJECT_DIR={} opencode-wrap --continue",
                   shell_quote(&dir.to_string_lossy()),
                   shell_quote(&prompt),
+                  shell_quote(&project_dir),
                 );
                 Command::new("sudo")
                   .args(["-i", "-c", &cmd])
                   .status()
-                  .map_err(|e| anyhow!("échec du lancement d'opencode : {e}"))?
+                  .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?
               }
             else
               {
-                Command::new("opencode")
+                Command::new("opencode-wrap")
                   .env("OPENCODE_AUTO_RESUME", &prompt)
+                  .env("OPENCODE_PROJECT_DIR", &project_dir)
                   .arg("--continue")
                   .current_dir(dir)
                   .status()
-                  .map_err(|e| anyhow!("échec du lancement d'opencode : {e}"))?
+                  .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?
               };
             report(status)
           }

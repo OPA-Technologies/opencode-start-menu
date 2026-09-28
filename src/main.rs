@@ -12,13 +12,13 @@ use ratatui::{
     widgets::ListState,
     Terminal,
 };
+use rusqlite::Connection;
 use std::{
     cmp::Ordering,
     env,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::ExitStatus,
 };
 
 mod launch;
@@ -402,6 +402,96 @@ fn bump_manifest_version(dir: &Path, new_version: &str) -> Result<bool>
     Ok(version_injected)
   }
 
+/// Définit la version exacte dans Cargo.toml (sans incrément).
+/// Utilisé lors de l'édition manuelle pour synchroniser le manifeste.
+fn set_manifest_version(dir: &Path, version: &str) -> Result<bool>
+  {
+    let cargo = dir.join("Cargo.toml");
+    let Ok(content) = fs::read_to_string(&cargo) else
+      {
+        return Ok(false);
+      };
+    let mut out = String::with_capacity(content.len() + 32);
+    let mut in_package = false;
+    let mut version_seen = false;
+    let mut version_injected = false;
+    for part in content.split_inclusive('\n')
+      {
+        let trimmed = part.trim();
+        let is_section = trimmed.starts_with('[');
+        if is_section
+          {
+            if in_package && !version_seen && !version_injected
+              {
+                out.push_str(&format!("version = \"{version}\"\n"));
+                version_injected = true;
+              }
+            in_package = trimmed == "[package]";
+            if in_package
+              {
+                version_seen = false;
+              }
+          }
+        else if in_package && !version_seen
+          {
+            if let Some(eq) = trimmed.find('=')
+              {
+                if trimmed[..eq].trim() == "version"
+                  {
+                    let lead = part.len() - part.trim_start().len();
+                    out.push_str(&format!("{}version = \"{version}\"", &part[..lead]));
+                    if part.ends_with('\n')
+                      {
+                        out.push('\n');
+                      }
+                    version_seen = true;
+                    version_injected = true;
+                    continue;
+                  }
+              }
+          }
+        out.push_str(part);
+      }
+    if in_package && !version_seen && !version_injected
+      {
+        if !out.is_empty() && !out.ends_with('\n')
+          {
+            out.push('\n');
+          }
+        out.push_str(&format!("version = \"{version}\"\n"));
+        version_injected = true;
+      }
+    if version_injected
+      {
+        fs::write(&cargo, out)?;
+      }
+    Ok(version_injected)
+  }
+
+/// Synchronise la version du projet menu (opencode-start-menu) avec
+/// la version du binaire (CARGO_PKG_VERSION). Appelé au démarrage et
+/// après chaque rescan pour garantir la cohérence.
+fn sync_menu_project_version(app: &mut App) -> Result<()>
+  {
+    let expected_version = env!("CARGO_PKG_VERSION");
+    let expected_status = "Beta-Release";
+    if let Some(p) = app.projects.iter_mut().find(|p| p.name == "OpenCode Start Menu")
+      {
+        if p.version_debug != expected_version
+          {
+            p.version_debug = expected_version.to_string();
+            p.status_debug = expected_status.to_string();
+            p.version = p.version_debug.clone();
+            p.status = p.status_debug.clone();
+            p.version_manually_edited = true;
+            let _ = set_manifest_version(&p.path, &p.version_debug);
+            // Persister la mise à jour dans le registre.
+            registry::save_registry(&app.registry_path, &app.projects)?;
+          }
+      }
+    Ok(())
+  }
+
 pub(crate) const MAX_MESSAGE_LINES: usize = 6;
 
 impl App {
@@ -435,6 +525,8 @@ impl App {
         if let Err(e) = rescan_repertoire(&mut app) {
             app.push_error(format!("Rescan au démarrage échoué : {e}"));
         }
+        // Auto-sync projet menu : aligner version_debug sur CARGO_PKG_VERSION.
+        let _ = sync_menu_project_version(&mut app);
         finalize_project_list(&mut app);
         app
     }
@@ -664,65 +756,90 @@ fn format_datetime(ts: i64) -> String {
     }
 }
 
-// ---- Détection du nom de binaire d'un projet (Cargo.toml) ----
+// self_variant_label removed — op -V now prints CARGO_PKG_VERSION directly.
 
-fn binary_name_from_cargo(dir: &Path) -> Option<String> {
-    let content = fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    let mut in_package = false;
-    for line in content.lines() {
-        let t = line.trim();
-        if t.starts_with("[package]") {
-            in_package = true;
-            continue;
+/// Vérifie si le wrapper opencode-wrap est installé dans /usr/local/bin.
+/// Si absent, propose l'installation avec prompt utilisateur (sudo requis).
+fn ensure_wrapper_installed() -> Result<()> {
+    let wrapper_path = PathBuf::from("/usr/local/bin/opencode-wrap");
+    if wrapper_path.exists() {
+        return Ok(());
+    }
+
+    // Wrapper absent → ne faire l'installation interactive que si on a un TTY
+    use std::io::{self, Write, IsTerminal};
+    if !io::stderr().is_terminal() {
+        // Pas en mode interactif (ex: -V, -l, etc.) → ne pas bloquer
+        return Ok(());
+    }
+
+    // Wrapper absent → demander confirmation
+    eprintln!();
+    eprintln!("═══════════════════════════════════════════════════════════");
+    eprintln!("Wrapper 'opencode-wrap' non trouvé dans /usr/local/bin");
+    eprintln!();
+    eprintln!("Ce wrapper lance opencode et capture le % de contexte");
+    eprintln!("à la sortie pour l'afficher dans opencode-start-menu.");
+    eprintln!("L'installation nécessite sudo pour écrire dans /usr/local/bin.");
+    eprint!("Installer maintenant ? [O/n] ");
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "o" || answer == "oui" || answer == "y" || answer == "yes" {
+        eprintln!("Compilation et installation du wrapper...");
+
+        // Trouver le répertoire du wrapper (relatif au binaire actuel)
+        let current_exe = std::env::current_exe()?;
+        let wrapper_dir = current_exe
+            .parent()
+            .and_then(|p| p.parent()) // target/debug ou target/release
+            .map(|p| p.join("../wrapper"))
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wrapper"));
+
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release"])
+            .current_dir(&wrapper_dir)
+            .status()?;
+
+        if !status.success() {
+            eprintln!("Échec de la compilation du wrapper.");
+            return Ok(());
         }
-        if in_package && t.starts_with('[') {
-            break;
-        }
-        if in_package {
-            if let Some((k, v)) = t.split_once('=') {
-                if k.trim() == "name" {
-                    let name = v.trim().trim_matches('"').to_string();
-                    if !name.is_empty() {
-                        return Some(name);
-                    }
-                }
+
+        // Copier avec sudo
+        let binary_path = wrapper_dir.join("target/release/opencode-wrap");
+        let status = std::process::Command::new("sudo")
+            .args(["cp", binary_path.to_str().unwrap(), "/usr/local/bin/opencode-wrap"])
+            .status()?;
+
+        if status.success() {
+            eprintln!("✓ Wrapper installé avec succès dans /usr/local/bin/opencode-wrap");
+
+            // Migration DB : ajouter colonne context_pct
+            let db_path = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("opencode/opencode.db");
+            if db_path.exists() {
+                let conn = Connection::open(&db_path)?;
+                let _ = conn.execute(
+                    "ALTER TABLE session ADD COLUMN context_pct INTEGER DEFAULT 0",
+                    [],
+                );
+                eprintln!("✓ Migration DB effectuée (colonne context_pct ajoutée)");
             }
+        } else {
+            eprintln!("Échec de l'installation (sudo requis).");
         }
+    } else {
+        eprintln!("Installation annulée. Le % contexte ne sera pas disponible.");
     }
-    None
-}
 
-fn exit_code_of(status: io::Result<ExitStatus>) -> i32 {
-    status
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(1)
-}
-
-fn run_project_version_passthrough(project: &ProjectEntry) -> i32 {
-    let name = binary_name_from_cargo(&project.path)
-        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string());
-    for profile in ["release", "debug"] {
-        let bin = project.path.join("target").join(profile).join(&name);
-        if bin.exists() {
-            let status = std::process::Command::new(bin).arg("-V").status();
-            return exit_code_of(status);
-        }
-    }
-    let status = std::process::Command::new("cargo")
-        .args(["run", "-q", "--", "-V"])
-        .current_dir(&project.path)
-        .status();
-    exit_code_of(status)
-}
-
-fn self_variant_label(app: &App) -> String {
-    for p in &app.projects {
-        if p.path == env::current_dir().unwrap_or_default() || p.name == "OpenCode Start Menu" {
-            return variant_label(&p.version_debug, &p.status_debug);
-        }
-    }
-    variant_label(env!("CARGO_PKG_VERSION"), "")
+    eprintln!("═══════════════════════════════════════════════════════════");
+    eprintln!();
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -746,7 +863,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-    }
+}
 
     let sort_order = if cli.sort_by_name {
         SortOrder::Name
@@ -788,15 +905,37 @@ fn main() -> Result<()> {
                     eprintln!("Aucun projet ne correspond à : {keyword}");
                 }
                 [i] => {
-                    let code = run_project_version_passthrough(&app.projects[*i]);
-                    std::process::exit(code);
+                    let p = &app.projects[*i];
+                    println!(
+                        "{} : Debug={} ({}) Release={} ({})",
+                        sanitize(&p.name),
+                        sanitize(&p.version_debug),
+                        sanitize(&p.status_debug),
+                        sanitize(&p.version_release),
+                        sanitize(&p.status_release)
+                    );
                 }
                 _ => {
-                    eprintln!("Plusieurs projets correspondent à : {keyword} (mot-clé ambigu)");
+                    for i in &idx {
+                        let p = &app.projects[*i];
+                        println!(
+                            "{} : Debug={} ({}) Release={} ({})",
+                            sanitize(&p.name),
+                            sanitize(&p.version_debug),
+                            sanitize(&p.status_debug),
+                            sanitize(&p.version_release),
+                            sanitize(&p.status_release)
+                        );
+                    }
                 }
             }
         } else {
-            println!("{}", self_variant_label(&app));
+            // Version du menu lui-même (depuis le registre si possible).
+            if let Some(p) = app.projects.iter().find(|p| p.name == "OpenCode Start Menu") {
+                println!("{}_{}", sanitize(&p.version_debug), sanitize(&p.status_debug).replace(['-', ' '], "_"));
+            } else {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+            }
         }
         return Ok(());
     }
@@ -818,13 +957,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.root {
+if cli.root {
         eprintln!("Erreur : l'option --root requiert un mot-clé de projet.");
         return Ok(());
     }
 
+    // Vérifier et installer le wrapper si nécessaire (une seule fois, mode interactif seulement).
+    if let Err(e) = ensure_wrapper_installed() {
+        eprintln!("Erreur wrapper: {e}");
+    }
+
     // Interactive TUI mode
-    run_tui(app)
+    run_tui(app)?;
+    Ok(())
 }
 
 fn run_tui(mut app: App) -> Result<()> {
@@ -1110,14 +1255,10 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
           {
             let cum = &u.cumulative;
             entry.token = format_number(cum.total_tokens);
-            if cum.total_tokens >= 1_000_000
-              {
-                entry.used_pct = "99+".to_string();
-              }
-            else
-              {
-                entry.used_pct = format!("{}", (cum.total_tokens * 100) / 1_000_000);
-              }
+            // Budget 100M tokens pour le calcul du pourcentage (affiché dans Totaux).
+            const BUDGET_TOKENS: u64 = 100_000_000;
+            let pct = (cum.total_tokens * 100) / BUDGET_TOKENS;
+            entry.used_pct = format!("{}", pct.min(99));
             entry.spent = if cum.total_cost > 0.0
               {
                 format_currency(cum.total_cost)
@@ -1188,38 +1329,49 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
           {
             if t > entry.last_compile_debug_secs
               {
-                let valid = registry::validate_version(&entry.version_debug);
-                let init = !valid;
-                let baseline = entry.last_compile_debug_secs == 0;
                 entry.last_compile_debug_secs = t;
                 written = true;
-                if init || !baseline
+                if entry.version_manually_edited
                   {
-                    let new_version = if valid
+                    // Édition manuelle → PAS de bump, resync version depuis
+                    // Cargo.toml (déjà fait plus haut lignes 1097-1105).
+                    entry.version_manually_edited = false;
+                    changed += 1;
+                  }
+                else
+                  {
+                    // Modif code → bump z normal.
+                    let valid = registry::validate_version(&entry.version_debug);
+                    let init = !valid;
+                    let baseline = entry.last_compile_debug_secs == 0;
+                    if init || !baseline
                       {
-                        bump_patch(&entry.version_debug)
-                      }
-                    else
-                      {
-                        Some("0.0.1".to_string())
-                      };
-                    if let Some(v) = new_version
-                      {
-                        let old = if entry.version_debug.is_empty()
+                        let new_version = if valid
                           {
-                            "—".to_string()
+                            bump_patch(&entry.version_debug)
                           }
                         else
                           {
-                            entry.version_debug.clone()
+                            Some("0.0.1".to_string())
                           };
-                        entry.version_debug = v.clone();
-                        // La Release n'est PAS bumpée ici : son binaire n'a pas
-                        // été reconstruit, elle reste à sa version antérieure.
-                        entry.version = v.clone();
-                        let _ = bump_manifest_version(&entry.path, &v)?;
-                        bumps.push(format!("{old} → {v}"));
-                        changed += 1;
+                        if let Some(v) = new_version
+                          {
+                            let old = if entry.version_debug.is_empty()
+                              {
+                                "—".to_string()
+                              }
+                            else
+                              {
+                                entry.version_debug.clone()
+                              };
+                            entry.version_debug = v.clone();
+                            // La Release n'est PAS bumpée ici : son binaire n'a pas
+                            // été reconstruit, elle reste à sa version antérieure.
+                            entry.version = v.clone();
+                            let _ = bump_manifest_version(&entry.path, &v)?;
+                            bumps.push(format!("{old} → {v}"));
+                            changed += 1;
+                          }
                       }
                   }
               }
@@ -1282,6 +1434,8 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
       {
         app.push_info("Rescan : base déjà alignée sur le disque".to_string());
       }
+    // Auto-sync projet menu après rescan.
+    sync_menu_project_version(app)?;
     finalize_project_list(app);
     Ok(())
   }
@@ -1636,6 +1790,7 @@ fn handle_creation_input(
                         last_session_cost: String::new(),
                         last_agent: String::new(),
                         last_time_created: String::new(),
+                        last_session_context_pct: String::new(),
                         status_debug: status.clone(),
                         version_debug: version.clone(),
                         status_release: status.clone(),
@@ -1644,6 +1799,7 @@ fn handle_creation_input(
                         release_modified: "jamais compilée".to_string(),
                         last_compile_debug_secs: 0,
                         last_compile_release_secs: 0,
+                        version_manually_edited: false,
                       });
                     registry::save_registry(&app.registry_path, &app.projects)?;
 
@@ -1856,6 +2012,10 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
         // Champs historiques alignés sur la variante élue (Debug).
         p.version = p.version_debug.clone();
         p.status = p.status_debug.clone();
+        // Marquer version éditée manuellement → pas de bump AutoPatch au rescan.
+        p.version_manually_edited = true;
+        // Synchroniser Cargo.toml immédiatement.
+        let _ = set_manifest_version(&p.path, &p.version_debug);
     }
     true
 }
@@ -2138,25 +2298,6 @@ mod tests
     }
 
     #[test]
-    fn binary_name_reads_cargo_package() {
-        let dir = temp_dir("binname");
-        fs::write(
-            dir.join("Cargo.toml"),
-            "[package]\nname = \"dummyproj\"\nversion = \"1.2.3\"\n",
-        )
-        .unwrap();
-        assert_eq!(super::binary_name_from_cargo(&dir).as_deref(), Some("dummyproj"));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn binary_name_missing_returns_none() {
-        let dir = temp_dir("nobin");
-        assert_eq!(super::binary_name_from_cargo(&dir), None);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn initial_selection_modified_targets_latest() {
         assert_eq!(super::initial_selection_index(super::SortOrder::Modified, 1), 0);
         assert_eq!(super::initial_selection_index(super::SortOrder::Modified, 5), 4);
@@ -2189,6 +2330,7 @@ mod tests
             last_session_cost: String::new(),
             last_agent: String::new(),
             last_time_created: String::new(),
+            last_session_context_pct: String::new(),
             status_debug: String::new(),
             version_debug: String::new(),
             status_release: String::new(),
@@ -2197,6 +2339,7 @@ mod tests
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            version_manually_edited: false,
         }
     }
 
