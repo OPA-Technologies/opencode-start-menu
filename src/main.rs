@@ -874,7 +874,8 @@ fn wrapper_etat(installe: &Path) -> WrapperEtat {
     let local = wrapper_source_dir().join("target/release/opencode-wrap");
     if !local.exists() {
         // Jamais compilé en release : rien ne permet de conclure, on ne
-        //.trigger pas de mise à jour sur une simple absence de référence.
+        // Sans binaire release local de référence, impossible de conclure à
+        // une péremption : ne pas déclencher de mise à jour sur une absence.
         return WrapperEtat::AJour;
     }
     match (sha256_file(installe), sha256_file(&local)) {
@@ -943,13 +944,37 @@ fn ensure_wrapper_installed() -> Result<()> {
             return Ok(());
         }
 
-        // Copier avec sudo
-        let status = std::process::Command::new("sudo")
-            .args(["cp", binary_path.to_str().unwrap(), "/usr/local/bin/opencode-wrap"])
-            .status()?;
+        // Copier avec sudo par renommage atomique. Un « cp » direct échoue
+        // avec ETXTBSY (« Fichier texte occupé ») dès qu'un wrapper tourne,
+        // ce qui est systématiquement le cas : c'est la session lancée par ce
+        // menu qui exécute /usr/local/bin/opencode-wrap. rename(2) ne modifie
+        // que l'entrée de répertoire, donc le processus en cours garde son
+        // ancienne image et n'est pas interrompu.
+        let temp_path = "/usr/local/bin/.opencode-wrap.new";
+        let copied = std::process::Command::new("sudo")
+            .args(["cp", binary_path.to_str().unwrap(), temp_path])
+            .status()?
+            .success();
 
-        if status.success() {
-            eprintln!("✓ Wrapper {} dans /usr/local/bin/opencode-wrap", if mise_a_jour { "mis à jour" } else { "installé" });
+        let installed = if copied {
+            let moved = std::process::Command::new("sudo")
+                .args(["mv", "-f", temp_path, "/usr/local/bin/opencode-wrap"])
+                .status()?
+                .success();
+
+            if !moved {
+                let _ = std::process::Command::new("sudo").args(["rm", "-f", temp_path]).status();
+            }
+
+            moved
+        } else {
+            false
+        };
+
+        if installed {
+            let verbe = if mise_a_jour { "mis à jour" } else { "installé" };
+            eprintln!("✓ Wrapper {verbe} dans /usr/local/bin/opencode-wrap");
+            eprintln!("  Le nouveau binaire s'appliquera à la prochaine session.");
         } else {
             eprintln!("Échec de l'installation (sudo requis).");
         }
