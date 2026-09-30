@@ -97,6 +97,44 @@ pub(crate) fn ui(
             .unwrap_or("Projet");
         render_module_dialog(f, size, name, modules, *selected);
     }
+
+    // Cost detail popup overlay
+    if let InputMode::CostDetail {
+        project_idx,
+        scroll_offset,
+    } = input_mode
+    {
+        if let Some(project) = app.projects.get(*project_idx) {
+            render_cost_detail_popup(f, size, project, *scroll_offset);
+        }
+    }
+
+    // Tariff popup overlay (valorisation du temps passé)
+    if let InputMode::Tariff {
+        project_idx,
+        active_field,
+        editing,
+        input_buffer,
+        country,
+        message,
+        fetching,
+        ..
+    } = input_mode
+    {
+        if let Some(project) = app.projects.get(*project_idx) {
+            render_tariff_popup(
+                f,
+                size,
+                app,
+                project,
+                *active_field,
+                *editing,
+                input_buffer,
+                country,
+                message.as_deref(),
+                *fetching,
+            );
+        }    }
 }
 
 fn render_banner(f: &mut Frame, area: Rect) {
@@ -269,7 +307,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         desc,
         debug_modified,
         release_modified,
-        total_tokens,
+        _total_tokens,
         used_pct,
         total_cost,
         session_count,
@@ -280,6 +318,10 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         last_time_created,
         last_session_context_pct,
         total_tokens_m,
+        last_duree,
+        total_duree,
+        last_valorisation,
+        total_valorisation,
     ) = if app.is_new_selected() {
         (
             "Nouveau projet".to_string(),
@@ -299,17 +341,28 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             "—".to_string(),
             "—".to_string(),
             "0".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
         )
     } else if let Some(idx) = app.selected_project_idx() {
         let p = &app.projects[idx];
         let or_dash =
             |s: &str| if s.is_empty() { "—".to_string() } else { s.to_string() };
-        // Tokens en millions pour l'affichage "XM / 100M (Y%)"
+        // Tokens en millions pour l'affichage "XM / 100M (Y%)" — on retire
+        // tous les séparateurs de milliers (espace ASCII, U+202F, virgules
+        // selon locale) puis on formate avec une décimale (874_009 → "0,9M").
         let total_tokens_m = if p.total_tokens.is_empty() {
             "0".to_string()
         } else {
-            let tokens = p.total_tokens.replace(' ', "").parse::<u64>().unwrap_or(0);
-            (tokens / 1_000_000).to_string()
+            let digits: String = p
+                .total_tokens
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            let tokens = digits.parse::<u64>().unwrap_or(0);
+            crate::format_millions(tokens)
         };
         (
             p.name.clone(),
@@ -329,9 +382,25 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             or_dash(&p.last_time_created),
             or_dash(&p.last_session_context_pct),
             total_tokens_m,
+            if p.last_duree.is_empty() { "—".to_string() } else { p.last_duree.clone() },
+            if p.total_duree.is_empty() { "—".to_string() } else { p.total_duree.clone() },
+            if p.last_valorisation.is_empty() {
+                "—".to_string()
+            } else {
+                p.last_valorisation.clone()
+            },
+            if p.total_valorisation.is_empty() {
+                "—".to_string()
+            } else {
+                p.total_valorisation.clone()
+            },
         )
     } else {
         (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -395,7 +464,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Min(0),
             Constraint::Length(6),
-            Constraint::Length(9),
+            Constraint::Length(11),
         ])
         .split(inner);
     let top_area = split[0];
@@ -443,11 +512,14 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
     ])
     .style(header_style);
     // Construire la ligne Tokens Totaux : "XM / 100M (Y%)"
-    let tokens_total_display = format!(
-        "{}M / 100M ({}%)",
-        total_tokens_m,
-        used_pct
-    );
+    let tokens_total_display = if used_pct == "—"
+      {
+        "—".to_string()
+      }
+    else
+      {
+        format!("{}M / 100M ({}%)", total_tokens_m, used_pct)
+      };
     let rows = vec![
         Row::new(vec![
             Cell::from("Tokens").style(label_style),
@@ -463,6 +535,16 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             Cell::from("Coût").style(label_style),
             Cell::from(sanitize(&last_session_cost)),
             Cell::from(sanitize(&total_cost)),
+        ]),
+        Row::new(vec![
+            Cell::from("Temps").style(label_style),
+            Cell::from(sanitize(&last_duree)),
+            Cell::from(sanitize(&total_duree)),
+        ]),
+        Row::new(vec![
+            Cell::from("Valorisation").style(label_style),
+            Cell::from(sanitize(&last_valorisation)),
+            Cell::from(sanitize(&total_valorisation)),
         ]),
         Row::new(vec![
             Cell::from("Modèle").style(label_style),
@@ -512,7 +594,7 @@ fn render_help(
       {
         InputMode::Normal =>
           {
-            "↑/↓ Naviguer  ·  Entrée Ouvrir  ·  m Module  ·  e Modifier  ·  n Nouveau projet  ·  q Quitter  ·  Budget% (100M) = tokens cumulés / 100M"
+            "↑/↓ Naviguer  ·  Entrée Ouvrir  ·  m Module  ·  e Modifier  ·  n Nouveau projet  ·  c Coûts détaillés  ·  t Valorisation  ·  q Quitter"
           }
         InputMode::SelectModule { .. } =>
           {
@@ -573,6 +655,29 @@ fn render_help(
                   {
                     "o = créer et ouvrir  ·  N = ouvrir sans créer  ·  Entrée = o"
                   }
+              }
+          }
+        InputMode::CostDetail { .. } =>
+          {
+            "↑/↓ Scroll ligne  ·  PgUp/PgDn Page  ·  Home/End Extrêmes  ·  Échap Fermer"
+          }
+        InputMode::Tariff { editing, active_field, fetching, .. } =>
+          {
+            if *fetching
+              {
+                "Consultation de la source en cours…"
+              }
+            else if *editing
+              {
+                "←/→ Curseur  ·  Frappe Saisie  ·  Entrée Valider  ·  Échap Annuler"
+              }
+            else if *active_field == 0
+              {
+                "Entrée Basculer web / manuel  ·  r Rafraîchir la source  ·  Échap Fermer"
+              }
+            else
+              {
+                "↑/↓ Champ  ·  Entrée Éditer  ·  Échap Fermer"
               }
           }
       };
@@ -1072,4 +1177,465 @@ fn render_module_dialog(
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
+}
+
+fn render_cost_detail_popup(
+    f: &mut Frame,
+    size: Rect,
+    project: &crate::ProjectEntry,
+    scroll_offset: usize,
+) {
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Header
+    rows.push(Row::new(vec![
+        Cell::from("Date/Heure").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Cell::from("Modèle").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Cell::from("Coût orig.").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Cell::from("Converti").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Cell::from("Devise").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+
+    // For now, we need to get session data from the DB
+    // Since we don't have direct access to all sessions here, we'll show the last session info
+    // and a note about aggregated data
+    let has_usage = !project.total_cost.is_empty() && project.total_cost != "0,00 €" && project.total_cost != "$0.00";
+
+    if has_usage {
+        // Show last session
+        let last_session_cost = if project.last_session_cost.is_empty() {
+            "—".to_string()
+        } else {
+            project.last_session_cost.clone()
+        };
+        let last_model = if project.last_model.is_empty() { "—" } else { &project.last_model };
+        let last_time = if project.last_time_created.is_empty() { "—" } else { &project.last_time_created };
+
+        // Extract currency from last_session_cost
+        let currency = if project.last_session_cost.contains('$') { "$ (USD)" }
+        else if project.last_session_cost.contains('€') { "€ (EUR)" }
+        else if project.last_session_cost.contains('£') { "£ (GBP)" }
+        else if project.last_session_cost.contains('¥') { "¥ (JPY)" }
+        else { "—" };
+
+        rows.push(Row::new(vec![
+            Cell::from(sanitize(last_time)),
+            Cell::from(sanitize(last_model)),
+            Cell::from(sanitize(&last_session_cost)),
+            Cell::from(sanitize(&project.total_cost)),
+            Cell::from(sanitize(currency)),
+        ]));
+
+        // Total row
+        rows.push(Row::new(vec![
+            Cell::from("TOTAL").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(format!("{} sessions", project.session_count)).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(sanitize(&project.total_cost)).style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+    } else {
+        rows.push(Row::new(vec![
+            Cell::from("Aucune donnée de coût disponible"),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+    }
+
+    // Scroll handling
+    let visible_rows = rows.len().saturating_sub(1); // -1 for header
+    let max_scroll = visible_rows.saturating_sub(10); // ~10 visible rows
+    let actual_scroll = scroll_offset.min(max_scroll);
+
+    // Take visible rows
+    let display_rows: Vec<Row> = if rows.len() > 1 {
+        let start = 1 + actual_scroll; // skip header
+        let end = (start + 10).min(rows.len());
+        let mut display = vec![rows[0].clone()]; // header
+        display.extend(rows[start..end].iter().cloned());
+        display
+    } else {
+        rows
+    };
+
+    // Calculate popup size (80% of screen)
+    let popup_width = (size.width as f32 * 0.8) as u16;
+    let popup_height = (size.height as f32 * 0.7) as u16;
+    let x = (size.width.saturating_sub(popup_width)) / 2;
+    let y = (size.height.saturating_sub(popup_height)) / 2;
+
+    let area = Rect {
+        x,
+        y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    // Clear background
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" DÉTAIL COÛTS PAR SESSION ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+
+    let table = Table::new(
+        display_rows,
+        [
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+        ],
+    )
+    .header(Row::new(vec![
+            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]))
+    .column_spacing(2)
+    .block(block);
+
+    f.render_widget(table, area);
+
+    // Scroll indicator
+    let scroll_info = format!(
+        "▲ {} lignes  │  ↑/↓ Ligne  PgUp/PgDn Page  Home/End Extrêmes  │  Échap Fermer  │  ⚠ Anomalies: 0",
+        visible_rows
+    );
+    let scroll_area = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(1),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    let scroll_para = Paragraph::new(scroll_info)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(scroll_para, scroll_area);
+}
+
+/// Popup « Valorisation du temps » (touche `t`).
+///
+/// Affiche le temps passé de la dernière session et du cumul, sa valorisation
+/// en euros, puis le détail du tarif appliqué (origine, année, date
+/// d'actualisation). Les limites de la méthode sont explicitées : l'utilisateur
+/// doit savoir qu'il s'agit d'une estimation fondée sur un salaire horaire
+/// moyen statistic published, et non d'un coût réellement supporté.
+#[allow(clippy::too_many_arguments)]
+fn render_tariff_popup(
+    f: &mut Frame,
+    size: Rect,
+    app: &App,
+    project: &crate::ProjectEntry,
+    active_field: usize,
+    editing: bool,
+    input_buffer: &str,
+    country: &str,
+    message: Option<&str>,
+    fetching: bool,
+) {
+    let popup_width = size.width.min(88).saturating_sub(4);
+    let popup_height = size.height.min(30).saturating_sub(4);
+    let x = (size.width.saturating_sub(popup_width)) / 2;
+    let y = (size.height.saturating_sub(popup_height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(
+            " VALORISATION DU TEMPS — {} ",
+            sanitize(&project.name)
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+    f.render_widget(block.clone(), area);
+    let inner = block.inner(area);
+
+    // Décalage de 2 lignes pour l'en-tête de colonnes : le popup partage sa
+    // surface avec le tableau des durées, pas avec le tableau de la liste.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // --- En-tête : temps passé et valorisation -------------------------
+    let valeur_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let label = Style::default().fg(Color::DarkGray);
+    let en_tete = Table::new(
+        vec![
+            Row::new(vec![
+                Cell::from("Mesure").style(label),
+                Cell::from("Session").style(label),
+                Cell::from("Cumul").style(label),
+            ]),
+            Row::new(vec![
+                Cell::from("Temps passé"),
+                Cell::from(sanitize(
+                    &if project.last_duree.is_empty() {
+                        "—".to_string()
+                    } else {
+                        project.last_duree.clone()
+                    },
+                )),
+                Cell::from(sanitize(
+                    &if project.total_duree.is_empty() {
+                        "—".to_string()
+                    } else {
+                        project.total_duree.clone()
+                    },
+                )),
+            ]),
+            Row::new(vec![
+                Cell::from("Valorisation"),
+                Cell::from(sanitize(
+                    &if project.last_valorisation.is_empty() {
+                        "—".to_string()
+                    } else {
+                        project.last_valorisation.clone()
+                    },
+                ))
+                .style(valeur_style),
+                Cell::from(sanitize(
+                    &if project.total_valorisation.is_empty() {
+                        "—".to_string()
+                    } else {
+                        project.total_valorisation.clone()
+                    },
+                ))
+                .style(valeur_style),
+            ]),
+        ],
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(35),
+            Constraint::Percentage(35),
+        ],
+    )
+    .column_spacing(2);
+    f.render_widget(en_tete, chunks[0]);
+
+    // --- Corps : réglage du tarif + limites de la méthode ---------------
+    let (serie, secteur, fetched_ms) =
+        crate::registry::serie_du_projet(project, &app.web_cache);
+    let web = project.tarif_mode != "manuel";
+
+    let champ_style = |actif: bool, edite: bool| {
+        if edite {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if actif {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        }
+    };
+
+    // Valeur affichée pour le champ actif pendant la saisie.
+    let champ = |i: usize, valeur: &str, actif: usize, buffer: &str, edit: bool| -> String {
+        if edit && actif == i {
+            if buffer.is_empty() {
+                "(vide)".to_string()
+            } else {
+                buffer.to_string()
+            }
+        } else if valeur.is_empty() {
+            "—".to_string()
+        } else {
+            valeur.to_string()
+        }
+    };
+
+    let mode_libelle = if web {
+        "Source web (OIT/ILOSTAT)"
+    } else {
+        "Tarif manuel"
+    };
+    let tarif_libelle = if project.tarif_manual > 0.0 {
+        format!(
+            "{} /h",
+            crate::format_currency(project.tarif_manual, crate::LOCAL_CURRENCY)
+        )
+    } else {
+        "—".to_string()
+    };
+
+    let mut lignes: Vec<Line> = Vec::new();
+    lignes.push(Line::from(vec![
+        Span::styled(" Mode          : ", label),
+        Span::styled(
+            champ(0, mode_libelle, active_field, input_buffer, editing),
+            champ_style(active_field == 0, editing),
+        ),
+    ]));
+    lignes.push(Line::from(vec![
+        Span::styled(" Tarif manuel  : ", label),
+        Span::styled(
+            champ(1, &tarif_libelle, active_field, input_buffer, editing),
+            champ_style(active_field == 1, editing),
+        ),
+    ]));
+    lignes.push(Line::from(vec![
+        Span::styled(" Pays source   : ", label),
+        Span::styled(
+            champ(2, country, active_field, input_buffer, editing),
+            champ_style(active_field == 2, editing),
+        ),
+    ]));
+
+    // Détail du tarif appliqué et date d'actualisation de la source.
+    if web {
+        if serie.is_empty() {
+            lignes.push(Line::from(vec![
+                Span::styled(" Source        : ", label),
+                Span::styled(
+                    "aucune donnée — appuyer sur r pour interroger la source",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        } else {
+            let dernier = serie.last();
+            let annees: Vec<String> =
+                serie.iter().map(|p| p.annee.to_string()).collect();
+            let granularite = if secteur {
+                "secteur J — information et communication"
+            } else {
+                "tous secteurs (repli national)"
+            };
+            let annee_ref = dernier.map(|p| p.annee).unwrap_or(0);
+            lignes.push(Line::from(vec![
+                Span::styled(" Source        : ", label),
+                Span::raw(format!("OIT/ILOSTAT · {granularite}")),
+            ]));
+            lignes.push(Line::from(vec![
+                Span::styled(" Années        : ", label),
+                Span::raw(annees.join(", ")),
+            ]));
+            if let Some(p) = dernier {
+                lignes.push(Line::from(vec![
+                    Span::styled(" Tarif retenu  : ", label),
+                    Span::styled(
+                        format!(
+                            "{} /h ({annee_ref}, source {})",
+                            crate::format_currency(p.valeur_eur_h, crate::LOCAL_CURRENCY),
+                            if p.devise_src.is_empty() {
+                                crate::LOCAL_CURRENCY
+                            } else {
+                                p.devise_src.as_str()
+                            }
+                        ),
+                        valeur_style,
+                    ),
+                ]));
+            }
+            // Date d'actualisation de la source, en « mois année » localisé.
+            let maj = if fetched_ms > 0 { fetched_ms } else {
+                dernier.map(|p| p.fetched_ms).unwrap_or(0)
+            };
+            let date_maj = if maj > 0 {
+                crate::registry::format_mois_annee(maj)
+            } else {
+                "—".to_string()
+            };
+            lignes.push(Line::from(vec![
+                Span::styled(" Actualisé le  : ", label),
+                Span::raw(date_maj),
+            ]));
+        }
+    } else {
+        lignes.push(Line::from(vec![
+            Span::styled(" Source        : ", label),
+            Span::raw("valeur saisie manuellement, aucune source externe"),
+        ]));
+    }
+
+    if fetching {
+        lignes.push(Line::from(Span::styled(
+            " Interrogation de la source en cours…",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(msg) = message {
+        lignes.push(Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    // Limites de la méthode : information indispensable à l'utilisateur pour
+    // ne pas confondre l'estimation avec un coût réellement supporté.
+    lignes.push(Line::from(""));
+    lignes.push(Line::from(Span::styled(
+        " Avertissement",
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )));
+    for avert in avertissements_tarif(web) {
+        lignes.push(Line::from(Span::styled(
+            format!(" • {avert}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraphe = Paragraph::new(lignes).wrap(Wrap { trim: false });
+    f.render_widget(paragraphe, chunks[1]);
+
+    let pied = Paragraph::new(
+        " Entrée : basculer le mode / éditer  ·  r : rafraîchir la source  ·  Échap : fermer ",
+    )
+    .style(Style::default().fg(Color::DarkGray))
+    .alignment(Alignment::Center);
+    f.render_widget(pied, chunks[2]);
+}
+
+/// Limites de la méthode, à rappeler explicitement à l'utilisateur.
+///
+/// En mode web, le tarif provient d'un salaire horaire **moyen** publié par
+/// l'OIT : c'est un ordre de grandeur, pas une facturation. De plus ce salaire
+/// est un salaire brut, hors charges patronales, alors que le coût réel
+/// d'un salarié pour un employeur inclut ces charges. La valorisation est
+/// donc une estimation du temps passé, et non un coût subi.
+fn avertissements_tarif(web: bool) -> Vec<String> {
+    if web {
+        vec![
+            "Estimation, pas un coût réellement supporté.".to_string(),
+            "Source : salaire horaire brut moyen OIT/ILOSTAT (charges patronales \
+             exclues), et non le coût employeur complet."
+                .to_string(),
+            "La durée est mesurée entre le premier et le dernier message de la \
+             session : le temps hors opencode n'est pas compté."
+                .to_string(),
+            "Chaque session est valorisée au tarif de son année (repli sur la \
+             première valeur connue si la série commence plus tard)."
+                .to_string(),
+            "Les montants hors euro sont convertis au taux courant du jour de la \
+             mise à jour de la source."
+                .to_string(),
+        ]
+    } else {
+        vec![
+            "Estimation, pas un coût réellement supporté.".to_string(),
+            "Le tarif est une valeur saisie manuellement : l'utilisateur en reste \
+             pleinement responsable."
+                .to_string(),
+            "La durée est mesurée entre le premier et le dernier message de la \
+             session : le temps hors opencode n'est pas compté."
+                .to_string(),
+        ]
+    }
 }

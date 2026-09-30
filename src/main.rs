@@ -99,6 +99,9 @@ pub(crate) struct App {
     pending_sudo: bool,
     pending_name: Option<String>,
     pending_bare: bool,
+    /// Cache des séries de tarifs récupérées de la source web, partagé par
+    /// tous les projets (évite un téléchargement par projet).
+    pub(crate) web_cache: registry::WebCache,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -115,6 +118,27 @@ pub(crate) enum InputMode {
         project_idx: usize,
         modules: Vec<PathBuf>,
         selected: usize,
+    },
+    CostDetail {
+        project_idx: usize,
+        scroll_offset: usize,
+    },
+    /// Popup de valorisation du temps passé (touche `t`) : consultation et
+    /// réglage du tarif (source web ou saisie manuelle).
+    Tariff {
+        project_idx: usize,
+        /// Champ actif : 0 = mode, 1 = tarif manuel (€/h), 2 = pays source.
+        active_field: usize,
+        /// Saisie en cours (édition du champ actif).
+        editing: bool,
+        input_buffer: String,
+        input_offset: usize,
+        /// Pays source en cours d'édition.
+        country: String,
+        /// Message d'erreur ou d'information de la dernière action.
+        message: Option<String>,
+        /// Publication d'un nouveau tarif depuis la source web.
+        fetching: bool,
     },
 }
 
@@ -469,28 +493,53 @@ fn set_manifest_version(dir: &Path, version: &str) -> Result<bool>
   }
 
 /// Synchronise la version du projet menu (opencode-start-menu) avec
-/// la version du binaire (CARGO_PKG_VERSION). Appelé au démarrage et
-/// après chaque rescan pour garantir la cohérence.
+/// la version du binaire (CARGO_PKG_VERSION). Appelé au démarrage.
+/// Ne synchronise QUE si la version binaire est PLUS RÉCENTE que le registre
+/// (semver), ou si le registre est vide. Ne JAMAIS écraser un bump AutoPatch.
 fn sync_menu_project_version(app: &mut App) -> Result<()>
   {
     let expected_version = env!("CARGO_PKG_VERSION");
     let expected_status = "Beta-Release";
     if let Some(p) = app.projects.iter_mut().find(|p| p.name == "OpenCode Start Menu")
       {
-        if p.version_debug != expected_version
-          {
+        let registry_version = &p.version_debug;
+        let should_sync = registry_version.is_empty()
+            || version_greater(expected_version, registry_version);
+        if should_sync {
             p.version_debug = expected_version.to_string();
             p.status_debug = expected_status.to_string();
             p.version = p.version_debug.clone();
             p.status = p.status_debug.clone();
-            p.version_manually_edited = true;
+            // Sync auto vers CARGO_PKG_VERSION ≠ édition manuelle utilisateur
+            // Ne PAS toucher à version_manually_edited ici.
             let _ = set_manifest_version(&p.path, &p.version_debug);
             // Persister la mise à jour dans le registre.
-            registry::save_registry(&app.registry_path, &app.projects)?;
-          }
+            registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+        }
       }
     Ok(())
   }
+
+/// Compare deux versions semver (x.y.z). Retourne true si a > b.
+fn version_greater(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() != 3 { return None; }
+        Some((
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        ))
+    };
+    match (parse(a), parse(b)) {
+        (Some((ma, mi, pa)), Some((mb, mib, pb))) => {
+            if ma != mb { return ma > mb; }
+            if mi != mib { return mi > mib; }
+            pa > pb
+        }
+        _ => false,
+    }
+}
 
 pub(crate) const MAX_MESSAGE_LINES: usize = 6;
 
@@ -513,7 +562,9 @@ impl App {
             pending_sudo: false,
             pending_name: None,
             pending_bare: false,
+            web_cache: registry::WebCache::default(),
         };
+        app.web_cache = registry::load_web_cache(&app.registry_path);
         match registry::load_registry(&app.registry_path) {
             Ok(projects) => app.projects = projects,
             Err(e) => {
@@ -733,27 +784,56 @@ fn is_french_locale() -> bool {
     get_locale().starts_with("fr")
 }
 
+const LOCAL_CURRENCY: &str = "EUR";
+
 fn format_number(v: u64) -> String {
     let loc = if is_french_locale() { NumLocale::fr } else { NumLocale::en };
     v.to_formatted_string(&loc)
 }
 
-fn format_currency(cost: f64) -> String {
+fn format_currency(cost: f64, currency: &str) -> String {
     let cents = (cost * 100.0).round() / 100.0;
-    if is_french_locale() {
+    let symbol = match currency {
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "JPY" => "¥",
+        _ => currency,
+    };
+    let formatted = if is_french_locale() {
         format!("{:.2}", cents).replace('.', ",")
     } else {
         format!("{:.2}", cents)
+    };
+    if is_french_locale() {
+        format!("{} {}", formatted, symbol)
+    } else {
+        format!("{}{}", symbol, formatted)
     }
 }
 
 fn format_datetime(ts: i64) -> String {
-    let dt = chrono::Local.timestamp_opt(ts, 0).single().unwrap_or_default();
+    // opencode stocke time_created en millisecondes ; un timestamp en secondes
+    // reste en dessous de 10^10 jusqu'en 2286, un ms est > 10^12.
+    let secs = if ts > 10_000_000_000 { ts / 1000 } else { ts };
+    let dt = chrono::Local.timestamp_opt(secs, 0).single().unwrap_or_default();
     if is_french_locale() {
         dt.format("%d/%m/%Y %H:%M").to_string()
     } else {
         dt.format("%m/%d/%Y %H:%M").to_string()
     }
+}
+
+/// Millions avec une décimale, ex. 874_009 → "0.9M" / "0,9M" (locale fr),
+/// 41_703_416 → "41.7M" / "41,7M". Zéro final retiré (40_000_000 → "40M").
+pub(crate) fn format_millions(v: u64) -> String {
+    let m = v as f64 / 1_000_000.0;
+    let mut s = format!("{:.1}", m);
+    if s.ends_with(".0")
+      {
+        s.truncate(s.len() - 2);
+      }
+    if is_french_locale() { s.replace('.', ",") } else { s }
 }
 
 // self_variant_label removed — op -V now prints CARGO_PKG_VERSION directly.
@@ -1053,6 +1133,32 @@ fn run_tui(mut app: App) -> Result<()> {
                         app.set_bare_launch();
                         InputMode::Normal
                     }
+                    KeyCode::Char('c') => {
+                        if let Some(idx) = app.selected_project_idx() {
+                            InputMode::CostDetail {
+                                project_idx: idx,
+                                scroll_offset: 0,
+                            }
+                        } else {
+                            InputMode::Normal
+                        }
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        if let Some(idx) = app.selected_project_idx() {
+                            InputMode::Tariff {
+                                project_idx: idx,
+                                active_field: 0,
+                                editing: false,
+                                input_buffer: String::new(),
+                                input_offset: 0,
+                                country: app.web_cache.country.clone(),
+                                message: None,
+                                fetching: false,
+                            }
+                        } else {
+                            InputMode::Normal
+                        }
+                    }
                     _ => InputMode::Normal,
                 },
                 InputMode::SelectModule {
@@ -1104,6 +1210,85 @@ fn run_tui(mut app: App) -> Result<()> {
                     handle_creation_input(key, &mut state, &mut app)?
                 }
                 InputMode::EditingProject(mut state) => handle_edit_input(key, &mut state, &mut app)?,
+                InputMode::CostDetail {
+                    project_idx,
+                    mut scroll_offset,
+                } => match key.code {
+                    KeyCode::Esc => InputMode::Normal,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if scroll_offset > 0 {
+                            scroll_offset -= 1;
+                        }
+                        InputMode::CostDetail {
+                            project_idx,
+                            scroll_offset,
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        scroll_offset += 1;
+                        InputMode::CostDetail {
+                            project_idx,
+                            scroll_offset,
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if scroll_offset >= 10 {
+                            scroll_offset -= 10;
+                        } else {
+                            scroll_offset = 0;
+                        }
+                        InputMode::CostDetail {
+                            project_idx,
+                            scroll_offset,
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        scroll_offset += 10;
+                        InputMode::CostDetail {
+                            project_idx,
+                            scroll_offset,
+                        }
+                    }
+                    KeyCode::Home => {
+                        scroll_offset = 0;
+                        InputMode::CostDetail {
+                            project_idx,
+                            scroll_offset,
+                        }
+                    }
+                    KeyCode::End => {
+                        scroll_offset = usize::MAX;
+                        InputMode::CostDetail {
+                            project_idx,
+                            scroll_offset,
+                        }
+                    }
+                    _ => InputMode::CostDetail {
+                        project_idx,
+                        scroll_offset,
+                    },
+                },
+                InputMode::Tariff {
+                    project_idx,
+                    active_field,
+                    editing,
+                    input_buffer,
+                    input_offset,
+                    country,
+                    message,
+                    fetching,
+                } => handle_tariff_input(
+                    key,
+                    &mut app,
+                    project_idx,
+                    active_field,
+                    editing,
+                    input_buffer,
+                    input_offset,
+                    country,
+                    message,
+                    fetching,
+                )?,
             };
         }
 
@@ -1212,6 +1397,24 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
         added = registry::reindex_from_disk(&root, &mut app.projects)?;
       }
     let usage = registry::load_usage(&app.opencode_db_path);
+    // Rafraîchissement de la source de tarifs : au plus une fois par période
+    // de fraîcheur, et seulement si un projet utilise effectivement le mode
+    // web (pas de requête inutile pour l'utilisateur en mode manuel).
+    let maintenant = registry::maintenant_ms();
+    let mode_web_utilise = app
+        .projects
+        .iter()
+        .any(|p| p.tarif_mode != "manuel");
+    if mode_web_utilise && app.web_cache.a_fetcher(maintenant) {
+        let pays = app.web_cache.country.clone();
+        let rafraichit = app.web_cache.rafraichir(&pays, maintenant, false);
+        if rafraichit || !app.web_cache.last_error.is_empty() {
+            written = true;
+        }
+        if !app.web_cache.last_error.is_empty() {
+            app.push_error(app.web_cache.last_error.clone());
+        }
+    }
     let mut bumps: Vec<String> = Vec::new();
     for entry in &mut app.projects
       {
@@ -1259,47 +1462,113 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
             const BUDGET_TOKENS: u64 = 100_000_000;
             let pct = (cum.total_tokens * 100) / BUDGET_TOKENS;
             entry.used_pct = format!("{}", pct.min(99));
-            entry.spent = if cum.total_cost > 0.0
+            entry.spent = if cum.total_cost_local > 0.0
               {
-                format_currency(cum.total_cost)
+                format_currency(cum.total_cost_local, LOCAL_CURRENCY)
               }
             else
               {
-                "—".to_string()
+                format_currency(0.0, LOCAL_CURRENCY)
               };
             entry.total_tokens = format_number(cum.total_tokens);
-            entry.total_cost = if cum.total_cost > 0.0
+            entry.total_cost = if cum.total_cost_local > 0.0
               {
-                format_currency(cum.total_cost)
+                format_currency(cum.total_cost_local, LOCAL_CURRENCY)
               }
             else
               {
-                "—".to_string()
+                format_currency(0.0, LOCAL_CURRENCY)
               };
             entry.session_count = format!("{}", cum.session_count);
+            // --- Temps passé et valorisation du temps -------------------
+            // La durée d'une session est l'écart entre son premier et son
+            // dernier message ; le cumul additionne toutes les sessions.
+            entry.total_duree = registry::format_duree(cum.total_duration_ms);
+            let (serie, secteur, fetched_ms) = registry::serie_du_projet(entry, &app.web_cache);
+            // En mode web, la série du cache (pays courant) fait référence :
+            // si elle est plus récente que la copie du projet, on la adopte.
+            // Cela prend en compte un changement de pays ou une actualisation.
+            if entry.tarif_mode != "manuel"
+              && !serie.is_empty()
+              && (entry.tarif_web_series.is_empty()
+                || entry.tarif_web_fetched_ms < fetched_ms
+                || (fetched_ms > 0 && entry.tarif_web_fetched_ms == 0)
+                // Série rapportée à un autre pays (changement de pays source)
+                || !entry
+                  .tarif_web_pays
+                  .eq_ignore_ascii_case(&app.web_cache.country))
+              {
+                entry.tarif_web_series = serie.clone();
+                entry.tarif_web_secteur = secteur;
+                entry.tarif_web_pays = app.web_cache.country.clone();
+                entry.tarif_web_fetched_ms = fetched_ms;
+                written = true;
+              }
             if let Some(ls) = &u.last_session
               {
                 entry.last_session_tokens = format_number(ls.tokens);
                 entry.last_session_cost = if ls.cost > 0.0
                   {
-                    format_currency(ls.cost)
+                    format_currency(ls.cost, &ls.currency)
                   }
                 else
                   {
-                    "—".to_string()
+                    format_currency(0.0, &ls.currency)
                   };
                 entry.last_model = ls.model.clone();
                 entry.last_agent = ls.agent.clone();
                 entry.last_time_created = format_datetime(ls.time_created);
+                entry.last_session_context_pct = format!("{}%", ls.context_pct);
+                entry.last_duree = registry::format_duree(ls.duration_ms);
+                // La session est valorisée au tarif en vigueur à sa date.
+                entry.last_valorisation =
+                  match registry::valoriser_session(
+                    ls.duration_ms,
+                    ls.time_created,
+                    &serie,
+                    secteur,
+                    fetched_ms,
+                    &entry.tarif_mode,
+                    entry.tarif_manual,
+                  ) {
+                    Some(v) => format!(
+                      "{} ({})",
+                      format_currency(v.euros, LOCAL_CURRENCY),
+                      v.etiquette()
+                    ),
+                    None => "—".to_string(),
+                  };
               }
             else
               {
                 entry.last_session_tokens = String::new();
-                entry.last_session_cost = String::new();
+                entry.last_session_cost = format_currency(0.0, LOCAL_CURRENCY);
                 entry.last_model = String::new();
                 entry.last_agent = String::new();
                 entry.last_time_created = String::new();
+                entry.last_session_context_pct = "0%".to_string();
+                entry.last_duree = "—".to_string();
+                entry.last_valorisation = "—".to_string();
               }
+            // Le cumul applique le tarif de chaque session à sa propre date
+            // (carry-forward) puis somme les montants.
+            entry.total_valorisation =
+              match registry::valoriser_cumul(
+                &u.sessions,
+                &serie,
+                secteur,
+                fetched_ms,
+                &entry.tarif_mode,
+                entry.tarif_manual,
+              ) {
+                Some(v) => format!(
+                  "{} ({})",
+                  format_currency(v.euros, LOCAL_CURRENCY),
+                  v.etiquette()
+                ),
+                None => "—".to_string(),
+              };
+            entry.tarif_resume = resume_tarif(entry, &serie, secteur, fetched_ms);
             changed += 1;
           }
         else
@@ -1315,71 +1584,73 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
             entry.last_model = String::new();
             entry.last_agent = String::new();
             entry.last_time_created = String::new();
+            entry.total_duree = "—".to_string();
+            entry.last_duree = "—".to_string();
+            entry.last_valorisation = "—".to_string();
+            entry.total_valorisation = "—".to_string();
+            entry.tarif_resume = resume_tarif(entry, &[], false, 0);
           }
-        // AutoPatch : seule la variante dont la compilation (target/debug ou
-        // /release) est plus récente que sa propre référence est traitée.
-        // Debug (variante élue) incrémente z de x.y.z ; Release rattrape la
-        // version/statut du code courant dès que son binaire est reconstruit.
-        // Aucune compilation → aucune mise à jour.
-        let t_debug = registry::variant_modified_time(&entry.path, "debug")
-          .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
+        // AutoPatch : détection des modifications de code via hash SHA256
+        // (Cargo.toml + src/**/*.rs) — plus fiable que mtime target/debug.
+        let current_hash = registry::compute_source_hash(&entry.path);
+        let hash_changed = current_hash != entry.source_hash;
+
+        if hash_changed {
+            // Modification de code détectée
+            let baseline = entry.source_hash.is_empty();
+            let old_hash = entry.source_hash.clone();
+            entry.source_hash = current_hash.clone();
+            // Mettre à jour la référence mtime pour cohérence
+            let t_debug = registry::variant_modified_time(&entry.path, "debug")
+              .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
+            if let Some(t) = t_debug {
+                entry.last_compile_debug_secs = t;
+            }
+            written = true;
+
+            if entry.version_manually_edited {
+                // Édition manuelle → PAS de bump, reset flag seulement
+                entry.version_manually_edited = false;
+                changed += 1;
+            } else {
+                // Modif code → bump z normal
+                let valid = registry::validate_version(&entry.version_debug);
+                let init = !valid;
+                if init || !baseline {
+                    let new_version = if valid {
+                        bump_patch(&entry.version_debug)
+                    } else {
+                        Some("0.0.1".to_string())
+                    };
+                    if let Some(v) = new_version {
+                        let old = if entry.version_debug.is_empty() {
+                            "—".to_string()
+                        } else {
+                            entry.version_debug.clone()
+                        };
+                        entry.version_debug = v.clone();
+                        // La Release n'est PAS bumpée ici : son binaire n'a pas
+                        // été reconstruit, elle reste à sa version antérieure.
+                        entry.version = v.clone();
+                        let _ = bump_manifest_version(&entry.path, &v)?;
+                        // Resynchroniser le hash sur le manifeste APRÈS écriture.
+                        // Sans cela le hash stocké décrit l'ancienne version, alors
+                        // que le manifeste porte la nouvelle : le rescan suivant y
+                        // voit une fausse modification et rebump à chaque
+                        // lancement.
+                        entry.source_hash = registry::compute_source_hash(&entry.path);
+                        bumps.push(format!("{} : {old} → {v}", entry.name));
+                        changed += 1;
+                    }
+                }
+            }
+        }
+
+        // Release rattrapage : si target/release reconstruit
         let t_release = registry::variant_modified_time(&entry.path, "release")
           .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
-        if let Some(t) = t_debug
-          {
-            if t > entry.last_compile_debug_secs
-              {
-                entry.last_compile_debug_secs = t;
-                written = true;
-                if entry.version_manually_edited
-                  {
-                    // Édition manuelle → PAS de bump, resync version depuis
-                    // Cargo.toml (déjà fait plus haut lignes 1097-1105).
-                    entry.version_manually_edited = false;
-                    changed += 1;
-                  }
-                else
-                  {
-                    // Modif code → bump z normal.
-                    let valid = registry::validate_version(&entry.version_debug);
-                    let init = !valid;
-                    let baseline = entry.last_compile_debug_secs == 0;
-                    if init || !baseline
-                      {
-                        let new_version = if valid
-                          {
-                            bump_patch(&entry.version_debug)
-                          }
-                        else
-                          {
-                            Some("0.0.1".to_string())
-                          };
-                        if let Some(v) = new_version
-                          {
-                            let old = if entry.version_debug.is_empty()
-                              {
-                                "—".to_string()
-                              }
-                            else
-                              {
-                                entry.version_debug.clone()
-                              };
-                            entry.version_debug = v.clone();
-                            // La Release n'est PAS bumpée ici : son binaire n'a pas
-                            // été reconstruit, elle reste à sa version antérieure.
-                            entry.version = v.clone();
-                            let _ = bump_manifest_version(&entry.path, &v)?;
-                            bumps.push(format!("{old} → {v}"));
-                            changed += 1;
-                          }
-                      }
-                  }
-              }
-          }
-        if let Some(t) = t_release
-          {
-            if t > entry.last_compile_release_secs
-              {
+        if let Some(t) = t_release {
+            if t > entry.last_compile_release_secs {
                 entry.last_compile_release_secs = t;
                 // Rattrapage : la Release reconstruite reprend la version et le
                 // statut du code courant (variante Debug élue / manifeste).
@@ -1403,7 +1674,7 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
       }
     if added > 0 || changed > 0 || written
       {
-        registry::save_registry(&app.registry_path, &app.projects)?;
+        registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
         let mut parts: Vec<String> = Vec::new();
         if !bumps.is_empty()
           {
@@ -1434,11 +1705,46 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
       {
         app.push_info("Rescan : base déjà alignée sur le disque".to_string());
       }
-    // Auto-sync projet menu après rescan.
-    sync_menu_project_version(app)?;
+    // NOTE: sync_menu_project_version appelé UNIQUEMENT au démarrage (App::new).
+    // Le rescan lit déjà Cargo.toml pour tous les projets (lignes 1308-1338),
+    // ce qui synchronise aussi le projet menu. Ne pas écraser un AutoPatch bump ici.
     finalize_project_list(app);
     Ok(())
   }
+
+/// Résumé lisible du tarif appliqué, affiché dans le popup (touche `t`).
+/// Exemple : « web · 21,58 €/h · OIT/ILOSTAT (secteur J) · 2024 ·
+/// récupéré le sept. 2026 ».
+fn resume_tarif(
+    p: &ProjectEntry,
+    serie: &[registry::TarifPoint],
+    secteur: bool,
+    _fetched_ms: i64,
+) -> String {
+    if p.tarif_mode == "manuel" {
+        return if p.tarif_manual > 0.0 {
+            format!(
+                "manuel · {} /h saisi",
+                format_currency(p.tarif_manual, LOCAL_CURRENCY)
+            )
+        } else {
+            "manuel · aucun tarif saisi".to_string()
+        };
+    }
+    if serie.is_empty() {
+        return "web · aucune donnée source".to_string();
+    }
+    // Dernier point connu de la série (le plus récent).
+    let Some(dernier) = serie.last() else {
+        return "web · aucune donnée source".to_string();
+    };
+    let annee = dernier.annee;
+    let granularite = if secteur { "secteur J" } else { "tous secteurs" };
+    format!(
+        "web · {} /h · {granularite} · {annee}",
+        format_currency(dernier.valeur_eur_h, LOCAL_CURRENCY)
+    )
+}
 
 fn initial_selection_index(order: SortOrder, len: usize) -> usize {
     if order == SortOrder::Modified {
@@ -1795,13 +2101,25 @@ fn handle_creation_input(
                         version_debug: version.clone(),
                         status_release: status.clone(),
                         version_release: version.clone(),
-                        debug_modified: "jamais compilée".to_string(),
+debug_modified: "jamais compilée".to_string(),
                         release_modified: "jamais compilée".to_string(),
                         last_compile_debug_secs: 0,
                         last_compile_release_secs: 0,
                         version_manually_edited: false,
-                      });
-                    registry::save_registry(&app.registry_path, &app.projects)?;
+                        source_hash: String::new(),
+                        tarif_mode: "web".to_string(),
+                        tarif_manual: 0.0,
+                        tarif_web_series: Vec::new(),
+                        tarif_web_fetched_ms: 0,
+                        tarif_web_secteur: false,
+                        tarif_web_pays: String::new(),
+                        last_duree: String::new(),
+                        total_duree: String::new(),
+                        last_valorisation: String::new(),
+                        total_valorisation: String::new(),
+                        tarif_resume: String::new(),
+                    });
+                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
 
                     if matches!(
                       state.input_buffer.to_lowercase().as_str(),
@@ -2022,12 +2340,311 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
 
 const EDIT_CONFIRM_FIELD: usize = 3;
 
+/// Nombre de champs éditables du popup de valorisation :
+/// 0 = mode, 1 = tarif manuel, 2 = pays source.
+const TARIF_CHAMPS: usize = 3;
+
+/// Gestionnaire clavier du popup « Valorisation du temps » (touche `t`).
+#[allow(clippy::too_many_arguments)]
+fn handle_tariff_input(
+  key: event::KeyEvent,
+  app: &mut App,
+  mut project_idx: usize,
+  active_field: usize,
+  editing: bool,
+  mut input_buffer: String,
+  mut input_offset: usize,
+  country: String,
+  mut message: Option<String>,
+  _fetching: bool,
+) -> Result<InputMode>
+   {
+    macro_rules! popup
+      {
+        ($editing:expr, $buffer:expr, $offset:expr, $msg:expr) =>
+          {
+            InputMode::Tariff {
+              project_idx,
+              active_field,
+              editing: $editing,
+              input_buffer: $buffer,
+              input_offset: $offset,
+              country,
+              message: $msg,
+              fetching: false,
+            }
+          };
+      }
+
+    // Some project might have been removed while the popup was open.
+    if project_idx >= app.projects.len()
+      {
+        return Ok(InputMode::Normal);
+      }
+
+    // Saisie en cours sur le champ actif.
+    if editing
+      {
+        match key.code
+          {
+            KeyCode::Esc => return Ok(popup!(false, String::new(), 0, message)),
+            KeyCode::Left =>
+              {
+                if input_offset > 0
+                  {
+                    input_offset -= 1;
+                  }
+                return Ok(popup!(true, input_buffer, input_offset, message));
+              }
+            KeyCode::Right =>
+              {
+                if input_offset < input_buffer.chars().count()
+                  {
+                    input_offset += 1;
+                  }
+                return Ok(popup!(true, input_buffer, input_offset, message));
+              }
+            KeyCode::Backspace =>
+              {
+                if input_offset > 0
+                  {
+                    let idx = input_offset - 1;
+                    delete_char_at(&mut input_buffer, idx);
+                    input_offset = idx;
+                  }
+                return Ok(popup!(true, input_buffer, input_offset, message));
+              }
+            KeyCode::Char(c) =>
+              {
+                // Le tarif manuel n'accepte que les chiffres, le point et la
+                // virgule décimale ; le pays est un code ISO3 en majuscules.
+                let accepte = match active_field
+                  {
+                    1 => c.is_ascii_digit() || c == '.' || c == ',',
+                    2 => c.is_ascii_alphabetic(),
+                    _ => false,
+                  };
+                if accepte
+                  {
+                    let pos = input_offset.min(input_buffer.chars().count());
+                    let c2 = if active_field == 2
+                      {
+                        c.to_ascii_uppercase()
+                      }
+                    else
+                      {
+                        c
+                      };
+                    insert_char_at(&mut input_buffer, c2, pos);
+                    input_offset = (pos + 1).min(input_buffer.chars().count());
+                    message = None;
+                  }
+                return Ok(popup!(true, input_buffer, input_offset, message));
+              }
+            KeyCode::Enter => {}
+            _ => return Ok(popup!(true, input_buffer, input_offset, message)),
+          }
+        // Validation (Entrée)
+        match active_field
+          {
+            1 =>
+              {
+                // Le tarif saisi remplace la virgule décimale par un point.
+                let brut = input_buffer.trim().replace(',', ".");
+                match brut.parse::<f64>()
+                  {
+                    Ok(v) if v >= 0.0 =>
+                      {
+                        app.projects[project_idx].tarif_manual = v;
+                        app.projects[project_idx].tarif_mode = "manuel".to_string();
+                        // Le changement de tarif doit être persisté et la
+                        // valorisation recalculée immédiatement. Le rescan
+                        // peut re-trier la liste : on retrouve l'index du
+                        // projet par son identifiant, qui est stable.
+                        let id = app.projects[project_idx].id.clone();
+                        let _ = rescan_repertoire(app);
+                        if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
+                          {
+                            project_idx = nouveau;
+                          }
+                        message = Some(format!(
+                          "Tarif manuel enregistré : {} /h",
+                          format_currency(v, LOCAL_CURRENCY)
+                        ));
+                        return Ok(popup!(false, String::new(), 0, message));
+                      }
+                    _ =>
+                      {
+                        message =
+                          Some(format!("Saisie invalide : « {input_buffer} »"));
+                        return Ok(popup!(true, input_buffer, input_offset, message));
+                      }
+                  }
+              }
+            2 =>
+              {
+                let code = input_buffer.trim().to_uppercase();
+                if code.len() == 3 && code.chars().all(|c| c.is_ascii_alphabetic())
+                  {
+                    app.web_cache.country = code.clone();
+                    // Le pays est stocké globalement : il est persisté avec
+                    // le registre. La valorisation n'est recalculée qu'au
+                    // rafraîchissement explicite (r), pour ne pas écraser un
+                    // tarif manuel au simple changement de pays.
+                    if let Err(e) = registry::save_registry_full(
+                      &app.registry_path,
+                      &app.projects,
+                      &app.web_cache,
+                    ) {
+                      message = Some(format!("Registre non écrit : {e}"));
+                    } else {
+                      message = Some(format!("Pays source : {code} — r pour actualiser"));
+                    }
+                    return Ok(popup!(false, String::new(), 0, message));
+                  }
+                message = Some(format!(
+                  "Code pays invalide : « {code} » (3 lettres, ex. FRA)"
+                ));
+                return Ok(popup!(true, input_buffer, input_offset, message));
+              }
+            _ => {}
+          }
+        return Ok(popup!(false, String::new(), 0, message));
+      }
+
+    // Navigation entre champs et actions.
+    match key.code
+      {
+        KeyCode::Esc | KeyCode::Char('q') => return Ok(InputMode::Normal),
+        KeyCode::Up | KeyCode::Char('k') =>
+          {
+            let next = if active_field == 0 { TARIF_CHAMPS - 1 } else { active_field - 1 };
+            return Ok(InputMode::Tariff {
+              project_idx,
+              active_field: next,
+              editing: false,
+              input_buffer: String::new(),
+              input_offset: 0,
+              country,
+              message,
+              fetching: false,
+            });
+          }
+        KeyCode::Down | KeyCode::Char('j') =>
+          {
+            let next = (active_field + 1) % TARIF_CHAMPS;
+            return Ok(InputMode::Tariff {
+              project_idx,
+              active_field: next,
+              editing: false,
+              input_buffer: String::new(),
+              input_offset: 0,
+              country,
+              message,
+              fetching: false,
+            });
+          }
+        KeyCode::Tab =>
+          {
+            let next = (active_field + 1) % TARIF_CHAMPS;
+            return Ok(InputMode::Tariff {
+              project_idx,
+              active_field: next,
+              editing: false,
+              input_buffer: String::new(),
+              input_offset: 0,
+              country,
+              message,
+              fetching: false,
+            });
+          }
+        KeyCode::Enter =>
+          {
+            // Champ 0 : bascule web / manuel. Champ 1 et 2 : ouverture de
+            // l'éditeur, pré-rempli avec la valeur courante.
+            if active_field == 0
+              {
+                let projet = &mut app.projects[project_idx];
+                if projet.tarif_mode == "manuel"
+                  {
+                    projet.tarif_mode = "web".to_string();
+                    message =
+                      Some("Mode source web activé — r pour actualiser".to_string());
+                  }
+                else
+                  {
+                    if projet.tarif_manual <= 0.0
+                      {
+                        message =
+                          Some("Saisissez d'abord un tarif manuel (champ 2)".to_string());
+                        return Ok(popup!(false, String::new(), 0, message));
+                      }
+                    projet.tarif_mode = "manuel".to_string();
+                    message = Some("Mode manuel activé".to_string());
+                  }
+                let id = app.projects[project_idx].id.clone();
+                let _ = rescan_repertoire(app);
+                if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
+                  {
+                    project_idx = nouveau;
+                  }
+                return Ok(popup!(false, String::new(), 0, message));
+              }
+            let buffer = match active_field
+              {
+                1 => app.projects[project_idx]
+                  .tarif_manual
+                  .to_string()
+                  .replace('.', ","),
+                2 => app.web_cache.country.clone(),
+                _ => String::new(),
+              };
+            let offset = buffer.chars().count();
+            return Ok(popup!(true, buffer, offset, message));
+          }
+        KeyCode::Char('r') | KeyCode::Char('R') =>
+          {
+            // Actualisation forcée de la source, pour le pays courant.
+            let pays = app.web_cache.country.clone();
+            let maintenant = registry::maintenant_ms();
+            let change = app.web_cache.rafraichir(&pays, maintenant, true);
+            if !app.web_cache.last_error.is_empty()
+              {
+                let err = app.web_cache.last_error.clone();
+                message = Some(err);
+              }
+            else if change
+              {
+                let annee = app
+                  .web_cache
+                  .rates
+                  .get(&pays)
+                  .and_then(|s| s.last())
+                  .map(|p| p.annee)
+                  .unwrap_or(0);
+                let maj = registry::format_mois_annee(maintenant);
+                message = Some(format!(
+                  "Source actualisée ({pays}, {annee}) le {maj}"
+                ));
+              }
+            else
+              {
+                message = Some(format!("Source déjà à jour ({pays})"));
+              }
+            // Recalcul immédiat des durées valorisées.
+            let _ = rescan_repertoire(app);
+            return Ok(popup!(false, String::new(), 0, message));
+          }
+        _ => return Ok(popup!(false, String::new(), 0, message)),
+      }
+   }
+
 fn handle_edit_input(
   key: event::KeyEvent,
   state: &mut ProjectEditState,
   app: &mut App,
 ) -> Result<InputMode>
-  {
+   {
     if state.editing
       {
         match key.code
@@ -2202,7 +2819,7 @@ fn handle_edit_input(
                   }
                 else if apply_edit(app, state)
                   {
-                    registry::save_registry(&app.registry_path, &app.projects)?;
+                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
                     app.push_info(
                       "Projet mis à jour : variante Debug enregistrée".to_string(),
                     );
@@ -2229,7 +2846,7 @@ fn handle_edit_input(
               {
                 if state.active_field == EDIT_CONFIRM_FIELD && apply_edit(app, state)
                   {
-                    registry::save_registry(&app.registry_path, &app.projects)?;
+                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
                     app.push_info(
                       "Projet mis à jour : variante Debug enregistrée".to_string(),
                     );
@@ -2340,6 +2957,18 @@ mod tests
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
             version_manually_edited: false,
+            source_hash: String::new(),
+            tarif_mode: "web".to_string(),
+            tarif_manual: 0.0,
+            tarif_web_series: Vec::new(),
+            tarif_web_fetched_ms: 0,
+            tarif_web_secteur: false,
+            tarif_web_pays: String::new(),
+            last_duree: String::new(),
+            total_duree: String::new(),
+            last_valorisation: String::new(),
+            total_valorisation: String::new(),
+            tarif_resume: String::new(),
         }
     }
 
@@ -2509,6 +3138,79 @@ mod tests
       }
 
     #[test]
+    fn autopatch_ne_rebump_pas_a_l_chaque_lancement()
+      {
+        let dir = temp_dir("autopatch");
+        let projet = dir.join("projet-factice");
+        fs::create_dir_all(projet.join("src")).unwrap();
+        let manifeste = |v: &str| {
+            format!("[package]\nname = \"projet-factice\"\nversion = \"{v}\"\n\n[dependencies]\n")
+          };
+        fs::write(projet.join("Cargo.toml"), manifeste("0.1.0")).unwrap();
+        fs::write(projet.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        // Registre décrivant l'état AVANT la modification de code : source_hash
+        // correspond au code d'origine, version 0.1.0.
+        let hash_initial = super::registry::compute_source_hash(&projet);
+        let registre = dir.join("projects.json");
+        let ecrire_registre = |source_hash: &str| {
+            let json = serde_json::json!({
+                "projects": {
+                    "projet-factice": {
+                        "name": "projet-factice",
+                        "path": projet.to_str().unwrap(),
+                        "version": "0.1.0",
+                        "version_debug": "0.1.0",
+                        "source_hash": source_hash,
+                        // Mode manuel : aucun appel réseau pendant le rescan.
+                        "tarif_mode": "manuel",
+                        "description": ""
+                    }
+                }
+            });
+            fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+          };
+        ecrire_registre(&hash_initial);
+
+        // Modification de code : c'est elle qui doit déclencher l'unique bump.
+        fs::write(projet.join("src/main.rs"), "fn main() { println!(\"v2\"); }\n").unwrap();
+
+        // Lancement n°1 : bump attendu, puis hash resynchronisé sur le
+        // manifeste réellement écrit.
+        let app = super::App::new(registre.clone(), super::SortOrder::Modified);
+        let apres_run1 = app
+          .projects
+          .iter()
+          .find(|p| p.path == projet)
+          .expect("projet présent après le premier rescan")
+          .clone();
+        assert_eq!(apres_run1.version_debug, "0.1.1");
+        let manifest = fs::read_to_string(projet.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("version = \"0.1.1\""), "manifeste : {manifest}");
+        // L'invariant central : le hash stocké décrit le manifeste ÉCRIT.
+        assert_eq!(
+          apres_run1.source_hash,
+          super::registry::compute_source_hash(&projet),
+          "le hash stocké doit décrire le manifeste post-bump, sinon le rescan \
+           suivant détecte une fausse modification"
+        );
+
+        // Lancement n°2 et n°3 : plus aucun bump, plus aucune écriture.
+        for n in 2..=3 {
+            let app = super::App::new(registre.clone(), super::SortOrder::Modified);
+            let e = app
+              .projects
+              .iter()
+              .find(|p| p.path == projet)
+              .expect("projet présent au rescan suivant");
+            assert_eq!(e.version_debug, "0.1.1", "bump intempestif au lancement n°{n}");
+            let manifest = fs::read_to_string(projet.join("Cargo.toml")).unwrap();
+            assert!(manifest.contains("version = \"0.1.1\""), "lancement n°{n} : {manifest}");
+          }
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    #[test]
     fn bump_manifest_version_absent_returns_false()
       {
         let dir = temp_dir("nomanifest");
@@ -2531,5 +3233,23 @@ mod tests
         assert!(content.contains("foo = \"1\""));
         assert!(content.contains("[dependencies]"));
         fs::remove_dir_all(&dir).unwrap();
+      }
+
+    #[test]
+    fn format_millions_une_decimale_et_zero_final()
+      {
+        // La locale machine (fr_FR) produit une virgule décimale.
+        let sep = if super::is_french_locale() { "," } else { "." };
+        assert_eq!(super::format_millions(874_009), format!("0{sep}9"));
+        assert_eq!(super::format_millions(41_703_416), format!("41{sep}7"));
+        assert_eq!(super::format_millions(40_000_000), "40");
+        assert_eq!(super::format_millions(0), "0");
+      }
+
+    #[test]
+    fn format_datetime_accepte_ms_et_secondes()
+      {
+        // opencode stocke time_created en millisecondes (13 chiffres)
+        assert_eq!(super::format_datetime(1_000_000_000_000), super::format_datetime(1_000_000_000));
       }
   }
