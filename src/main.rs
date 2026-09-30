@@ -12,7 +12,6 @@ use ratatui::{
     widgets::ListState,
     Terminal,
 };
-use rusqlite::Connection;
 use std::{
     cmp::Ordering,
     env,
@@ -838,30 +837,88 @@ pub(crate) fn format_millions(v: u64) -> String {
 
 // self_variant_label removed — op -V now prints CARGO_PKG_VERSION directly.
 
-/// Vérifie si le wrapper opencode-wrap est installé dans /usr/local/bin.
-/// Si absent, propose l'installation avec prompt utilisateur (sudo requis).
+/// Répertoire du crate `wrapper`, déduit de l'emplacement du binaire courant
+/// (target/debug ou target/release), avec repli sur la constante de compilation.
+fn wrapper_source_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("../wrapper")))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wrapper"))
+}
+
+/// Empreinte SHA-256 d'un fichier. Sert à comparer le wrapper déployé au
+/// binaire release local, sans dépendre d'une version codée en dur qui
+/// dériverait à chaque release.
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&fs::read(path).ok()?);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// État du wrapper déployé au regard du binaire release local.
+enum WrapperEtat {
+    /// Absent de /usr/local/bin.
+    Absent,
+    /// Présent et identique au binaire local, ou aucun binaire local de
+    /// référence pour conclure.
+    AJour,
+    /// Présent mais différent du binaire local : le deployed est obsolète.
+    Perime { local: PathBuf },
+}
+
+fn wrapper_etat(installe: &Path) -> WrapperEtat {
+    if !installe.exists() {
+        return WrapperEtat::Absent;
+    }
+    let local = wrapper_source_dir().join("target/release/opencode-wrap");
+    if !local.exists() {
+        // Jamais compilé en release : rien ne permet de conclure, on ne
+        //.trigger pas de mise à jour sur une simple absence de référence.
+        return WrapperEtat::AJour;
+    }
+    match (sha256_file(installe), sha256_file(&local)) {
+        (Some(emp), Some(local_hash)) if emp != local_hash => WrapperEtat::Perime { local },
+        _ => WrapperEtat::AJour,
+    }
+}
+
+/// Vérifie que le wrapper opencode-wrap est installé dans /usr/local/bin et à
+/// jour. Si absent ou plus récent que le binaire release local, propose
+/// l'installation ou la mise à jour (sudo requis).
 fn ensure_wrapper_installed() -> Result<()> {
     let wrapper_path = PathBuf::from("/usr/local/bin/opencode-wrap");
-    if wrapper_path.exists() {
-        return Ok(());
-    }
+    let (binary_path, mise_a_jour) = match wrapper_etat(&wrapper_path) {
+        WrapperEtat::Absent => (wrapper_source_dir().join("target/release/opencode-wrap"), false),
+        WrapperEtat::AJour => return Ok(()),
+        WrapperEtat::Perime { local } => (local, true),
+    };
 
-    // Wrapper absent → ne faire l'installation interactive que si on a un TTY
+    // Installation ou mise à jour → n'interrompre que sur un TTY.
     use std::io::{self, Write, IsTerminal};
     if !io::stderr().is_terminal() {
         // Pas en mode interactif (ex: -V, -l, etc.) → ne pas bloquer
         return Ok(());
     }
 
-    // Wrapper absent → demander confirmation
     eprintln!();
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("Wrapper 'opencode-wrap' non trouvé dans /usr/local/bin");
+    if mise_a_jour {
+        eprintln!("Wrapper 'opencode-wrap' obsolète dans /usr/local/bin");
+        eprintln!();
+        eprintln!("Le binaire déployé diffère de wrapper/target/release.");
+        eprintln!("Sans mise à jour, le suivi du % de contexte, des coûts");
+        eprintln!("et de la devise peut rester sans effet.");
+        eprint!("Mettre à jour maintenant ? [O/n] ");
+    } else {
+        eprintln!("Wrapper 'opencode-wrap' non trouvé dans /usr/local/bin");
+        eprintln!();
+        eprintln!("Ce wrapper lance opencode et capture le % de contexte");
+        eprintln!("à la sortie pour l'afficher dans opencode-start-menu.");
+        eprint!("Installer maintenant ? [O/n] ");
+    }
     eprintln!();
-    eprintln!("Ce wrapper lance opencode et capture le % de contexte");
-    eprintln!("à la sortie pour l'afficher dans opencode-start-menu.");
-    eprintln!("L'installation nécessite sudo pour écrire dans /usr/local/bin.");
-    eprint!("Installer maintenant ? [O/n] ");
+    eprintln!("L'opération nécessite sudo pour écrire dans /usr/local/bin.");
     io::stderr().flush()?;
 
     let mut input = String::new();
@@ -869,15 +926,12 @@ fn ensure_wrapper_installed() -> Result<()> {
     let answer = input.trim().to_lowercase();
 
     if answer.is_empty() || answer == "o" || answer == "oui" || answer == "y" || answer == "yes" {
-        eprintln!("Compilation et installation du wrapper...");
+        eprintln!(
+            "Compilation {} du wrapper...",
+            if mise_a_jour { "et mise à jour" } else { "et installation" }
+        );
 
-        // Trouver le répertoire du wrapper (relatif au binaire actuel)
-        let current_exe = std::env::current_exe()?;
-        let wrapper_dir = current_exe
-            .parent()
-            .and_then(|p| p.parent()) // target/debug ou target/release
-            .map(|p| p.join("../wrapper"))
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wrapper"));
+        let wrapper_dir = wrapper_source_dir();
 
         let status = std::process::Command::new("cargo")
             .args(["build", "--release"])
@@ -890,31 +944,17 @@ fn ensure_wrapper_installed() -> Result<()> {
         }
 
         // Copier avec sudo
-        let binary_path = wrapper_dir.join("target/release/opencode-wrap");
         let status = std::process::Command::new("sudo")
             .args(["cp", binary_path.to_str().unwrap(), "/usr/local/bin/opencode-wrap"])
             .status()?;
 
         if status.success() {
-            eprintln!("✓ Wrapper installé avec succès dans /usr/local/bin/opencode-wrap");
-
-            // Migration DB : ajouter colonne context_pct
-            let db_path = dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("opencode/opencode.db");
-            if db_path.exists() {
-                let conn = Connection::open(&db_path)?;
-                let _ = conn.execute(
-                    "ALTER TABLE session ADD COLUMN context_pct INTEGER DEFAULT 0",
-                    [],
-                );
-                eprintln!("✓ Migration DB effectuée (colonne context_pct ajoutée)");
-            }
+            eprintln!("✓ Wrapper {} dans /usr/local/bin/opencode-wrap", if mise_a_jour { "mis à jour" } else { "installé" });
         } else {
             eprintln!("Échec de l'installation (sudo requis).");
         }
     } else {
-        eprintln!("Installation annulée. Le % contexte ne sera pas disponible.");
+        eprintln!("Opération annulée. Le % contexte ne sera pas à jour.");
     }
 
     eprintln!("═══════════════════════════════════════════════════════════");

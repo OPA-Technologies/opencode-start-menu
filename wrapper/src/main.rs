@@ -54,19 +54,6 @@ async fn update_session_data(project_dir: &str, output: &std::process::Output) -
 
     let conn = Connection::open(&db_path)?;
 
-    conn.execute(
-        "ALTER TABLE session ADD COLUMN currency TEXT DEFAULT 'USD'",
-        [],
-    )?;
-    conn.execute(
-        "ALTER TABLE session ADD COLUMN exchange_rate REAL",
-        [],
-    )?;
-    conn.execute(
-        "ALTER TABLE session ADD COLUMN cost_local REAL",
-        [],
-    )?;
-
     let exchange_rate = if let Some(ref curr) = currency {
         fetch_exchange_rate(curr, "EUR").await
     } else {
@@ -81,11 +68,7 @@ async fn update_session_data(project_dir: &str, output: &std::process::Output) -
 
     let currency_str = currency.unwrap_or_else(|| "USD".to_string());
 
-    // Cible : la session la plus récente du répertoire. La sélection passe par
-    // une sous-requête sur `id` car `ORDER BY … LIMIT` n'existe pas dans un
-    // UPDATE pour le SQLite embarqué de rusqlite (« near "ORDER": syntax
-    // error ») : la requête échouait et aucune donnée n'était jamais écrite.
-    maj_session(
+    persist_session(
         &conn,
         project_dir,
         context_pct as i64,
@@ -95,6 +78,43 @@ async fn update_session_data(project_dir: &str, output: &std::process::Output) -
     )?;
 
     Ok(())
+}
+
+/// Applique les migrations de colonnes puis reporte contexte, devise et
+/// coûts sur la session la plus récente du répertoire.
+///
+/// Les `ALTER TABLE ADD COLUMN` sont volontairement ignorés : les colonnes
+/// existent déjà après la première exécution (et le menu les crée de son
+/// côté), donc SQLite renvoie « duplicate column ». Propager cette erreur
+/// faisait sortir la fonction avant l'écriture — le wrapper n'écrivait donc
+/// jamais rien, silencieusement.
+fn persist_session(
+    conn: &Connection,
+    project_dir: &str,
+    context_pct: i64,
+    currency: &str,
+    exchange_rate: Option<f64>,
+    cost_local: Option<f64>,
+) -> rusqlite::Result<usize> {
+    let _ = conn.execute(
+        "ALTER TABLE session ADD COLUMN currency TEXT DEFAULT 'USD'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE session ADD COLUMN exchange_rate REAL", []);
+    let _ = conn.execute("ALTER TABLE session ADD COLUMN cost_local REAL", []);
+    // Le wrapper doit tenir seul : sur une installation fraîche où le menu
+    // n'a jamais tourné, context_pct n'existe pas encore et l'écriture
+    // échouerait sur « no such column ».
+    let _ = conn.execute(
+        "ALTER TABLE session ADD COLUMN context_pct INTEGER DEFAULT 0",
+        [],
+    );
+
+    // Cible : la session la plus récente du répertoire. La sélection passe par
+    // une sous-requête sur `id` car `ORDER BY … LIMIT` n'existe pas dans un
+    // UPDATE pour le SQLite embarqué de rusqlite (« near "ORDER": syntax
+    // error ») : la requête échouait et aucune donnée n'était jamais écrite.
+    maj_session(conn, project_dir, context_pct, currency, exchange_rate, cost_local)
 }
 
 /// Reporte contexte, devise et coûts sur la session la plus récente du
@@ -301,6 +321,71 @@ mod tests {
         assert_eq!(lire("recente"), (42, "EUR".to_string(), Some(0.92), Some(9.2)));
         assert_eq!(lire("vieille").1, "USD".to_string());
         assert_eq!(lire("autre").1, "USD".to_string(), "un autre répertoire ne doit pas etre touche");
+    }
+
+    #[test]
+    fn persist_session_ecrit_meme_si_les_colonnes_existent_deja() {
+        // Régression du blocage principal : les colonnes sont déjà présentes
+        // (créées par le menu ou par une exécution précédente), donc chaque
+        // « ALTER TABLE ADD COLUMN » échoue avec « duplicate column ».
+        // L'erreur était propagée par `?`, ce qui faisait sortir la fonction
+        // avant l'écriture : le wrapper n'écrivait jamais rien, sans bruit.
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT,
+                 time_created INTEGER,
+                 context_pct INTEGER DEFAULT 0,
+                 currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL,
+                 cost_local REAL
+             );
+             INSERT INTO session VALUES ('a','/p',100,0,'USD',NULL,NULL);
+             INSERT INTO session VALUES ('b','/p',200,0,'USD',NULL,NULL);",
+        )
+        .unwrap();
+
+        let n = persist_session(&c, "/p", 55, "GBP", Some(1.15), Some(11.5)).unwrap();
+        assert_eq!(n, 1, "une seule session doit etre mise a jour");
+
+        let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
+            c.query_row(
+                "SELECT context_pct, currency, exchange_rate, cost_local FROM session WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(lire("b"), (55, "GBP".to_string(), Some(1.15), Some(11.5)));
+        assert_eq!(lire("a").0, 0, "seule la session la plus recente est touchee");
+    }
+
+    #[test]
+    fn persist_session_cree_les_colonnes_manquantes() {
+        // Le cas inverse : la table n'a que les colonnes d'origine, la
+        // migration doit créer les trois autres et l'écriture doit aboutir.
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT,
+                 time_created INTEGER
+             );
+             INSERT INTO session VALUES ('a','/p',100);",
+        )
+        .unwrap();
+
+        let n = persist_session(&c, "/p", 60, "EUR", Some(1.0), Some(20.0)).unwrap();
+        assert_eq!(n, 1);
+        let v: (i64, String, Option<f64>, Option<f64>) = c
+            .query_row(
+                "SELECT context_pct, currency, exchange_rate, cost_local FROM session WHERE id = 'a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(v, (60, "EUR".to_string(), Some(1.0), Some(20.0)));
     }
 
     #[test]
