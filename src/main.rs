@@ -875,6 +875,22 @@ fn format_currency(cost: f64, currency: &str) -> String {
     }
 }
 
+/// Coût d'une session ou d'un cumul, ou « — » quand le fournisseur n'en
+/// communique aucun.
+///
+/// Un coût nul accompagné de tokens n'est pas une session gratuite : c'est une
+/// donnée absente. opencode écrit `cost = 0` quand le fournisseur ne fournit
+/// aucune grille tarifaire (OpenCode Zen, modèles « free »), et le menu
+/// affichait « 0,00 € », ce qui laissait croire à une gratuité. Seule une
+/// session réellement sans tokens garde un montant à zéro.
+fn cout_affiche(cout: f64, tokens: u64, devise: &str) -> String {
+  if cout <= 0.0 && tokens > 0 {
+    "—".to_string()
+  } else {
+    format_currency(cout, devise)
+  }
+}
+
 fn format_datetime(ts: i64) -> String {
     // opencode stocke time_created en millisecondes ; un timestamp en secondes
     // reste en dessous de 10^10 jusqu'en 2286, un ms est > 10^12.
@@ -1928,23 +1944,9 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
             const BUDGET_TOKENS: u64 = 100_000_000;
             let pct = (cum.total_tokens * 100) / BUDGET_TOKENS;
             entry.used_pct = format!("{}", pct);
-            entry.spent = if cum.total_cost_local > 0.0
-              {
-                format_currency(cum.total_cost_local, LOCAL_CURRENCY)
-              }
-            else
-              {
-                format_currency(0.0, LOCAL_CURRENCY)
-              };
+            entry.spent = cout_affiche(cum.total_cost_local, cum.total_tokens, LOCAL_CURRENCY);
             entry.total_tokens = format_number(cum.total_tokens);
-            entry.total_cost = if cum.total_cost_local > 0.0
-              {
-                format_currency(cum.total_cost_local, LOCAL_CURRENCY)
-              }
-            else
-              {
-                format_currency(0.0, LOCAL_CURRENCY)
-              };
+            entry.total_cost = cout_affiche(cum.total_cost_local, cum.total_tokens, LOCAL_CURRENCY);
             entry.session_count = format!("{}", cum.session_count);
             // --- Temps passé et valorisation du temps -------------------
             // La durée d'une session est l'écart entre son premier et son
@@ -1973,14 +1975,7 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
             if let Some(ls) = &u.last_session
               {
                 entry.last_session_tokens = format_number(ls.tokens);
-                entry.last_session_cost = if ls.cost > 0.0
-                  {
-                    format_currency(ls.cost, &ls.currency)
-                  }
-                else
-                  {
-                    format_currency(0.0, &ls.currency)
-                  };
+                entry.last_session_cost = cout_affiche(ls.cost, ls.tokens, &ls.currency);
                 entry.last_model = ls.model.clone();
                 entry.last_agent = ls.agent.clone();
                 entry.last_time_created = format_datetime(ls.time_created);
@@ -2008,7 +2003,9 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
             else
               {
                 entry.last_session_tokens = String::new();
-                entry.last_session_cost = format_currency(0.0, LOCAL_CURRENCY);
+                // Aucune session rattachée au projet : rien à afficher, pas un
+                // montant à zéro.
+                entry.last_session_cost = "—".to_string();
                 entry.last_model = String::new();
                 entry.last_agent = String::new();
                 entry.last_time_created = String::new();
@@ -3448,7 +3445,7 @@ fn handle_edit_input(
 #[cfg(test)]
 mod tests
   {
-    use crate::{sanitize, variant_label, Progress};
+    use crate::{cout_affiche, sanitize, variant_label, Progress};
     use std::{fs, path::PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -3457,6 +3454,17 @@ mod tests
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cout_nul_avec_des_tokens_vaut_pas_zero() {
+        // opencode écrit cost = 0 quand le fournisseur ne publie pas de tarif.
+        // Afficher « 0,00 € » ferait croire à une session gratuite.
+        assert_eq!(cout_affiche(0.0, 467_383, "EUR"), "—");
+        // Session réellement sans tokens : le montant reste affichable.
+        assert_ne!(cout_affiche(0.0, 0, "EUR"), "—");
+        // Un coût connu reste prioritaire sur le cas « tokens > 0 ».
+        assert_ne!(cout_affiche(12.5, 1000, "EUR"), "—");
     }
 
     #[test]

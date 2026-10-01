@@ -1204,6 +1204,13 @@ fn render_cost_detail_popup(
     // For now, we need to get session data from the DB
     // Since we don't have direct access to all sessions here, we'll show the last session info
     // and a note about aggregated data
+    // Un « — » en colonne Coût ne signifie pas « gratuit » : opencode
+    // enregistre cost = 0 quand le fournisseur ne publie aucune grille
+    // tarifaire pour le modèle employé, alors que les tokens ont bien été
+    // consommés. Les deux cas sont donc traités séparément.
+    let cout_inconnu = project.last_session_cost.trim() == "—"
+        || project.total_cost.trim() == "—";
+
     let has_usage = project.total_cost.chars().any(|c| c.is_ascii_digit() && c != '0');
 
     if has_usage {
@@ -1240,8 +1247,18 @@ fn render_cost_detail_popup(
             Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)),
         ]));
     } else {
+        // Message d'absence : distinguer « le fournisseur ne publie pas de
+        // tarif » de « aucune session ».
+        let explication = if cout_inconnu && !project.total_tokens.trim().is_empty() {
+            Cell::from(format!(
+                "Coût non communiqué par le fournisseur ({} tokens consommés)",
+                project.total_tokens
+            ))
+        } else {
+            Cell::from("Aucune donnée de coût disponible")
+        };
         rows.push(Row::new(vec![
-            Cell::from("Aucune donnée de coût disponible"),
+            explication,
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
@@ -1309,6 +1326,27 @@ fn render_cost_detail_popup(
     .block(block);
 
     f.render_widget(table, area);
+
+    // Rappel de la signification de « — », affiché seulement dans ce cas :
+    // sans lui, un utilisateur y lit un zéro ou une session non lancée.
+    if cout_inconnu {
+        let rappel = Paragraph::new(
+            "« — » : le fournisseur ne publie aucun tarif pour ce modèle, \
+             opencode enregistre donc un coût nul malgré les tokens consommés.",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+        let rappel_area = Rect {
+            x: area.x + 1,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        if rappel_area.height > 0 {
+            f.render_widget(rappel, rappel_area);
+        }
+    }
 
     // Scroll indicator
     let scroll_info = format!(
