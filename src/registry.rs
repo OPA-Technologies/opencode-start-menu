@@ -12,7 +12,12 @@ use std::{
 
 use crate::perms;
 
-static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+});
 
 const LOCAL_CURRENCY: &str = "EUR";
 
@@ -20,6 +25,9 @@ static EXCHANGE_RATE_CACHE: LazyLock<std::sync::Mutex<HashMap<String, f64>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
+    if from == to {
+        return Some(1.0);
+    }
     let cache_key = format!("{from}->{to}");
     {
         let cache = EXCHANGE_RATE_CACHE.lock().unwrap();
@@ -28,8 +36,16 @@ async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
         }
     }
 
-    let url = format!("https://api.exchangerate.host/latest?base={from}&symbols={to}");
-    let response = HTTP_CLIENT.get(&url).send().await.ok()?;
+    let url = format!("https://api.frankfurter.app/latest?from={from}&to={to}");
+    let response = HTTP_CLIENT
+        .get(&url)
+        .timeout(std::time::Duration::from_millis(HTTP_TIMEOUT_MS))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
     let json: serde_json::Value = response.json().await.ok()?;
     let rate = json.get("rates")?.get(to)?.as_f64()?;
 
@@ -280,6 +296,9 @@ struct Registry {
     // Pays ISO3 → granularité obtenue (true : secteur J, false : national).
     #[serde(default)]
     web_secteur: HashMap<String, bool>,
+    // Horodatage (ms) du dernier échec de récupération (0 = aucun échec en cours).
+    #[serde(default)]
+    web_last_failure_ms: i64,
 }
 
 #[derive(Clone)]
@@ -361,11 +380,18 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
         .into_iter()
         .map(|(id, p)| {
             let dir = PathBuf::from(shellexpand::tilde(&p.path).to_string());
-            let modified = last_modified(&dir).unwrap_or_else(|| "—".to_string());
-            let debug_modified =
-                variant_modified(&dir, "debug").unwrap_or_else(|| "jamais compilée".to_string());
-            let release_modified =
-                variant_modified(&dir, "release").unwrap_or_else(|| "jamais compilée".to_string());
+            // Une seule traversée pour l'ensemble des horodatages affichés :
+            // global, target/debug, target/release et sources.
+            let t = project_times(&dir);
+            let modified = t.overall.map(format_mod_time).unwrap_or_else(|| "—".to_string());
+            let debug_modified = t
+                .debug
+                .map(format_mod_time)
+                .unwrap_or_else(|| "jamais compilée".to_string());
+            let release_modified = t
+                .release
+                .map(format_mod_time)
+                .unwrap_or_else(|| "jamais compilée".to_string());
             // Migration source_hash : si vide, calculer le hash initial des sources
             let source_hash = if p.source_hash.is_empty() {
                 compute_source_hash(&dir)
@@ -440,35 +466,85 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
     Ok(projects)
 }
 
+/// Indique si toutes les colonnes demandées existent déjà dans `table`.
+///
+/// Vrai lecture via `PRAGMA table_info` : évite d'ouvrir une transaction
+/// d'écriture pour rien. Une table absente ou illisible renvoie `false`, ce
+/// redonne le comportement d'avant (ALTER TABLE ignorés s'ils échouent).
+fn colonnes_presents(conn: &Connection, table: &str, colonnes: &[&str]) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) else {
+        return false;
+    };
+    let existantes: Vec<String> = rows.filter_map(|r| r.ok()).collect();
+    if existantes.is_empty() {
+        return false;
+    }
+    colonnes.iter().all(|c| existantes.iter().any(|e| e == c))
+}
+
 // Nouvelle fonction pour charger les données d'usage (cumulées + dernière session)
 pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
     let mut usage = HashMap::new();
-    let Ok(conn) = Connection::open(db_path) else {
+    if !db_path.exists() {
+        return usage;
+    }
+    // Pas de SQLITE_OPEN_CREATE : ne jamais fabriquer une base vide à la place
+    // de celle d'opencode. Repli en lecture seule si l'écriture est refusée.
+    let Some(conn) = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .or_else(|_| {
+        Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    })
+    .ok() else {
         return usage;
     };
-    // Migration : ajouter les colonnes manquantes si elles n'existent pas.
-    let _ = conn.execute(
-        "ALTER TABLE session ADD COLUMN context_pct INTEGER DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE session ADD COLUMN currency TEXT DEFAULT 'USD'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE session ADD COLUMN exchange_rate REAL",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE session ADD COLUMN cost_local REAL",
-        [],
-    );
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(2_000));
+    // Migration : n'ajouter les colonnes que si elles manquent vraiment.
+    // Sans cette garde, les quatre ALTER TABLE sont tentés à chaque démarrage
+    // alors qu'ils échouent presque toujours (« duplicate column name ») ; sur
+    // une base de plus de 1 Go, ces échecs prennent un verrou d'écriture et
+    // peuvent propager le délai jusqu'aux lectures qui suivent.
+    if !colonnes_presents(
+        &conn,
+        "session",
+        &["context_pct", "currency", "exchange_rate", "cost_local"],
+    ) {
+        let _ = conn.execute(
+            "ALTER TABLE session ADD COLUMN context_pct INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE session ADD COLUMN currency TEXT DEFAULT 'USD'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE session ADD COLUMN exchange_rate REAL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE session ADD COLUMN cost_local REAL",
+            [],
+        );
+    }
 
     // D'abord, récupérer toutes les sessions pour détecter celles sans taux
     // session.id est du TEXTE (`ses_…`) : le lire en i64 renvoyait 0, la garde
     // `id > 0` était donc toujours fausse et tout ce bloc restait inerte.
+    let colonnes_ok = colonnes_presents(
+        &conn,
+        "session",
+        &["currency", "exchange_rate", "cost_local"],
+    );
     let mut sessions_to_update: Vec<(String, String, f64)> = Vec::new();
-    {
+    if colonnes_ok {
         let stmt = conn.prepare(
             "SELECT id, currency, cost FROM session WHERE directory IS NOT NULL AND (exchange_rate IS NULL OR exchange_rate = 0) AND cost > 0",
         );
@@ -513,13 +589,26 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
 
     let durations = session_durations(&conn);
 
-    let mut stmt = match conn.prepare(
+    // Colonnes ajoutées par migration : si l'ALTER a échoué (base verrouillée
+    // par opencode), on lit quand même le reste au lieu de tout perdre.
+    let expr = |col: &str, defaut: &str, vide: &str| -> String {
+        if colonnes_presents(&conn, "session", &[col]) {
+            defaut.to_string()
+        } else {
+            vide.to_string()
+        }
+    };
+    let ctx_expr = expr("context_pct", "COALESCE(context_pct,0)", "0");
+    let cur_expr = expr("currency", "COALESCE(currency, 'USD')", "'USD'");
+    let rate_expr = expr("exchange_rate", "COALESCE(exchange_rate, 0)", "0");
+    let loc_expr = expr("cost_local", "COALESCE(cost_local, 0)", "0");
+    let requete = format!(
         "SELECT id, directory, COALESCE(cost,0), \
          COALESCE(tokens_input,0) + COALESCE(tokens_output,0) + COALESCE(tokens_reasoning,0), \
-         model, agent, time_created, COALESCE(context_pct,0), \
-         COALESCE(currency, 'USD'), COALESCE(exchange_rate, 0), COALESCE(cost_local, 0) \
-         FROM session WHERE directory IS NOT NULL ORDER BY time_created DESC",
-    ) {
+         model, agent, time_created, {ctx_expr}, {cur_expr}, {rate_expr}, {loc_expr} \
+         FROM session WHERE directory IS NOT NULL ORDER BY time_created DESC"
+    );
+    let mut stmt = match conn.prepare(&requete) {
         Ok(s) => s,
         Err(_) => return usage,
     };
@@ -532,7 +621,7 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, i64>(6)?,
-            row.get::<_, u8>(7)?,
+            row.get::<_, i64>(7)?.clamp(0, 255) as u8,
             row.get::<_, String>(8)?,
             row.get::<_, f64>(9)?,
             row.get::<_, f64>(10)?,
@@ -597,6 +686,41 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
         Err(_) => {}
     }
     usage
+}
+
+/// Agrège les sessions d'un projet : celles lancées à sa racine et celles
+/// lancées depuis un sous-dossier (module, touche `m`).
+pub(crate) fn usage_du_projet(
+    usage: &HashMap<PathBuf, ProjectUsage>,
+    projet: &Path,
+) -> Option<ProjectUsage> {
+    let mut agg: Option<ProjectUsage> = None;
+    for (dir, u) in usage {
+        if !dir.starts_with(projet) {
+            continue;
+        }
+        if let Some(a) = agg.as_mut() {
+            a.cumulative.total_tokens += u.cumulative.total_tokens;
+            a.cumulative.total_cost_local += u.cumulative.total_cost_local;
+            a.cumulative.session_count += u.cumulative.session_count;
+            a.cumulative.total_duration_ms += u.cumulative.total_duration_ms;
+            for (dev, m) in &u.cumulative.cost_by_currency {
+                *a.cumulative.cost_by_currency.entry(dev.clone()).or_insert(0.0) += *m;
+            }
+            a.sessions.extend(u.sessions.iter().cloned());
+            let plus_recente = match (&a.last_session, &u.last_session) {
+                (Some(x), Some(y)) => y.time_created > x.time_created,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if plus_recente {
+                a.last_session = u.last_session.clone();
+            }
+        } else {
+            agg = Some(u.clone());
+        }
+    }
+    agg
 }
 
 /// Durée (ms) de chaque session, dérivée des messages de la table `message`
@@ -1042,6 +1166,7 @@ pub(crate) fn load_web_cache(path: &Path) -> WebCache {
     cache.rates = registry.web_rates_cache;
     cache.last_fetch_ms = registry.web_last_fetch_ms;
     cache.secteur = registry.web_secteur;
+    cache.last_failure_ms = registry.web_last_failure_ms;
     if cache.secteur.is_empty() {
         // Registre antérieur à la mémorisation de la granularité : la série
         // sectorielle (J) est celle demandée par défaut.
@@ -1269,14 +1394,22 @@ pub(crate) struct WebCache {
     pub last_error: String,
     /// Pays ISO3 → granularité obtenue (true : secteur J, false : national).
     pub secteur: HashMap<String, bool>,
+    /// Dernier échec de récupération (ms) : évite de retenter à chaque rescan.
+    pub last_failure_ms: i64,
 }
 
 /// Durée de fraîcheur du cache web avant re-téléchargement (jours).
 pub(crate) const WEB_FETCH_JOURS: i64 = 30;
 
+/// Pause (ms) après un échec avant de retenter automatiquement la source.
+const ECHEC_PAUSE_MS: i64 = 3_600_000;
+
 impl WebCache {
     /// Le cache du pays courant est-il absent ou périmé ?
     pub fn a_fetcher(&self, maintenant_ms: i64) -> bool {
+        if self.last_failure_ms > 0 && maintenant_ms - self.last_failure_ms < ECHEC_PAUSE_MS {
+            return false;
+        }
         if let Some(serie) = self.rates.get(&self.country) {
             if let Some(p) = serie.last() {
                 let age_jours = (maintenant_ms - p.fetched_ms) / 86_400_000;
@@ -1316,16 +1449,19 @@ impl WebCache {
                 self.rates.insert(pays.clone(), points);
                 self.last_fetch_ms = maintenant_ms;
                 self.last_error.clear();
+                self.last_failure_ms = 0;
                 // Mémorise la granularité obtenue (secteur J ou national).
                 self.secteur.insert(pays, secteur);
                 true
             }
             Ok(_) => {
                 self.last_error = format!("aucune donnée {TARIF_WEB_LIBELLE} pour {pays}");
+                self.last_failure_ms = maintenant_ms;
                 false
             }
             Err(e) => {
                 self.last_error = e.to_string();
+                self.last_failure_ms = maintenant_ms;
                 false
             }
         }
@@ -1351,6 +1487,12 @@ pub(crate) fn save_registry_full(
     projects: &[ProjectEntry],
     web: &WebCache,
 ) -> Result<()> {    ensure_regular(path)?;
+    // Un registre illisible est mis de côté avant d'être remplacé.
+    if let Ok(existant) = fs::read_to_string(path)
+        && serde_json::from_str::<Registry>(&existant).is_err()
+    {
+        let _ = fs::copy(path, path.with_extension("json.corrompu"));
+    }
     let mut map = HashMap::new();
     for p in projects {
         map.insert(
@@ -1404,10 +1546,15 @@ pub(crate) fn save_registry_full(
         web_last_fetch_ms: web.last_fetch_ms,
         web_country: web.country.clone(),
         web_secteur: web.secteur.clone(),
+        web_last_failure_ms: web.last_failure_ms,
     };
-    let tmp = path.with_extension("tmp");
+    // Nom temporaire propre au processus : deux instances ne se marchent pas dessus.
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     write_private(&tmp, &serde_json::to_string_pretty(&registry)?)?;
-    fs::rename(tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -1549,6 +1696,79 @@ fn last_modified(dir: &Path) -> Option<String> {
     last_modified_time(dir).map(format_mod_time)
 }
 
+/// Quatre réponses pour une seule traversée de l'arborescence d'un projet.
+///
+/// Chaque appel séparé à `last_modified_time` / `variant_modified` reparcourt
+/// l'intégralité de `target/`. Sur un projet compilé, c'est des dizaines de
+/// milliers d'inodes lus plusieurs fois par lancement ; le regroupement ci
+///-dessous ramène le nombre de traversées à une par projet.
+pub(crate) struct ProjectTimes {
+    /// Fichier le plus récent du projet, `target/` compris.
+    pub(crate) overall: Option<std::time::SystemTime>,
+    /// Fichier le plus récent sous `target/debug`.
+    pub(crate) debug: Option<std::time::SystemTime>,
+    /// Fichier le plus récent sous `target/release`.
+    pub(crate) release: Option<std::time::SystemTime>,
+    /// Fichier le plus récent parmi `Cargo.toml` et `src/**/*.rs`.
+    pub(crate) source: Option<std::time::SystemTime>,
+}
+
+pub(crate) fn project_times(dir: &Path) -> ProjectTimes {
+    let mut t = ProjectTimes {
+        overall: None,
+        debug: None,
+        release: None,
+        source: None,
+    };
+    if !dir.exists() {
+        return t;
+    }
+    let debug_dir = dir.join("target").join("debug");
+    let release_dir = dir.join("target").join("release");
+    for entree in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let chemin = entree.path();
+        let Ok(meta) = entree.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if t.overall.is_none_or(|b| mtime > b) {
+            t.overall = Some(mtime);
+        }
+        if chemin.starts_with(&debug_dir) && t.debug.is_none_or(|b| mtime > b) {
+            t.debug = Some(mtime);
+        }
+        if chemin.starts_with(&release_dir) && t.release.is_none_or(|b| mtime > b) {
+            t.release = Some(mtime);
+        }
+        if est_fichier_source(chemin, dir) && t.source.is_none_or(|b| mtime > b) {
+            t.source = Some(mtime);
+        }
+    }
+    t
+}
+
+/// `Cargo.toml` ou `.rs` sous `src/` : le périmètre suivi par
+/// [`compute_source_hash`], donc celui qui décide d'un bump AutoPatch.
+///
+/// Doit rester aligné avec [`fichiers_sources`] : les dossiers de sauvegarde
+/// sont exclus ici aussi, sinon une sauvegarde récente ferait croire à une
+/// modification de code.
+fn est_fichier_source(chemin: &Path, dir: &Path) -> bool {
+    if chemin == dir.join("Cargo.toml") {
+        return true;
+    }
+    let src_dir = dir.join("src");
+    chemin.starts_with(&src_dir)
+        && chemin.extension().is_some_and(|e| e == "rs")
+        && chemin_suivi(chemin, &src_dir)
+}
+
 pub(crate) fn variant_modified(dir: &Path, profile: &str) -> Option<String> {
     last_modified_time(&dir.join("target").join(profile)).map(format_mod_time)
 }
@@ -1558,6 +1778,77 @@ pub(crate) fn variant_modified_time(dir: &Path, profile: &str) -> Option<std::ti
   {
     last_modified_time(&dir.join("target").join(profile))
   }
+
+/// Date de modification la plus récente parmi les sources suivies par
+/// [`compute_source_hash`] : `Cargo.toml` + `src/**/*.rs`.
+///
+/// Sert à signaler un binaire plus ancien que le code qu'il est censé
+/// exécuter : c'est la cause d'une version « figée », silencieuse sinon.
+pub(crate) fn source_modified_time(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut best: Option<std::time::SystemTime> = None;
+    let mut considere = |p: &Path| {
+        if let Ok(meta) = fs::metadata(p)
+            && let Ok(mtime) = meta.modified()
+            && best.is_none_or(|b| mtime > b)
+        {
+            best = Some(mtime);
+        }
+    };
+    considere(&dir.join("Cargo.toml"));
+    for fichier in fichiers_sources(dir) {
+        considere(&fichier);
+    }
+    best
+}
+
+/// Vrai si `nom` désigne un dossier de sauvegarde ou de travail jetable.
+///
+/// Un dossier de sauvegarde posé sous `src/` est indétectable à la compilation
+/// — Rust n'y descend pas — mais il change le hash de sources. Résultat observé :
+/// huit bumps de version successifs alors qu'aucune ligne de code n'avait
+/// bougé. Ces dossiers sont donc exclus explicitement du périmètre suivi.
+///
+/// Le nom est retenu tel quel ou avec un préfixe (`src_bck`, `main_Bck`) :
+/// c'est sous cette forme que les copies de sauvegarde apparaissent en pratique.
+fn est_dossier_sauvegarde(nom: &std::ffi::OsStr) -> bool {
+    let n = nom.to_string_lossy().to_ascii_lowercase();
+    const SUFFIXES: [&str; 5] = ["_bck", "_bak", "_backup", "_old", "_orig"];
+    matches!(
+        n.as_str(),
+        "bck" | "bak" | "backup" | "backups" | "old" | "orig" | ".bak"
+    ) || SUFFIXES.iter().any(|s| n.ends_with(s))
+}
+
+/// Sous-arborescence réellementcompilee : `src/` moins les dossiers de
+/// sauvegarde. Appliqué à chaque entrée pour ne dépendre d'aucun `skip_pattern`
+/// de parcours.
+fn chemin_suivi(chemin: &Path, src_dir: &Path) -> bool {
+    let Ok(relatif) = chemin.strip_prefix(src_dir) else {
+        return true;
+    };
+    !relatif
+        .components()
+        .any(|c| est_dossier_sauvegarde(c.as_os_str()))
+}
+
+/// Liste triée des fichiers `.rs` réellement compilés sous `src/`, pour un
+/// parcours déterministe.
+fn fichiers_sources(dir: &Path) -> Vec<PathBuf> {
+    let src_dir = dir.join("src");
+    if !src_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&src_dir)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || chemin_suivi(e.path(), &src_dir))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    files.sort();
+    files
+}
 
 /// Calcule le hash SHA256 des sources du projet (Cargo.toml + src/**/*.rs).
 /// Utilisé pour détecter les modifications de code indépendamment du mtime
@@ -1575,19 +1866,8 @@ pub(crate) fn compute_source_hash(dir: &Path) -> String {
     // Hash tous les fichiers .rs sous src/
     let src_dir = dir.join("src");
     if src_dir.is_dir() {
-        let mut files: Vec<PathBuf> = Vec::new();
-        for entry in walkdir::WalkDir::new(&src_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "rs") {
-                files.push(path.to_path_buf());
-            }
-        }
+        let files = fichiers_sources(dir);
         // Trier pour ordre déterministe
-        files.sort();
         for file in &files {
             if let Ok(content) = fs::read(file) {
                 hasher.update(&content);
@@ -1614,6 +1894,49 @@ mod tests
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Les dossiers de sauvegarde placés sous `src/` ne doivent pas changer
+    /// le hash de sources : Rust ne les compile pas, mais une retouche dans
+    /// l'un d'eux déclenchait un bump de version à chaque rescan.
+    #[test]
+    fn les_dossiers_de_sauvegarde_ne_entrent_pas_dans_le_hash() {
+        let dir = temp_registry("hash-sans-bck");
+        fs::create_dir_all(dir.join("src/sub")).unwrap();
+        fs::create_dir_all(dir.join("src/src_bck")).unwrap();
+        fs::create_dir_all(dir.join("src/backup")).unwrap();
+        fs::write(dir.join("Cargo.toml"), "[package]\nversion = \"1.0.0\"\n").unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.join("src/sub/mod.rs"), "// vrai code\n").unwrap();
+        let reference = super::compute_source_hash(&dir);
+
+        // On écrit dans les deux emplacements de sauvegarde : aucun ne doit
+        // changer le hash.
+        fs::write(dir.join("src/src_bck/main.rs"), "vieille version\n").unwrap();
+        assert_eq!(super::compute_source_hash(&dir), reference);
+        fs::write(dir.join("src/backup/main.rs"), "vieille version\n").unwrap();
+        assert_eq!(super::compute_source_hash(&dir), reference);
+
+        // En revanche un vrai fichier du module change bien le hash.
+        fs::write(dir.join("src/sub/mod.rs"), "// nouveau code\n").unwrap();
+        assert_ne!(super::compute_source_hash(&dir), reference);
+
+        // Et mtime la plus récente : une sauvegarde ne doit pas dater le code.
+        let retains: Vec<String> = super::fichiers_sources(&dir)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            retains,
+            vec!["src/main.rs".to_string(), "src/sub/mod.rs".to_string()],
+            "seuls les vrais fichiers compilés doivent être suivis"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     fn assert_0600(path: &std::path::Path) {
@@ -2499,6 +2822,26 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
         ];
         let v = super::valoriser_cumul(&sessions, &serie, true, 1_700_000_000_000, "web", 0.0).unwrap();
         assert_eq!(v.annee, 2024, "l'année doit être celle de la session la plus récente (2025 → tarif 2024)");
+    }
+
+    #[test]
+    fn usage_du_projet_agrege_racine_et_modules() {
+        let mut usage: HashMap<PathBuf, super::ProjectUsage> = HashMap::new();
+        let mut a = super::ProjectUsage::default();
+        a.cumulative.total_tokens = 10;
+        a.cumulative.session_count = 1;
+        usage.insert(PathBuf::from("/p/proj"), a);
+        let mut b = super::ProjectUsage::default();
+        b.cumulative.total_tokens = 5;
+        b.cumulative.session_count = 2;
+        usage.insert(PathBuf::from("/p/proj/api"), b);
+        let mut c = super::ProjectUsage::default();
+        c.cumulative.total_tokens = 99;
+        usage.insert(PathBuf::from("/p/proj2"), c);
+        let agg = super::usage_du_projet(&usage, std::path::Path::new("/p/proj")).unwrap();
+        assert_eq!(agg.cumulative.total_tokens, 15);
+        assert_eq!(agg.cumulative.session_count, 3);
+        assert!(super::usage_du_projet(&usage, std::path::Path::new("/p/autre")).is_none());
     }
 
     #[test]
