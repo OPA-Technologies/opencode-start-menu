@@ -653,7 +653,7 @@ fn render_help(
                   }
                 _ =>
                   {
-                    "o = créer et ouvrir  ·  N = ouvrir sans créer  ·  Entrée = o"
+                    "Saisir o puis Entrée = créer et ouvrir  ·  Entrée seule = créer sans ouvrir"
                   }
               }
           }
@@ -710,6 +710,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         width: dialog_width,
         height: dialog_height,
       };
+    let area = area.intersection(size);
 
     // Fond opaque : efface la zone puis repeint tout en gris foncé
     f.render_widget(Clear, area);
@@ -820,7 +821,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
     // Curseur réel : sur la valeur du champ actif.
     // Colonne de début de valeur = bordure + libellé réel + « : ».
     let cursor_y = area.y + 3 + active as u16; // bordure(1) + 2 lignes vides + index champ
-    let cursor_x = (area.x + 1 + fields[active].0.chars().count() as u16 + 3
+    let cursor_x = (area.x + 1 + fields.get(active).map_or(13, |f| f.0.chars().count()) as u16 + 3
       + state.input_offset as u16)
       .min(x.saturating_add(dialog_width).saturating_sub(2));
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
@@ -844,6 +845,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
             width: width as u16,
             height: (visible + 2) as u16,
           };
+        let parea = parea.intersection(size);
         f.render_widget(Clear, parea);
         let mut popup: Vec<Line> = Vec::new();
         for (idx, item) in items.iter().enumerate().skip(offset).take(visible)
@@ -894,6 +896,7 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
         width: dialog_width,
         height: dialog_height,
       };
+    let area = area.intersection(size);
 
     // Fond opaque : efface la zone puis repeint tout en gris foncé
     f.render_widget(Clear, area);
@@ -1081,6 +1084,7 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
             width: width as u16,
             height: (visible + 2) as u16,
           };
+        let parea = parea.intersection(size);
         f.render_widget(Clear, parea);
         let mut popup: Vec<Line> = Vec::new();
         for (idx, item) in items.iter().enumerate().skip(offset).take(visible)
@@ -1168,6 +1172,7 @@ fn render_module_dialog(
         width: dialog_width,
         height: dialog_height,
     };
+    let area = area.intersection(size);
 
     let block = Block::default()
         .title(" Module ")
@@ -1199,7 +1204,7 @@ fn render_cost_detail_popup(
     // For now, we need to get session data from the DB
     // Since we don't have direct access to all sessions here, we'll show the last session info
     // and a note about aggregated data
-    let has_usage = !project.total_cost.is_empty() && project.total_cost != "0,00 €" && project.total_cost != "$0.00";
+    let has_usage = project.total_cost.chars().any(|c| c.is_ascii_digit() && c != '0');
 
     if has_usage {
         // Show last session
@@ -1222,7 +1227,7 @@ fn render_cost_detail_popup(
             Cell::from(sanitize(last_time)),
             Cell::from(sanitize(last_model)),
             Cell::from(sanitize(&last_session_cost)),
-            Cell::from(sanitize(&project.total_cost)),
+            Cell::from("—"),
             Cell::from(sanitize(currency)),
         ]));
 
@@ -1272,6 +1277,7 @@ fn render_cost_detail_popup(
         width: popup_width,
         height: popup_height,
     };
+    let area = area.intersection(size);
 
     // Clear background
     f.render_widget(Clear, area);
@@ -1306,7 +1312,7 @@ fn render_cost_detail_popup(
 
     // Scroll indicator
     let scroll_info = format!(
-        "▲ {} lignes  │  ↑/↓ Ligne  PgUp/PgDn Page  Home/End Extrêmes  │  Échap Fermer  │  ⚠ Anomalies: 0",
+        "▲ {} lignes  │  ↑/↓ Ligne  PgUp/PgDn Page  Home/End Extrêmes  │  Échap Fermer",
         visible_rows
     );
     let scroll_area = Rect {
@@ -1351,6 +1357,7 @@ fn render_tariff_popup(
         width: popup_width,
         height: popup_height,
     };
+    let area = area.intersection(size);
 
     f.render_widget(Clear, area);
 
@@ -1623,8 +1630,9 @@ fn avertissements_tarif(web: bool) -> Vec<String> {
             "Chaque session est valorisée au tarif de son année (repli sur la \
              première valeur connue si la série commence plus tard)."
                 .to_string(),
-            "Les montants hors euro sont convertis au taux courant du jour de la \
-             mise à jour de la source."
+            "Les montants hors euro sont convertis au taux du jour de la mise à \
+             jour de la source lorsqu'il est disponible, sinon à un taux de repli \
+             fixe et approximatif."
                 .to_string(),
         ]
     } else {
