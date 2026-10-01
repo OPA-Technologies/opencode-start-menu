@@ -45,16 +45,20 @@ Manquants :
 
 ## 6. Coûts et devises toujours à zéro (priorité haute)
 
-Le menu affiche `0,00 $` / `0,00 €` : la table `session` de `opencode.db`
-ne contient aucune ligne avec `cost > 0`.
+~~Le menu affiche `0,00 $` / `0,00 €` : la table `session` de `opencode.db`
+ne contient aucune ligne avec `cost > 0`.~~
 
-Cause trouvée et corrigée dans `wrapper/` : l'écriture des colonnes
-`context_pct`, `currency`, `exchange_rate` et `cost_local` échouait
-silencieusement. La requête utilisait `ORDER BY … LIMIT` dans un `UPDATE`,
-que le SQLite embarqué de rusqlite refuse
-(`near "ORDER": syntax error`) — le `sqlite3` système l'accepte, d'où la
-confusion. Remplacé par une sous-requête sur `id`, avec test de
-régression.
+**Analyse (2026-10-01) — FAIT (commit 1bd77bd) :** Les 82 sessions présentes
+dans `~/.local/share/opencode/opencode.db` ont `cost = 0` écrit par opencode
+lui-même, pour les modèles utilisés (OpenCode Zen / `nemotron-3-ultra-free`), car
+le fournisseur ne communique pas de grille tarifaire. Ce n'était donc pas
+uniquement un bug d'écriture du wrapper, mais surtout un problème d'affichage.
 
-À confirmer après correction : lancer une session réelle puis vérifier que
-`SELECT COUNT(*) FROM session WHERE cost > 0` devient non nul.
+**Correction :** `cout_affiche()` renvoie « — » quand un coût nul accompagne
+des tokens (coût non communiqué), et conserve un montant à zéro uniquement pour
+une session réellement sans tokens. Le popup « Détail Coûts » précise cette
+explication quand « — » est affiché.
+
+**Résultat :** L'ambiguïté est levée. Si des modèles payants sont utilisés
+ultérieurement et que le wrapper écrit bien les colonnes, les montants
+chiffrés apparaîtront automatiquement.
