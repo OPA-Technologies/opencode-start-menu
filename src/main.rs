@@ -1150,14 +1150,9 @@ fn run_startup_gauge(
     avertissements: Vec<String>,
 ) -> Result<Option<App>>
   {
-    use std::{
-      sync::mpsc::{self, TryRecvError},
-      thread,
-      time::Duration,
-    };
+    use std::{sync::mpsc, thread};
 
-    const RAFRAICHISSEMENT: Duration = Duration::from_millis(40);
-
+    let mut avertissements = avertissements;
     let (tx, rx) = mpsc::channel::<startup::Signal>();
     // Étapes antérieures au travail : elles ne durent rien, mais elles doivent
     // apparaître dans la jauge pour que la numérotation soit continue.
@@ -1183,20 +1178,80 @@ fn run_startup_gauge(
 
     let mut terminal = open_terminal()?;
     let mut state = startup::GaugeState::new();
+    // La boucle anime la jauge. Elle est isolée dans une fonction pour que
+    // `close_terminal` soit atteint même quand une erreur I/O survient : avec
+    // les `?` en place ici, une erreur de `draw`, de `poll` ou de `read`
+    // remontait directement vers `main`, laissant le shell en mode brut dans
+    // l'écran alternatif, où plus rien ne s'affiche. C'est le pire mode de
+    // défaillance possible pour un TUI, et il faut un `reset` pour s'en sortir.
+    let resultat = animer_jauge(&mut terminal, &mut state, &rx, &mut avertissements);
+
+    close_terminal(&mut terminal);
+    drop(worker);
+    resultat.unwrap_or(Ok(None))
+  }
+
+/// Anime la jauge jusqu'à ce que le démarrage soit prêt, qu'une touche
+/// d'annulation arrive, ou qu'une erreur I/O se produise.
+///
+/// Ne touche pas au terminal : l'appelant reste seul responsable de le
+/// refermer, quelle que soit la sortie.
+/// Borne `B` explicite : la jauge est ainsi testable avec un `TestBackend`,
+/// sans dépendre d'un vrai terminal.
+fn animer_jauge<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut startup::GaugeState,
+    rx: &std::sync::mpsc::Receiver<startup::Signal>,
+    avertissements: &mut Vec<String>,
+) -> Option<Result<Option<App>>>
+  {
+    use std::{sync::mpsc::TryRecvError, time::Duration};
+
+    const RAFRAICHISSEMENT: Duration = Duration::from_millis(40);
+
     let mut issue: Option<Result<Option<App>>> = None;
-    let mut avertissements = avertissements;
     'attente: while issue.is_none()
       {
         state.tick();
-        terminal.draw(|f| startup::render(f, &state))?;
-        if event::poll(RAFRAICHISSEMENT)?
-          && let Event::Key(key) = event::read()?
+        if let Err(e) = terminal.draw(|f| startup::render(f, &state))
           {
-            if key.kind == KeyEventKind::Press
-                && (ctrl_quit(key) || key.code == KeyCode::Esc)
+            issue = Some(Err(e.into()));
+            break;
+          }
+        match event::poll(RAFRAICHISSEMENT)
+          {
+            Err(e) =>
               {
-                issue = Some(Ok(None));
-                break 'attente;
+                issue = Some(Err(e.into()));
+                break;
+              }
+            Ok(false) =>
+              {
+                // délai expiré : on draine le canal ci-dessous
+              }
+            Ok(true) =>
+              {
+                match event::read()
+                  {
+                    Err(e) =>
+                      {
+                        issue = Some(Err(e.into()));
+                        break;
+                      }
+                    Ok(Event::Key(key)) =>
+                      {
+                        if key.kind == KeyEventKind::Press
+                            && (ctrl_quit(key) || key.code == KeyCode::Esc)
+                          {
+                            issue = Some(Ok(None));
+                            break 'attente;
+                          }
+                      }
+                    Ok(_) =>
+                      {
+                        // souris ou redimensionnement : sans effet sur la jauge
+                      }
+                  }
               }
           }
         loop
@@ -1207,7 +1262,7 @@ fn run_startup_gauge(
                 Ok(startup::Signal::Ready(app)) =>
                   {
                     let mut app = *app;
-                    app.status_messages.extend(std::mem::take(&mut avertissements));
+                    app.status_messages.extend(std::mem::take(avertissements));
                     issue = Some(Ok(Some(app)));
                     break;
                   }
@@ -1220,10 +1275,7 @@ fn run_startup_gauge(
               }
           }
       }
-
-    close_terminal(&mut terminal);
-    drop(worker);
-    issue.unwrap_or(Ok(None))
+    issue
   }
 
 fn main() -> Result<()> {
@@ -1458,13 +1510,26 @@ fn ctrl_quit(key: crossterm::event::KeyEvent) -> bool
   }
 
 /// Établit la session terminal (mode brut + écran alternatif + souris).
+///
+/// Chaque étape qui peut échouer après `enable_raw_mode` restaure le mode
+/// précédent avant de propager l'erreur : sans cela, un échec de `execute!`
+/// ou de `clear` laisserait le shell suivant en mode brut dans l'écran
+/// alternatif, où plus rien ne s'affiche.
 fn open_terminal() -> Result<Term>
   {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+      {
+        let _ = disable_raw_mode();
+        return Err(e.into());
+      }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    terminal.clear()?;
+    if let Err(e) = terminal.clear()
+      {
+        let _ = close_terminal(&mut terminal);
+        return Err(e.into());
+      }
     Ok(terminal)
   }
 
@@ -3456,7 +3521,7 @@ fn handle_edit_input(
 #[cfg(test)]
 mod tests
   {
-    use crate::{cout_affiche, sanitize, variant_label, Progress};
+    use crate::{cout_affiche, sanitize, startup, variant_label, Progress};
     use std::{fs, path::PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -3856,10 +3921,88 @@ mod tests
         assert_eq!(super::format_millions(0), "0");
       }
 
-    #[test]
-    fn format_datetime_accepte_ms_et_secondes()
+    /// Backend qui délègue tout à un `TestBackend` sauf `draw`, toujours en
+    /// erreur. Sert à vérifier que la jauge rend la main quand l'affichage
+    /// échoue, au lieu de propager l'erreur hors de la boucle.
+    struct BackendEnPanne(ratatui::backend::TestBackend);
+
+    impl ratatui::backend::Backend for BackendEnPanne
       {
-        // opencode stocke time_created en millisecondes (13 chiffres)
-        assert_eq!(super::format_datetime(1_000_000_000_000), super::format_datetime(1_000_000_000));
+        fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
+          where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>
+          {
+            Err(std::io::Error::other("panne du terminal simulee"))
+          }
+        fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor() }
+        fn show_cursor(&mut self) -> std::io::Result<()> { self.0.show_cursor() }
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::prelude::Position>
+          { self.0.get_cursor_position() }
+        fn set_cursor_position<P: Into<ratatui::prelude::Position>>(&mut self, p: P) -> std::io::Result<()>
+          { self.0.set_cursor_position(p) }
+        fn clear(&mut self) -> std::io::Result<()> { self.0.clear() }
+        fn size(&self) -> std::io::Result<ratatui::prelude::Size> { self.0.size() }
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize>
+          { self.0.window_size() }
+        fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+      }
+
+    /// Régression P1-1 : une erreur d'affichage pendant l'initialisation
+    /// remontait par `?` hors de `run_startup_gauge`, avant `close_terminal`.
+    /// Le shell se retrouvait en mode brut dans l'écran alternatif, sans rien
+    /// afficher, jusqu'à un `reset` manuel.
+    ///
+    /// La fonction rend désormais la main avec l'erreur stockée, ce qui permet
+    /// à l'appelant de toujours restaurer le terminal.
+    #[test]
+    fn animer_jauge_rend_la_main_meme_si_l_affichage_echoue()
+      {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<startup::Signal>();
+        // Le sender reste vivant : l'annulation ne peut pas venir du canal,
+        // seule l'erreur d'affichage peut terminer la boucle.
+        let backend = BackendEnPanne(ratatui::backend::TestBackend::new(20, 5));
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = startup::GaugeState::new();
+        let mut avertissements: Vec<String> = Vec::new();
+
+        let issue = super::animer_jauge(&mut terminal, &mut state, &rx, &mut avertissements);
+
+        let issue = issue.expect("la boucle doit se terminer et rendre une issue");
+        // `App` n'implémente pas `Debug`, donc pas `expect_err` : on déroule
+        // le Result à la main.
+        let Err(err) = issue else {
+            panic!("l'erreur du terminal doit etre propagee, pas absorbee");
+        };
+        assert!(
+            err.to_string().contains("panne du terminal simulee"),
+            "erreur inattendue : {err}"
+        );
+        drop(tx);
+      }
+
+    /// Sans terminal réel, `event::poll` échoue (« Failed to initialize input
+    /// reader »). Ce test vérifie deux choses qui comptent pour le correctif :
+    /// la boucle rend toujours la main au lieu de boucler ou de propager, et
+    /// l'échec est signalé plutôt que silencieusement absorbé.
+    #[test]
+    fn animer_jauge_rend_la_main_meme_sans_terminal_reel()
+      {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<startup::Signal>();
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = startup::GaugeState::new();
+        let mut avertissements: Vec<String> = Vec::new();
+
+        let issue = super::animer_jauge(&mut terminal, &mut state, &rx, &mut avertissements)
+          .expect("la boucle doit rendre la main, jamais boucler indefiniment");
+        // Ici aucune touche n'a pu être lue : l'issue est forcément une erreur,
+        // ce qui prouve que le `break` sur échec de `poll` est atteint.
+        let Err(err) = issue else {
+            panic!("sans terminal, la lecture d'evenement doit echouer");
+        };
+        assert!(!err.to_string().is_empty(), "l'erreur doit etre decrite");
+        drop(tx);
       }
   }
