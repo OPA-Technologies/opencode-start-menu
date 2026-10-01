@@ -13,9 +13,13 @@ makedepends=('cargo' 'rust')
 source=("opencode-start-menu-$pkgver.tar.gz::https://github.com/OPA-Technologies/opencode-start-menu/releases/download/v$pkgver/op-$pkgver-src.tar.gz")
 sha256sums=('eeead512e53cbae7130e1d69f7666103f28b15ae253794cb3c9d0834a122e036')
 
+# Le wrapper est un crate séparé : sans lui, `op` lance opencode sans
+# transmettre stdin ni enregistrer contexte et coût.
 build()
   {
     cd "$srcdir"
+    cargo build --release --locked
+    cd "$srcdir/wrapper"
     cargo build --release --locked
   }
 
@@ -23,5 +27,6 @@ package()
   {
     cd "$srcdir"
     install -Dm755 target/release/opencode-start-menu "$pkgdir"/usr/bin/op
+    install -Dm755 wrapper/target/release/opencode-wrap "$pkgdir"/usr/bin/opencode-wrap
     install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
   }

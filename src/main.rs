@@ -993,9 +993,11 @@ fn wrapper_etat(installe: &Path) -> WrapperEtat {
     }
     let local = wrapper_source_dir().join("target/release/opencode-wrap");
     if !local.exists() {
-        // Jamais compilé en release : rien ne permet de conclure, on ne
-        // Sans binaire release local de référence, impossible de conclure à
-        // une péremption : ne pas déclencher de mise à jour sur une absence.
+        // Sans binaire release local de référence, impossible de conclure à une
+        // péremption. Déclarer « absent » serait faux — le binaire déployé
+        // existe — et proposer une compilation échouerait, la source n'étant pas
+        // là. C'est le cas de toute installation packagée, où le wrapper est
+        // installé par le canal de distribution.
         return WrapperEtat::AJour;
     }
     if fichiers_identiques(installe, &local) {
@@ -1489,7 +1491,7 @@ fn tui_loop(terminal: &mut Term, mut app: App) -> Result<()> {
     let mut input_mode = InputMode::Normal;
 
     loop {
-        // Extract creation/edit states from input_mode for rendering
+        // États de création et d'édition, extraits de `input_mode` pour le rendu.
         let creation_state = match &input_mode {
             InputMode::CreatingProject(state) => state.clone(),
             _ => ProjectCreationState::default(),

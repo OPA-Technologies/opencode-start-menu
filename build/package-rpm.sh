@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Construit le paquet .rpm installant op dans /usr/local/bin.
+# Construit le paquet .rpm installant op et opencode-wrap dans /usr/local/bin.
 # Nécessite rpmbuild (paquet rpm-build).
 # Usage : build/package-rpm.sh [arch]
 #   arch : x86_64 (défaut) | aarch64
@@ -20,6 +20,7 @@ ARCH="${1:-x86_64}"
 RPMROOT="$(mktemp -d)"
 mkdir -p "$RPMROOT/SOURCES" "$RPMROOT/BUILD" "$RPMROOT/BUILDROOT" "$RPMROOT/RPMS" "$RPMROOT/SPECS"
 cp "$ROOT/target/release/opencode-start-menu" "$RPMROOT/SOURCES/op"
+cp "$ROOT/wrapper/target/release/opencode-wrap" "$RPMROOT/SOURCES/opencode-wrap"
 cp "$ROOT/LICENSE" "$RPMROOT/SOURCES/LICENSE"
 sed "s/@VERSION@/$VERSION/; s/@ARCH@/$ARCH/" "$ROOT/build/rpm/op.spec.in" > "$RPMROOT/SPECS/op.spec"
 

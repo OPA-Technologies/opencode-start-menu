@@ -7,7 +7,8 @@ URL: https://opencode.ai
 BuildArch: @ARCH@
 BuildRoot: %{_tmppath}/%{name}-buildroot
 Source0: op
-Source1: LICENSE
+Source1: opencode-wrap
+Source2: LICENSE
 
 %description
 Lanceur TUI des projets opencode : liste, recherche, lancement en session.
@@ -16,13 +17,15 @@ Lanceur TUI des projets opencode : liste, recherche, lancement en session.
 
 %install
 install -Dm755 %{SOURCE0} %{buildroot}/usr/local/bin/op
-install -Dm644 %{SOURCE1} %{buildroot}/usr/share/licenses/%{name}/LICENSE
+install -Dm755 %{SOURCE1} %{buildroot}/usr/local/bin/opencode-wrap
+install -Dm644 %{SOURCE2} %{buildroot}/usr/share/licenses/%{name}/LICENSE
 
 %clean
 rm -rf %{buildroot}
 
 %files
 /usr/local/bin/op
+/usr/local/bin/opencode-wrap
 %license /usr/share/licenses/%{name}/LICENSE
 
 %changelog

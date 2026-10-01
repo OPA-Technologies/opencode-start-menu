@@ -2,8 +2,12 @@
 %:
 	dh $@
 
+# Les deux binaires sont construits et installés : op appelle opencode-wrap,
+# qui transmet stdin et enregistre contexte et coût de session.
 override_dh_auto_build:
 	cargo build --release --locked
+	cd wrapper && cargo build --release --locked
 
 override_dh_auto_install:
 	install -Dm755 target/release/opencode-start-menu debian/opencode-start-menu/usr/local/bin/op
+	install -Dm755 wrapper/target/release/opencode-wrap debian/opencode-start-menu/usr/local/bin/opencode-wrap
