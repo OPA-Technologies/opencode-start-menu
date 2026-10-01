@@ -7,11 +7,87 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
 static EXCHANGE_RATE_CACHE: Lazy<Mutex<HashMap<String, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Flux du parent sur lequel une capture est restituée.
+#[derive(Clone, Copy)]
+enum Flux {
+    Stdout,
+    Stderr,
+}
+
+/// Capture sur fichier temporaire de la sortie d'opencode.
+///
+/// `Command::output()` capturait déjà stdout et stderr, mais sans stdin :
+/// opencode recevait un EOF immédiat et quittait sans laisser l'utilisateur
+/// taper. Il faut donc laisser stdin au terminal tout en conservant une copie
+/// de la sortie pour le scraping, ce qu'`output()` ne permet pas.
+///
+/// La restitution se fait après la sortie de l'enfant, en une seule fois :
+/// c'est la contrepartie assumée du correctif minimal, le rendu en direct n'est
+/// plus possible (voir `OPENCODE_WRAP_CAPTURE`).
+struct CaptureTemp {
+    path: PathBuf,
+}
+
+impl CaptureTemp {
+    /// Crée le fichier de capture et renvoie le descripteur à passer à
+    /// `Stdio::from`. Le nom combine le PID et l'horodatage pour que deux
+    /// sessions simultanées, ou deux captures d'un même processus, ne se
+    /// marchent pas dessus.
+    fn nouveau(etiquette: &str) -> std::io::Result<(Self, std::fs::File)> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "opencode-wrap-{etiquette}-{}-{nanos}",
+            std::process::id()
+        ));
+        let fd = std::fs::File::create(&path)?;
+        Ok((
+            Self { path },
+            fd,
+        ))
+    }
+
+    /// Restitue la sortie capturée sur le flux du parent, supprime le fichier
+    /// temporaire et rend les octets capturés pour le scraping.
+    ///
+    /// Une erreur de lecture ou d'écriture est ignorée : opencode s'est déjà
+    /// terminé et la session est sauvée, seul l'affichage est en jeu.
+    fn restituer(&self, flux: Flux) -> Vec<u8> {
+        let contenu = std::fs::read(&self.path).unwrap_or_default();
+        let mut sortie: Box<dyn Write> = match flux {
+            Flux::Stdout => Box::new(std::io::stdout()),
+            Flux::Stderr => Box::new(std::io::stderr()),
+        };
+        if !contenu.is_empty() {
+            let _ = sortie.write_all(&contenu);
+            let _ = sortie.flush();
+        }
+        let _ = std::fs::remove_file(&self.path);
+        contenu
+    }
+}
+
+/// Prépare la capture d'un flux. Retourne `None` si le fichier temporaire n'a
+/// pas pu être créé : on préfère alors la sortie en direct, dégradée mais
+/// lisible, à une session silencieuse.
+fn preparer_capture(etiquette: &str) -> Option<(CaptureTemp, Stdio)> {
+    match CaptureTemp::nouveau(etiquette) {
+        Ok((cap, fd)) => Some((cap, Stdio::from(fd))),
+        Err(e) => {
+            eprintln!("opencode-wrap: capture impossible ({e}), sortie en direct");
+            None
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,18 +97,45 @@ async fn main() -> Result<()> {
     let mut cmd = Command::new("opencode");
     cmd.args(&args);
 
-    let output = cmd.output().await?;
-    let exit_code = output.status.code().unwrap_or(1);
+    // Régression P0-1 : sans cet héritage explicite, `output()` redirigeait
+    // stdin et opencode recevait un EOF immédiat — le TUI était inutilisable.
+    cmd.stdin(Stdio::inherit());
 
-    if !output.stdout.is_empty() {
-        std::io::stdout().write_all(&output.stdout)?;
+    // OPENCODE_WRAP_CAPTURE=0 : opencode écrit directement dans notre terminal.
+    // Le rendu est alors en direct, mais plus rien n'est scrapé, donc ni
+    // contexte ni coût ne sont enregistrés. À réserver au débogage.
+    let capturer = std::env::var("OPENCODE_WRAP_CAPTURE").as_deref() != Ok("0");
+
+    let mut cap_out = None;
+    let mut cap_err = None;
+    if capturer {
+        if let Some((cap, fd)) = preparer_capture("out") {
+            cap_out = Some(cap);
+            cmd.stdout(fd);
+        }
+        if let Some((cap, fd)) = preparer_capture("err") {
+            cap_err = Some(cap);
+            cmd.stderr(fd);
+        }
     }
-    if !output.stderr.is_empty() {
-        std::io::stderr().write_all(&output.stderr)?;
-    }
+
+    // `status()` et non `output()` : on veut laisser le terminal à opencode.
+    let status = cmd.status().await?;
+    let exit_code = status.code().unwrap_or(1);
+
+    // Restitution avant le scraping, pour que l'utilisateur n'attende pas le
+    // réseau de la conversion de devise.
+    let stdout_cap = cap_out
+        .as_ref()
+        .map(|c| c.restituer(Flux::Stdout))
+        .unwrap_or_default();
+    let stderr_cap = cap_err
+        .as_ref()
+        .map(|c| c.restituer(Flux::Stderr))
+        .unwrap_or_default();
 
     if let Some(ref dir) = project_dir {
-        if let Err(e) = update_session_data(dir, &output).await {
+        if let Err(e) = update_session_data(dir, &stdout_cap, &stderr_cap).await {
             eprintln!("opencode-wrap: erreur mise à jour session: {e}");
         }
     }
@@ -40,9 +143,9 @@ async fn main() -> Result<()> {
     std::process::exit(exit_code);
 }
 
-async fn update_session_data(project_dir: &str, output: &std::process::Output) -> Result<()> {
-    let context_pct = extract_context_pct(&output.stdout, &output.stderr);
-    let (currency, cost_original) = extract_cost_and_currency(&output.stdout, &output.stderr);
+async fn update_session_data(project_dir: &str, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+    let context_pct = extract_context_pct(stdout, stderr);
+    let (currency, cost_original) = extract_cost_and_currency(stdout, stderr);
 
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -54,25 +157,21 @@ async fn update_session_data(project_dir: &str, output: &std::process::Output) -
 
     let conn = Connection::open(&db_path)?;
 
-    let exchange_rate = if let Some(ref curr) = currency {
-        fetch_exchange_rate(curr, "EUR").await
-    } else {
-        None
+    let exchange_rate = match currency {
+        Some(ref curr) => fetch_exchange_rate(curr, "EUR").await,
+        None => None,
     };
 
-    let cost_local = if let (Some(rate), Some(cost)) = (exchange_rate, cost_original) {
-        Some(cost * rate)
-    } else {
-        None
+    let cost_local = match (exchange_rate, cost_original) {
+        (Some(rate), Some(cost)) => Some(cost * rate),
+        _ => None,
     };
-
-    let currency_str = currency.unwrap_or_else(|| "USD".to_string());
 
     persist_session(
         &conn,
         project_dir,
-        context_pct as i64,
-        &currency_str,
+        context_pct,
+        currency.as_deref(),
         exchange_rate,
         cost_local,
     )?;
@@ -83,6 +182,9 @@ async fn update_session_data(project_dir: &str, output: &std::process::Output) -
 /// Applique les migrations de colonnes puis reporte contexte, devise et
 /// coûts sur la session la plus récente du répertoire.
 ///
+/// Les champs à écrire sont des `Option` : voir `maj_session` pour pourquoi un
+/// champ non extrait ne doit pas écraser la valeur précédente.
+///
 /// Les `ALTER TABLE ADD COLUMN` sont volontairement ignorés : les colonnes
 /// existent déjà après la première exécution (et le menu les crée de son
 /// côté), donc SQLite renvoie « duplicate column ». Propager cette erreur
@@ -91,8 +193,8 @@ async fn update_session_data(project_dir: &str, output: &std::process::Output) -
 fn persist_session(
     conn: &Connection,
     project_dir: &str,
-    context_pct: i64,
-    currency: &str,
+    context_pct: Option<u8>,
+    currency: Option<&str>,
     exchange_rate: Option<f64>,
     cost_local: Option<f64>,
 ) -> rusqlite::Result<usize> {
@@ -119,24 +221,80 @@ fn persist_session(
 
 /// Reporte contexte, devise et coûts sur la session la plus récente du
 /// répertoire donné. Retourne le nombre de lignes mises à jour (0 si aucune
-/// session ne correspond), pour que l'appelant puisse distinguer « rien à
-/// faire » d'une écriture effective.
+/// session ne correspond, ou si rien n'a été extrait), pour que l'appelant
+/// puisse distinguer « rien à faire » d'une écriture effective.
+///
+/// Régression P1-2 : la requête écrivait les quatre colonnes inconditionnellement.
+/// Quand l'extraction échouait — opencode interrompu, sortie sans ligne de
+/// coût, TUI sans résumé — le wrapper remettait `context_pct` à 0, la devise à
+/// « USD » et `cost_local` à NULL. Une session correcte était donc effacée par une
+/// session qui ne l'était pas. La clause `SET` est désormais construite sur les
+/// seuls champs réellement extraits ; un champ absent conserve sa valeur.
+///
+/// Contrainte de nommage : les noms de colonnes viennent d'une liste interne
+/// constants, jamais d'une entrée utilisateur, donc l'interpolation est sûre.
 fn maj_session(
     conn: &Connection,
     project_dir: &str,
-    context_pct: i64,
-    currency: &str,
+    context_pct: Option<u8>,
+    currency: Option<&str>,
     exchange_rate: Option<f64>,
     cost_local: Option<f64>,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE session SET context_pct = ?, currency = ?, exchange_rate = ?, cost_local = ? \
-         WHERE id = (SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1)",
-        rusqlite::params![context_pct, currency, exchange_rate, cost_local, project_dir],
-    )
+    use rusqlite::types::Value;
+
+    let mut colonnes: Vec<&str> = Vec::new();
+    let mut valeurs: Vec<Value> = Vec::new();
+
+    if let Some(pct) = context_pct {
+        colonnes.push("context_pct");
+        valeurs.push(Value::Integer(pct as i64));
+    }
+    if let Some(curr) = currency {
+        colonnes.push("currency");
+        valeurs.push(Value::Text(curr.to_string()));
+    }
+    if let Some(rate) = exchange_rate {
+        colonnes.push("exchange_rate");
+        valeurs.push(Value::Real(rate));
+    }
+    if let Some(cost) = cost_local {
+        colonnes.push("cost_local");
+        valeurs.push(Value::Real(cost));
+    }
+
+    // Rien n'a été extrait : ne lance pas un UPDATE qui n'écrirait que des
+    // valeurs par défaut, ce qui était précisément le bug.
+    if colonnes.is_empty() {
+        return Ok(0);
+    }
+
+    let set = colonnes
+        .iter()
+        .map(|c| format!("{c} = ?"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Cible : la session la plus récente du répertoire. La sélection passe par
+    // une sous-requête sur `id` car `ORDER BY … LIMIT` n'existe pas dans un
+    // UPDATE pour le SQLite embarqué de rusqlite (« near "ORDER": syntax
+    // error ») : la requête échouait et aucune donnée n'était jamais écrite.
+    let sql = format!(
+        "UPDATE session SET {set} \
+         WHERE id = (SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1)"
+    );
+    valeurs.push(Value::Text(project_dir.to_string()));
+    conn.execute(&sql, rusqlite::params_from_iter(valeurs.iter()))
 }
 
-fn extract_context_pct(stdout: &[u8], stderr: &[u8]) -> u8 {
+/// Extrait le pourcentage de contexte.
+///
+/// Régression P1-2 : le retour était un `u8` dont le « rien trouvé » valait
+/// `0`, indiscernable d'un contexte réellement vide. Combiné à l'écriture
+/// inconditionnelle de `maj_session`, une session dont la sortie ne mentionne
+/// pas le contexte remettait le champ à 0. Le retour est donc un `Option<u8>`,
+/// et `None` ne touche pas la base.
+fn extract_context_pct(stdout: &[u8], stderr: &[u8]) -> Option<u8> {
     let stdout_str = String::from_utf8_lossy(stdout);
     let stderr_str = String::from_utf8_lossy(stderr);
     let combined = format!("{}\n{}", stdout_str, stderr_str);
@@ -153,7 +311,7 @@ fn extract_context_pct(stdout: &[u8], stderr: &[u8]) -> u8 {
             if let Some(caps) = re.captures(&combined) {
                 if let Some(m) = caps.get(1) {
                     if let Ok(pct) = m.as_str().parse::<u8>() {
-                        return pct.min(100);
+                        return Some(pct.min(100));
                     }
                 }
             }
@@ -166,13 +324,13 @@ fn extract_context_pct(stdout: &[u8], stderr: &[u8]) -> u8 {
             let re = Regex::new(r"(\d{1,3})\s*%").unwrap();
             if let Some(caps) = re.captures(line) {
                 if let Ok(pct) = caps.get(1).unwrap().as_str().parse::<u8>() {
-                    return pct.min(100);
+                    return Some(pct.min(100));
                 }
             }
         }
     }
 
-    0
+    None
 }
 
 fn extract_cost_and_currency(stdout: &[u8], stderr: &[u8]) -> (Option<String>, Option<f64>) {
@@ -241,12 +399,26 @@ async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn extract_context_pct_basic() {
-        assert_eq!(extract_context_pct(b"Context: 50%", b""), 50);
-        assert_eq!(extract_context_pct(b"context: 75%", b""), 75);
-        assert_eq!(extract_context_pct(b"50% context", b""), 50);
+        assert_eq!(extract_context_pct(b"Context: 50%", b""), Some(50));
+        assert_eq!(extract_context_pct(b"context: 75%", b""), Some(75));
+        assert_eq!(extract_context_pct(b"50% context", b""), Some(50));
+    }
+
+    /// Régression P1-2 : sans mention de contexte, l'ancien code renvoyait
+    /// `Some(0)`-équivalent, indiscernable d'une session à 0 % réel.
+    #[test]
+    fn extract_context_pct_absent_ne_vaut_pas_zero() {
+        assert_eq!(extract_context_pct(b"session terminee", b""), None);
+        assert_eq!(extract_context_pct(b"", b""), None);
+        assert_eq!(extract_context_pct(b"erreur fatale", b"aucune donnee"), None);
+        // Une progression sans pourcentage n'est pas un contexte.
+        assert_eq!(extract_context_pct(b"context: en cours", b""), None);
+        // Un vrai 0 % reste un 0 mesuré, pas une absence.
+        assert_eq!(extract_context_pct(b"Context: 0%", b""), Some(0));
     }
 
     #[test]
@@ -305,7 +477,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = maj_session(&c, "/p", 42, "EUR", Some(0.92), Some(9.2)).unwrap();
+        let n = maj_session(&c, "/p", Some(42), Some("EUR"), Some(0.92), Some(9.2)).unwrap();
         assert_eq!(n, 1, "une seule session doit etre mise a jour");
 
         let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
@@ -346,7 +518,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = persist_session(&c, "/p", 55, "GBP", Some(1.15), Some(11.5)).unwrap();
+        let n = persist_session(&c, "/p", Some(55), Some("GBP"), Some(1.15), Some(11.5)).unwrap();
         assert_eq!(n, 1, "une seule session doit etre mise a jour");
 
         let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
@@ -376,7 +548,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = persist_session(&c, "/p", 60, "EUR", Some(1.0), Some(20.0)).unwrap();
+        let n = persist_session(&c, "/p", Some(60), Some("EUR"), Some(1.0), Some(20.0)).unwrap();
         assert_eq!(n, 1);
         let v: (i64, String, Option<f64>, Option<f64>) = c
             .query_row(
@@ -398,7 +570,142 @@ mod tests {
                  exchange_rate REAL, cost_local REAL);",
         )
         .unwrap();
-        assert_eq!(maj_session(&c, "/inconnu", 7, "USD", None, None).unwrap(), 0);
+        assert_eq!(
+            maj_session(&c, "/inconnu", Some(7), Some("USD"), None, None).unwrap(),
+            0
+        );
+    }
+
+    /// Régression P1-2 : c'est le test qui compte pour ce bug.
+    ///
+    /// L'ancien `UPDATE` écrivait les quatre colonnes inconditionnellement, donc
+    /// une extraction vide remettait `context_pct` à 0, `currency` à « USD » et
+    /// `cost_local` à NULL. Les données réelles d'une session étaient perdues à
+    /// fin de la session suivante. Ici, seul le contexte est présent dans la
+    /// sortie : la devise et le coût précédents doivent survivre intacts.
+    #[test]
+    fn une_extraction_partielle_n_ecrase_pas_les_champs_absents() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             INSERT INTO session VALUES ('s','/p',100,31,'GBP',1.15,4.6);",
+        )
+        .unwrap();
+
+        // Contexte seul : ni devise, ni taux, ni coût extraits.
+        let n = maj_session(&c, "/p", Some(88), None, None, None).unwrap();
+        assert_eq!(n, 1);
+
+        let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
+            c.query_row(
+                "SELECT context_pct, currency, exchange_rate, cost_local FROM session WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            lire("s"),
+            (88, "GBP".to_string(), Some(1.15), Some(4.6)),
+            "seul context_pct doit avoir change"
+        );
+    }
+
+    /// Le cas dégénéré de P1-2 : rien n'est extrait. L'ancien code émettait un
+    /// UPDATE qui remettait tout à zéro/NULL. Il ne doit plus rien écrire, ni
+    /// même lancer de requête.
+    #[test]
+    fn une_extraction_vide_ne_touche_a_rien() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             INSERT INTO session VALUES ('s','/p',100,31,'GBP',1.15,4.6);",
+        )
+        .unwrap();
+
+        let n = maj_session(&c, "/p", None, None, None, None).unwrap();
+        assert_eq!(n, 0, "rien a ecrire : aucune ligne ne doit etre touchee");
+
+        let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
+            c.query_row(
+                "SELECT context_pct, currency, exchange_rate, cost_local FROM session WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            lire("s"),
+            (31, "GBP".to_string(), Some(1.15), Some(4.6)),
+            "la session doit etre intacte"
+        );
+    }
+
+    /// Le coût local dépend du taux de change : sans taux, pas de coût. Et un
+    /// coût sans devise ne doit pas non plus fabriquer une devise « USD ».
+    #[test]
+    fn un_cout_sans_taux_ne_produit_pas_de_cost_local() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             INSERT INTO session VALUES ('s','/p',100,31,'EUR',NULL,NULL);",
+        )
+        .unwrap();
+
+        // Devise trouvée, coût trouvé, mais taux indisponible (réseau coupé).
+        let n = maj_session(&c, "/p", None, Some("GBP"), None, None).unwrap();
+        assert_eq!(n, 1);
+        let (pct, devise, taux, cout): (i64, String, Option<f64>, Option<f64>) = c
+            .query_row(
+                "SELECT context_pct, currency, exchange_rate, cost_local FROM session WHERE id = 's'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((pct, devise.as_str(), taux, cout), (31, "GBP", None, None));
+    }
+
+    /// P0-1 : la capture doit survivre à un fichier temporaire préexistant
+    /// portant le même nom, sans le tronquer ni le lire par erreur.
+    #[test]
+    fn la_capture_ne_reutilise_pas_un_fichier_ancien() {
+        let (a, _fa) = CaptureTemp::nouveau("test").unwrap();
+        let (b, fb) = CaptureTemp::nouveau("test").unwrap();
+        assert_ne!(
+            a.path, b.path,
+            "deux captures doivent avoir des fichiers distincts"
+        );
+        use std::io::Write;
+        let mut fb = fb;
+        fb.write_all(b"seconde").unwrap();
+        drop(fb);
+        assert_eq!(fs::read(&a.path).unwrap(), Vec::<u8>::new(), "la premiere capture doit rester vide");
+        assert_eq!(fs::read(&b.path).unwrap(), b"seconde");
+        fs::remove_file(&a.path).ok();
+        fs::remove_file(&b.path).ok();
+    }
+
+    /// P0-1 : `restituer` rend les octets au scraping et supprime le fichier, de
+    /// sorte qu'aucune capture ne s'accumule dans le répertoire temporaire.
+    #[test]
+    fn restituer_rend_les_octets_puis_supprime_le_fichier() {
+        let (cap, mut fd) = CaptureTemp::nouveau("restitution").unwrap();
+        use std::io::Write;
+        fd.write_all(b"Context: 42%\nspent $12.34\n").unwrap();
+        drop(fd);
+
+        let contenu = cap.restituer(Flux::Stdout);
+        assert_eq!(contenu, b"Context: 42%\nspent $12.34\n");
+        assert!(!cap.path.exists(), "le fichier temporaire doit etre supprime");
     }
 
     #[test]
