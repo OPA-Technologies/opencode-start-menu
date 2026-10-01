@@ -113,7 +113,7 @@ pub(crate) fn run_launch_sequence(
                   shell_quote(&project_dir),
                 );
                 Command::new("sudo")
-                  .args(["-i", "-c", &cmd])
+                  .args(["-i", "sh", "-c", &cmd])
                   .status()
                   .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?
               }

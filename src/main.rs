@@ -16,7 +16,7 @@ use std::{
     cmp::Ordering,
     env,
     fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
@@ -25,10 +25,12 @@ mod lock;
 mod modules;
 mod perms;
 mod registry;
+mod startup;
 mod ui;
 
 use crate::launch::{run_launch_sequence, LaunchKind};
 use crate::registry::ProjectEntry;
+use crate::startup::{Progress, Step};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +52,9 @@ struct Cli {
 
     #[arg(short = 'V', long = "version", help = "Print variant version (self or project passthrough)")]
     version: bool,
+
+    #[arg(short = 'v', long = "verbose", help = "Trace textuelle des étapes de lancement sur stderr")]
+    verbose: bool,
 
     #[arg(short = 's', value_enum, default_value_t = SortOrder::Modified,
           help = "Tri : -sM par date (défaut) · -sN alphabétique")]
@@ -101,6 +106,9 @@ pub(crate) struct App {
     /// Cache des séries de tarifs récupérées de la source web, partagé par
     /// tous les projets (évite un téléchargement par projet).
     pub(crate) web_cache: registry::WebCache,
+    /// Registre présent mais illisible : aucune réindexation ni réécriture
+    /// automatique tant qu'il n'est pas réparé.
+    registry_broken: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -353,10 +361,31 @@ fn bump_patch(version: &str) -> Option<String>
     Some(format!("{}.{}.{}", nums[0], nums[1], nums[2]))
   }
 
-/// Réécrit la ligne `version = "…"` de la section `[package]` de Cargo.toml,
-/// ou l'ajoute juste après l'en-tête si elle est absente. Retourne false si
-/// le manifeste est absent ou n'a pas de section `[package]`.
-fn bump_manifest_version(dir: &Path, new_version: &str) -> Result<bool>
+/// Écriture atomique : fichier temporaire voisin puis renommage, pour qu'une
+/// interruption (Échap dans la jauge, Ctrl+C, plantage) ne laisse jamais un
+/// fichier tronqué.
+fn write_atomic(path: &Path, contenu: &str) -> Result<()>
+  {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, contenu)?;
+    if let Ok(meta) = fs::metadata(path)
+      {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+      }
+    if let Err(e) = fs::rename(&tmp, path)
+      {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+      }
+    Ok(())
+  }
+
+/// Réécrit la clé `version` de la section `[package]` de Cargo.toml (guillemets
+/// doubles ou simples, commentaire de fin de ligne conservé), ou l'ajoute en
+/// fin de section si elle est absente. Une version héritée
+/// (`version.workspace = true`, `version = { workspace = true }`) n'est pas
+/// touchée. Retourne `true` si le fichier a été modifié.
+fn rewrite_manifest_version(dir: &Path, new_version: &str) -> Result<bool>
   {
     let cargo = dir.join("Cargo.toml");
     let Ok(content) = fs::read_to_string(&cargo) else
@@ -366,129 +395,93 @@ fn bump_manifest_version(dir: &Path, new_version: &str) -> Result<bool>
     let mut out = String::with_capacity(content.len() + 32);
     let mut in_package = false;
     let mut version_seen = false;
-    let mut version_injected = false;
+    let mut modifie = false;
     for part in content.split_inclusive('\n')
       {
         let trimmed = part.trim();
-        let is_section = trimmed.starts_with('[');
-        if is_section
+        let eol = &part[part.trim_end().len()..];
+        if trimmed.starts_with('[')
           {
-            // Fin d'un [package] sans version : on injecte avant la section suivante.
-            if in_package && !version_seen && !version_injected
+            if in_package && !version_seen
               {
                 out.push_str(&format!("version = \"{new_version}\"\n"));
-                version_injected = true;
+                version_seen = true;
+                modifie = true;
               }
-            in_package = trimmed == "[package]";
+            in_package = trimmed.split('#').next().unwrap_or("").trim() == "[package]";
             if in_package
               {
                 version_seen = false;
               }
           }
-        else if in_package && !version_seen
+        else if in_package
+          && !version_seen
+          && let Some(eq) = trimmed.find('=')
           {
-            if let Some(eq) = trimmed.find('=')
+            let cle = trimmed[..eq].trim();
+            if cle == "version"
               {
-                if trimmed[..eq].trim() == "version"
+                let rest = trimmed[eq + 1..].trim_start();
+                match rest.chars().next().filter(|c| *c == '"' || *c == '\'')
                   {
-                    let rest = trimmed[eq + 1..].trim();
-                    if rest.starts_with('"') && rest.split('"').count() > 1
+                    Some(q) =>
                       {
-                        let lead = part.len() - part.trim_start().len();
-                        out.push_str(&format!("{}version = \"{new_version}\"", &part[..lead]));
-                        if part.ends_with('\n')
+                        let after = &rest[1..];
+                        if let Some(end) = after.find(q)
                           {
-                            out.push('\n');
+                            let lead = &part[..part.len() - part.trim_start().len()];
+                            let tail = &after[end + 1..];
+                            out.push_str(lead);
+                            out.push_str(&format!("version = \"{new_version}\"{tail}{eol}"));
+                            version_seen = true;
+                            modifie = true;
+                            continue;
                           }
+                      }
+                    None =>
+                      {
+                        // Version héritée : on n'y touche pas.
                         version_seen = true;
-                        version_injected = true;
+                        out.push_str(part);
                         continue;
                       }
                   }
               }
+            else if cle == "version.workspace"
+              {
+                version_seen = true;
+                out.push_str(part);
+                continue;
+              }
           }
         out.push_str(part);
       }
-    if in_package && !version_seen && !version_injected
+    if in_package && !version_seen
       {
         if !out.is_empty() && !out.ends_with('\n')
           {
             out.push('\n');
           }
         out.push_str(&format!("version = \"{new_version}\"\n"));
-        version_injected = true;
+        modifie = true;
       }
-    if version_injected
+    if modifie
       {
-        fs::write(&cargo, out)?;
+        write_atomic(&cargo, &out)?;
       }
-    Ok(version_injected)
+    Ok(modifie)
+  }
+
+fn bump_manifest_version(dir: &Path, new_version: &str) -> Result<bool>
+  {
+    rewrite_manifest_version(dir, new_version)
   }
 
 /// Définit la version exacte dans Cargo.toml (sans incrément).
 /// Utilisé lors de l'édition manuelle pour synchroniser le manifeste.
 fn set_manifest_version(dir: &Path, version: &str) -> Result<bool>
   {
-    let cargo = dir.join("Cargo.toml");
-    let Ok(content) = fs::read_to_string(&cargo) else
-      {
-        return Ok(false);
-      };
-    let mut out = String::with_capacity(content.len() + 32);
-    let mut in_package = false;
-    let mut version_seen = false;
-    let mut version_injected = false;
-    for part in content.split_inclusive('\n')
-      {
-        let trimmed = part.trim();
-        let is_section = trimmed.starts_with('[');
-        if is_section
-          {
-            if in_package && !version_seen && !version_injected
-              {
-                out.push_str(&format!("version = \"{version}\"\n"));
-                version_injected = true;
-              }
-            in_package = trimmed == "[package]";
-            if in_package
-              {
-                version_seen = false;
-              }
-          }
-        else if in_package && !version_seen
-          {
-            if let Some(eq) = trimmed.find('=')
-              {
-                if trimmed[..eq].trim() == "version"
-                  {
-                    let lead = part.len() - part.trim_start().len();
-                    out.push_str(&format!("{}version = \"{version}\"", &part[..lead]));
-                    if part.ends_with('\n')
-                      {
-                        out.push('\n');
-                      }
-                    version_seen = true;
-                    version_injected = true;
-                    continue;
-                  }
-              }
-          }
-        out.push_str(part);
-      }
-    if in_package && !version_seen && !version_injected
-      {
-        if !out.is_empty() && !out.ends_with('\n')
-          {
-            out.push('\n');
-          }
-        out.push_str(&format!("version = \"{version}\"\n"));
-        version_injected = true;
-      }
-    if version_injected
-      {
-        fs::write(&cargo, out)?;
-      }
-    Ok(version_injected)
+    rewrite_manifest_version(dir, version)
   }
 
 /// Synchronise la version du projet menu (opencode-start-menu) avec
@@ -543,7 +536,8 @@ fn version_greater(a: &str, b: &str) -> bool {
 pub(crate) const MAX_MESSAGE_LINES: usize = 6;
 
 impl App {
-    fn new(registry_path: PathBuf, sort_order: SortOrder) -> Self {
+    fn new(registry_path: PathBuf, sort_order: SortOrder, progress: &mut Progress) -> Self {
+        progress.begin(Step::Paths);
         let opencode_db_path = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("opencode/opencode.db");
@@ -562,22 +556,60 @@ impl App {
             pending_name: None,
             pending_bare: false,
             web_cache: registry::WebCache::default(),
+            registry_broken: false,
         };
+        progress.begin(Step::WebCache);
         app.web_cache = registry::load_web_cache(&app.registry_path);
+        progress.begin(Step::Registry);
         match registry::load_registry(&app.registry_path) {
             Ok(projects) => app.projects = projects,
             Err(e) => {
                 app.push_error(format!("Registre illisible : {e}"));
+                app.registry_broken = true;
             }
         }
         // Rescan au démarrage : chaque projet est relu depuis son Cargo.toml disque,
         // pour que la liste reflète l'état réel du répertoire éponyme dès l'affichage.
-        if let Err(e) = rescan_repertoire(&mut app) {
+        if let Err(e) = rescan_repertoire(&mut app, progress) {
             app.push_error(format!("Rescan au démarrage échoué : {e}"));
         }
         // Auto-sync projet menu : aligner version_debug sur CARGO_PKG_VERSION.
+        progress.begin(Step::SyncVersion);
         let _ = sync_menu_project_version(&mut app);
-        finalize_project_list(&mut app);
+        progress.begin(Step::Finalize);
+        refresh_project_selection(&mut app);
+        progress.done();
+        app
+    }
+
+    /// Chargement minimal pour `-l` et `-V` : ni rescan, ni réseau, ni écriture
+    /// (aucun bump de Cargo.toml pour une simple consultation).
+    fn new_light(registry_path: PathBuf, sort_order: SortOrder) -> Self {
+        let opencode_db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("opencode/opencode.db");
+        let mut app = Self {
+            projects: Vec::new(),
+            filtered: Vec::new(),
+            list_state: ListState::default(),
+            show_new: true,
+            mode: LaunchMode::Normal,
+            status_messages: Vec::new(),
+            registry_path,
+            opencode_db_path,
+            sort_order,
+            pending_launch: None,
+            pending_sudo: false,
+            pending_name: None,
+            pending_bare: false,
+            web_cache: registry::WebCache::default(),
+            registry_broken: false,
+        };
+        match registry::load_registry(&app.registry_path) {
+            Ok(projects) => app.projects = projects,
+            Err(e) => eprintln!("Registre illisible : {e}"),
+        }
+        sort_projects(&mut app.projects, sort_order);
         app
     }
 
@@ -736,6 +768,36 @@ impl App {
       }
 }
 
+/// Signale un binaire plus ancien que les sources qu'il devrait exécuter.
+///
+/// `op -V` lit la version du registre, mais cette version ne change qu'au
+/// moment de la compilation : sans cet avertissement, un `op` qui n'a pas
+/// été reconstruit affiche une version figée sans le moindre avertissement.
+fn binary_freshness_note(projet: &Path) -> Option<String>
+  {
+    let exe = std::env::current_exe().ok()?;
+    let binaire = exe.metadata().ok()?.modified().ok()?;
+    let sources = registry::source_modified_time(projet)?;
+    if binaire >= sources
+      {
+        return None;
+      }
+    let heure = |t: std::time::SystemTime| -> Option<String> {
+      let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+      Some(
+        chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)?
+          .with_timezone(&chrono::Local)
+          .format("%d/%m %H:%M")
+          .to_string(),
+      )
+    };
+    Some(format!(
+      "⚠ binaire du {} — sources modifiées le {} : exécuter « cargo build »",
+      heure(binaire)?,
+      heure(sources)?
+    ))
+  }
+
 fn print_help() {
     println!("Usage : op [mot-clé|id|nom]");
     println!();
@@ -748,6 +810,8 @@ fn print_help() {
     println!("  op -l         liste les projets sans menu (variante Debug)");
     println!("  op -V         version du menu lui-même (variante Release)");
     println!("  op <mot> -V   version de l'exécutable du projet (passthrough)");
+    println!("  op -v         trace textuelle des étapes de lancement sur stderr,");
+    println!("                puis ouverture du menu (défaut : jauge de démarrage)");
     println!("  op -sN        tri alphabétique (--sort-by-name)");
     println!("  op -sM        tri par dernière modification, le plus ancien d'abord");
     println!("                (défaut, --sort-by-date)");
@@ -849,11 +913,51 @@ fn wrapper_source_dir() -> PathBuf {
 /// Empreinte SHA-256 d'un fichier. Sert à comparer le wrapper déployé au
 /// binaire release local, sans dépendre d'une version codée en dur qui
 /// dériverait à chaque release.
-fn sha256_file(path: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&fs::read(path).ok()?);
-    Some(format!("{:x}", hasher.finalize()))
+/// Compare deux fichiers octet par octet, par blocs de 64 KiB, pour dire si le
+/// wrapper déployé est bien le binaire release local.
+///
+/// Seule l'égalité importe ici : les deux binaires font une dizaine de Mo et
+/// leurs empreintes SHA-256 coûtent ~700 ms en profil Debug, contre ~20 ms
+/// pour une comparaison directe bornée par la taille.
+/// Remplit `buf` autant que possible : `read` peut rendre moins d'octets que
+/// demandé sans que le fichier soit fini.
+fn lire_plein(f: &mut fs::File, buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+    let mut total = 0;
+    while total < buf.len() {
+        let n = f.read(&mut buf[total..])?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
+fn fichiers_identiques(a: &Path, b: &Path) -> bool {
+    let (Ok(mut fa), Ok(mut fb)) = (fs::File::open(a), fs::File::open(b)) else {
+        return false;
+    };
+    let (Ok(ma), Ok(mb)) = (fa.metadata(), fb.metadata()) else {
+        return false;
+    };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    let mut ba = [0u8; 64 * 1024];
+    let mut bb = [0u8; 64 * 1024];
+    loop {
+        let (na, nb) = match (lire_plein(&mut fa, &mut ba), lire_plein(&mut fb, &mut bb)) {
+            (Ok(x), Ok(y)) => (x, y),
+            _ => return false,
+        };
+        if na != nb || ba[..na] != bb[..nb] {
+            return false;
+        }
+        if na == 0 {
+            return true;
+        }
+    }
 }
 
 /// État du wrapper déployé au regard du binaire release local.
@@ -878,9 +982,10 @@ fn wrapper_etat(installe: &Path) -> WrapperEtat {
         // une péremption : ne pas déclencher de mise à jour sur une absence.
         return WrapperEtat::AJour;
     }
-    match (sha256_file(installe), sha256_file(&local)) {
-        (Some(emp), Some(local_hash)) if emp != local_hash => WrapperEtat::Perime { local },
-        _ => WrapperEtat::AJour,
+    if fichiers_identiques(installe, &local) {
+        WrapperEtat::AJour
+    } else {
+        WrapperEtat::Perime { local }
     }
 }
 
@@ -987,28 +1092,133 @@ fn ensure_wrapper_installed() -> Result<()> {
     Ok(())
 }
 
+/// Avertissements levés par la vérification de `opencode` dans le PATH.
+/// En mode jauge ils ne peuvent pas être écrits sur stderr (cela casserait le
+/// dessin) : ils sont reportés dans la zone de messages du menu.
+fn check_opencode() -> Vec<String>
+  {
+    match which::which("opencode")
+      {
+        Err(_) => vec![
+          "Avertissement : la commande « opencode » est introuvable dans le PATH.".to_string(),
+        ],
+        Ok(path) =>
+          {
+            let under_home = dirs::home_dir().is_some_and(|h| path.starts_with(h));
+            if under_home || world_writable(path.parent())
+              {
+                vec![
+                  format!(
+                    "Avertissement : « opencode » résolu vers {} (chemin sous le dossier personnel ou modifiable par les autres).",
+                    path.display()
+                  ),
+                ]
+              }
+            else
+              {
+                Vec::new()
+              }
+          }
+      }
+  }
+
+/// Démarrage instrumenté : la jauge anime l'avancement des étapes pendant que
+/// le thread de travail construit l'`App`.
+///
+/// Renvoie `Ok(None)` si l'utilisateur interrompt (Ctrl+C ou Échap).
+fn run_startup_gauge(
+    registry_path: PathBuf,
+    sort_order: SortOrder,
+    avertissements: Vec<String>,
+) -> Result<Option<App>>
+  {
+    use std::{
+      sync::mpsc::{self, TryRecvError},
+      thread,
+      time::Duration,
+    };
+
+    const RAFRAICHISSEMENT: Duration = Duration::from_millis(40);
+
+    let (tx, rx) = mpsc::channel::<startup::Signal>();
+    // Étapes antérieures au travail : elles ne durent rien, mais elles doivent
+    // apparaître dans la jauge pour que la numérotation soit continue.
+    {
+      let emetteur = startup::Channel(tx.clone());
+      let mut progress = Progress::new(&emetteur);
+      progress.begin(Step::Args);
+      progress.begin(Step::WhichOpencode);
+      if !avertissements.is_empty()
+        {
+          progress.detail(Step::WhichOpencode, avertissements.join(" · "));
+        }
+      progress.done();
+    }
+
+    let worker = thread::spawn(move ||
+      {
+        let emetteur = startup::Channel(tx.clone());
+        let mut progress = Progress::new(&emetteur);
+        let app = App::new(registry_path, sort_order, &mut progress);
+        let _ = tx.send(startup::Signal::Ready(Box::new(app)));
+      });
+
+    let mut terminal = open_terminal()?;
+    let mut state = startup::GaugeState::new();
+    let mut issue: Option<Result<Option<App>>> = None;
+    let mut avertissements = avertissements;
+    'attente: while issue.is_none()
+      {
+        state.tick();
+        terminal.draw(|f| startup::render(f, &state))?;
+        if event::poll(RAFRAICHISSEMENT)?
+          && let Event::Key(key) = event::read()?
+          {
+            if key.kind == KeyEventKind::Press
+                && (ctrl_quit(key) || key.code == KeyCode::Esc)
+              {
+                issue = Some(Ok(None));
+                break 'attente;
+              }
+          }
+        loop
+          {
+            match rx.try_recv()
+              {
+                Ok(startup::Signal::Step(e)) => state.apply(e),
+                Ok(startup::Signal::Ready(app)) =>
+                  {
+                    let mut app = *app;
+                    app.status_messages.extend(std::mem::take(&mut avertissements));
+                    issue = Some(Ok(Some(app)));
+                    break;
+                  }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) =>
+                  {
+                    issue = Some(Err(anyhow::anyhow!("le thread de démarrage s'est arrêté")));
+                    break;
+                  }
+              }
+          }
+      }
+
+    close_terminal(&mut terminal);
+    drop(worker);
+    issue.unwrap_or(Ok(None))
+  }
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.help {
+        print_help();
+        return Ok(());
+    }
 
     let registry_path = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("opencode/projects.json");
-
-    // Ensure opencode exists
-    match which::which("opencode") {
-        Err(_) => {
-            eprintln!("Avertissement : la commande « opencode » est introuvable dans le PATH.");
-        }
-        Ok(path) => {
-            let under_home = dirs::home_dir().is_some_and(|h| path.starts_with(h));
-            if under_home || world_writable(path.parent()) {
-                eprintln!(
-                    "Avertissement : « opencode » résolu vers {} (chemin sous le dossier personnel ou modifiable par les autres).",
-                    path.display()
-                );
-            }
-        }
-}
 
     let sort_order = if cli.sort_by_name {
         SortOrder::Name
@@ -1018,12 +1228,77 @@ fn main() -> Result<()> {
         cli.sort
     };
 
-    let mut app = App::new(registry_path.clone(), sort_order);
+    // La jauge ne concerne que le chemin interactif : -l, -V, -h et le
+    // lancement direct par mot-clé restent silencieux et rapides.
+    let interactif = !cli.help && !cli.list && !cli.version && cli.keyword.is_none();
 
-    if cli.help {
-        print_help();
-        return Ok(());
-    }
+    let verbose = if cli.verbose
+      {
+        Some(startup::Verbose::new())
+      }
+    else
+      {
+        None
+      };
+
+    if interactif
+      {
+        // Restaure le terminal si un panic survient en mode brut / écran alterné.
+        let defaut = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info|
+          {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            defaut(info);
+          }));
+      }
+
+    // -l et -V ne font que lire le registre : ni rescan, ni réseau, ni bump.
+    let leger = cli.list || cli.version;
+    let avertissements = if leger { Vec::new() } else { check_opencode() };
+
+    let mut app = if leger
+      {
+        App::new_light(registry_path.clone(), sort_order)
+      }
+    else
+      {
+        match verbose.as_ref()
+      {
+        Some(journal) =>
+          {
+            let mut progress = Progress::new(journal);
+            progress.begin(Step::Args);
+            progress.begin(Step::WhichOpencode);
+            if !avertissements.is_empty()
+              {
+                progress.detail(Step::WhichOpencode, avertissements.join(" · "));
+              }
+            progress.done();
+            App::new(registry_path.clone(), sort_order, &mut progress)
+          }
+        None if interactif && io::stdout().is_terminal() =>
+          {
+            match run_startup_gauge(registry_path.clone(), sort_order, avertissements)?
+              {
+                Some(app) => app,
+                None =>
+                  {
+                    eprintln!("Démarrage annulé.");
+                    return Ok(());
+                  }
+              }
+          }
+        None =>
+          {
+            for a in &avertissements
+              {
+                eprintln!("{a}");
+              }
+            App::new(registry_path.clone(), sort_order, &mut Progress::noop())
+          }
+      }
+      };
 
     if cli.list {
         if app.projects.is_empty() {
@@ -1078,6 +1353,12 @@ fn main() -> Result<()> {
             // Version du menu lui-même (depuis le registre si possible).
             if let Some(p) = app.projects.iter().find(|p| p.name == "OpenCode Start Menu") {
                 println!("{}_{}", sanitize(&p.version_debug), sanitize(&p.status_debug).replace(['-', ' '], "_"));
+                // La version affichée ne change qu'à la compilation : sans cette
+                // ligne, un binaire vieux de plusieurs commits affiche encore
+                // l'ancienne version, sans aucun signe visible du décalage.
+                if let Some(note) = binary_freshness_note(&p.path) {
+                    println!("{note}");
+                }
             } else {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
@@ -1092,38 +1373,103 @@ fn main() -> Result<()> {
         None => {}
     }
 
-    if let Some(keyword) = cli.keyword {
+    let a_mot_cle = cli.keyword.is_some();
+    if let Some(keyword) = cli.keyword.clone() {
         app.filter(&keyword, if cli.root { LaunchMode::Root } else { LaunchMode::Normal });
         if let Some(dir) = app.pending_launch.take() {
             let name = app.pending_name.take()
                 .unwrap_or_else(|| dir.display().to_string());
             run_launch_sequence(LaunchKind::Resume, &name, &dir, app.pending_sudo)?;
+            return Ok(());
         }
-        return Ok(());
+        if app.filtered.len() <= 1 {
+            // Aucun projet, ou un seul dont le lancement a échoué : dire pourquoi.
+            if app.status_messages.is_empty() {
+                eprintln!("Aucun projet ne correspond à : {keyword}");
+            } else {
+                for m in &app.status_messages {
+                    eprintln!("{m}");
+                }
+            }
+            return Ok(());
+        }
+        // Plusieurs correspondances : menu restreint à ces projets.
     }
 
-if cli.root {
+    if cli.root && !a_mot_cle {
         eprintln!("Erreur : l'option --root requiert un mot-clé de projet.");
         return Ok(());
     }
 
     // Vérifier et installer le wrapper si nécessaire (une seule fois, mode interactif seulement).
+    // Cette étape lit une réponse sur stdin : elle a donc lieu en mode cooked,
+    // jamais à l'intérieur de la jauge ni du menu.
+    let debut_wrapper = std::time::Instant::now();
+    let mut wrapper_ok = true;
     if let Err(e) = ensure_wrapper_installed() {
         eprintln!("Erreur wrapper: {e}");
+        wrapper_ok = false;
     }
+    if let Some(journal) = verbose.as_ref()
+      {
+        startup::trace_tail(journal, debut_wrapper.elapsed(), wrapper_ok);
+      }
 
-    // Interactive TUI mode
-    run_tui(app)?;
-    Ok(())
+    // Session terminal unique : le menu réutilise le même terminal, et la
+    // restauration est garantie même si le menu remonte une erreur.
+    let debut_terminal = std::time::Instant::now();
+    let mut terminal = open_terminal()?;
+    let resultat = run_tui(app, &mut terminal);
+    close_terminal(&mut terminal);
+    if let Some(journal) = verbose.as_ref()
+      {
+        startup::trace_terminal(journal, debut_terminal.elapsed());
+      }
+    resultat
 }
 
-fn run_tui(mut app: App) -> Result<()> {
+type Term = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Ctrl+C ou Ctrl+D : quitter. Sans modificateur, la touche « c » garde son
+/// sens (popup Coût) et « q » la sortie normale.
+fn ctrl_quit(key: crossterm::event::KeyEvent) -> bool
+  {
+    use crossterm::event::KeyModifiers;
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d') | KeyCode::Char('\u{3}'))
+  }
+
+/// Établit la session terminal (mode brut + écran alternatif + souris).
+fn open_terminal() -> Result<Term>
+  {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    terminal.clear()?;
+    Ok(terminal)
+  }
 
+/// Rend le terminal à l'interpréteur. Appelé sur TOUS les chemins de sortie,
+/// y compris les erreurs : sans cela, le shell suivant démarre en mode brut
+/// dans l'écran alternatif et plus rien ne s'affiche.
+fn close_terminal(terminal: &mut Term)
+  {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+      terminal.backend_mut(),
+      LeaveAlternateScreen,
+      DisableMouseCapture
+    );
+    let _ = terminal.show_cursor();
+    let _ = terminal.backend_mut().flush();
+  }
+
+fn run_tui(app: App, terminal: &mut Term) -> Result<()> {
+    tui_loop(terminal, app)
+}
+
+fn tui_loop(terminal: &mut Term, mut app: App) -> Result<()> {
     let mut input_mode = InputMode::Normal;
 
     loop {
@@ -1144,10 +1490,20 @@ fn run_tui(mut app: App) -> Result<()> {
                 continue;
             }
 
+            // Ctrl+C / Ctrl+D quittent depuis n'importe quel mode : en mode
+            // brut, ISIG est coupé et l'octet 0x03 arrivait ici comme une
+            // simple touche « c », qui ouvrait le popup Coût au lieu de sortir.
+            if ctrl_quit(key)
+              {
+                break;
+              }
+
             input_mode = match input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        rescan_repertoire(&mut app)?;
+                        if let Err(e) = rescan_repertoire(&mut app, &mut Progress::noop()) {
+                            app.push_error(format!("Rescan échoué : {e}"));
+                        }
                         InputMode::Normal
                     }
                     KeyCode::Char('q') | KeyCode::Esc => break,
@@ -1272,9 +1628,23 @@ fn run_tui(mut app: App) -> Result<()> {
                     },
                 },
                 InputMode::CreatingProject(mut state) => {
-                    handle_creation_input(key, &mut state, &mut app)?
+                    match handle_creation_input(key, &mut state, &mut app) {
+                        Ok(mode) => mode,
+                        Err(e) => {
+                            app.push_error(format!("Création impossible : {e}"));
+                            InputMode::Normal
+                        }
+                    }
                 }
-                InputMode::EditingProject(mut state) => handle_edit_input(key, &mut state, &mut app)?,
+                InputMode::EditingProject(mut state) => {
+                    match handle_edit_input(key, &mut state, &mut app) {
+                        Ok(mode) => mode,
+                        Err(e) => {
+                            app.push_error(format!("Édition impossible : {e}"));
+                            InputMode::Normal
+                        }
+                    }
+                }
                 InputMode::CostDetail {
                     project_idx,
                     mut scroll_offset,
@@ -1290,7 +1660,7 @@ fn run_tui(mut app: App) -> Result<()> {
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        scroll_offset += 1;
+                        scroll_offset = scroll_offset.saturating_add(1);
                         InputMode::CostDetail {
                             project_idx,
                             scroll_offset,
@@ -1308,7 +1678,7 @@ fn run_tui(mut app: App) -> Result<()> {
                         }
                     }
                     KeyCode::PageDown => {
-                        scroll_offset += 10;
+                        scroll_offset = scroll_offset.saturating_add(10);
                         InputMode::CostDetail {
                             project_idx,
                             scroll_offset,
@@ -1342,7 +1712,7 @@ fn run_tui(mut app: App) -> Result<()> {
                     country,
                     message,
                     fetching,
-                } => handle_tariff_input(
+                } => match handle_tariff_input(
                     key,
                     &mut app,
                     project_idx,
@@ -1353,7 +1723,13 @@ fn run_tui(mut app: App) -> Result<()> {
                     country,
                     message,
                     fetching,
-                )?,
+                ) {
+                    Ok(mode) => mode,
+                    Err(e) => {
+                        app.push_error(format!("Valorisation : {e}"));
+                        InputMode::Normal
+                    }
+                },
             };
         }
 
@@ -1380,12 +1756,7 @@ fn run_tui(mut app: App) -> Result<()> {
                 LaunchKind::Resume
             };
             app.pending_bare = false;
-            let launch_ok = if let Err(e) = run_launch_sequence(kind, &name, &dir, sudo) {
-                app.push_error(format!("Échec du lancement : {e}"));
-                false
-            } else {
-                true
-            };
+            let launch_err = run_launch_sequence(kind, &name, &dir, sudo).err();
 
             // Reprendre le TUI menu
             enable_raw_mode()?;
@@ -1399,22 +1770,18 @@ fn run_tui(mut app: App) -> Result<()> {
             // AutoPatch : rescan immédiat après chaque session réussie pour
             // détecter une éventuelle nouvelle compilation et incrémenter z ,
             // avec suivi visuel dès le retour dans le menu.
-            if launch_ok
-              {
-                if let Err(e) = rescan_repertoire(&mut app) {
-                    app.push_error(format!("Rescan post-session échoué : {e}"));
-                }
-              }
+            // Rescan après toute session, y compris terminée par Ctrl+C (code de
+            // sortie non nul) : une compilation a pu avoir lieu. Le message
+            // d'échec est posté après, le rescan remplaçant les messages.
+            if let Err(e) = rescan_repertoire(&mut app, &mut Progress::noop()) {
+                app.push_error(format!("Rescan post-session échoué : {e}"));
+            }
+            if let Some(e) = launch_err {
+                app.push_error(format!("Échec du lancement : {e}"));
+            }
         }
     }
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
     Ok(())
 }
 
@@ -1435,15 +1802,31 @@ fn load_creation_field(state: &mut ProjectCreationState)
     state.rewrite_mode = true;
   }
 
-fn rescan_repertoire(app: &mut App) -> Result<()>
+fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
   {
+    if app.registry_broken
+      {
+        // Registre illisible : ne rien réindexer ni réécrire, sinon une
+        // sauvegarde le remplacerait par un registre quasi vide.
+        finalize_project_list(app);
+        return Ok(());
+      }
+    let selection = app
+      .selected_project_idx()
+      .map(|i| app.projects[i].id.clone());
+    let mut alertes: Vec<String> = Vec::new();
     let mut changed = 0usize;
     let mut added = 0usize;
     let mut removed = 0usize;
     let mut written = false;
+    progress.begin(Step::RescanPurge);
     app.projects.retain(|p|
       {
-        if p.path.exists() && !registry::is_excluded(&p.path)
+        // Un projet n'est retiré que si son dossier a disparu alors que le
+        // dossier parent existe : un disque démonté ou un partage réseau
+        // absent ne doit pas effacer le registre.
+        let disparu = !p.path.exists() && p.path.parent().is_some_and(|d| d.is_dir());
+        if !disparu && !registry::is_excluded(&p.path)
           {
             true
           }
@@ -1457,10 +1840,16 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
       {
         written = true;
       }
+    progress.begin(Step::RescanIndex);
     if let Some(root) = projects_root(&app.projects)
       {
-        added = registry::reindex_from_disk(&root, &mut app.projects)?;
+        match registry::reindex_from_disk(&root, &mut app.projects)
+          {
+            Ok(n) => added = n,
+            Err(e) => alertes.push(format!("Indexation impossible : {e}")),
+          }
       }
+    progress.begin(Step::RescanUsage);
     let usage = registry::load_usage(&app.opencode_db_path);
     // Rafraîchissement de la source de tarifs : au plus une fois par période
     // de fraîcheur, et seulement si un projet utilise effectivement le mode
@@ -1470,6 +1859,7 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
         .projects
         .iter()
         .any(|p| p.tarif_mode != "manuel");
+    progress.begin(Step::RescanTarifs);
     if mode_web_utilise && app.web_cache.a_fetcher(maintenant) {
         let pays = app.web_cache.country.clone();
         let rafraichit = app.web_cache.rafraichir(&pays, maintenant, false);
@@ -1477,12 +1867,23 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
             written = true;
         }
         if !app.web_cache.last_error.is_empty() {
-            app.push_error(app.web_cache.last_error.clone());
+            alertes.push(app.web_cache.last_error.clone());
         }
+    } else {
+        progress.skip(Step::RescanTarifs);
     }
+    // La boucle par projet couvre deux étapes distinctes : on chronomètre
+    // chaque moitié séparément pour les restituer indépendamment.
+    progress.begin(Step::RescanManifests);
+    let total_projets = app.projects.len();
+    let mut t_manifestes = std::time::Duration::ZERO;
+    let mut t_autopatch = std::time::Duration::ZERO;
     let mut bumps: Vec<String> = Vec::new();
-    for entry in &mut app.projects
+    for (rang, entry) in app.projects.iter_mut().enumerate()
       {
+        progress.detail(Step::RescanManifests, format!("projet {}/{}", rang + 1, total_projets));
+        let avant = signature_persistee(entry);
+        let debut = std::time::Instant::now();
         entry.debug_modified =
           registry::variant_modified(&entry.path, "debug").unwrap_or_else(|| "jamais compilée".to_string());
         entry.release_modified =
@@ -1516,17 +1917,17 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
                   {
                     entry.version_debug = v;
                   }
-                changed += 1;
               }
           }
-        if let Some(u) = usage.get(&entry.path)
+        let agrege = registry::usage_du_projet(&usage, &entry.path);
+        if let Some(u) = agrege.as_ref()
           {
             let cum = &u.cumulative;
             entry.token = format_number(cum.total_tokens);
             // Budget 100M tokens pour le calcul du pourcentage (affiché dans Totaux).
             const BUDGET_TOKENS: u64 = 100_000_000;
             let pct = (cum.total_tokens * 100) / BUDGET_TOKENS;
-            entry.used_pct = format!("{}", pct.min(99));
+            entry.used_pct = format!("{}", pct);
             entry.spent = if cum.total_cost_local > 0.0
               {
                 format_currency(cum.total_cost_local, LOCAL_CURRENCY)
@@ -1634,7 +2035,6 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
                 None => "—".to_string(),
               };
             entry.tarif_resume = resume_tarif(entry, &serie, secteur, fetched_ms);
-            changed += 1;
           }
         else
           {
@@ -1655,15 +2055,16 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
             entry.total_valorisation = "—".to_string();
             entry.tarif_resume = resume_tarif(entry, &[], false, 0);
           }
+        t_manifestes += debut.elapsed();
         // AutoPatch : détection des modifications de code via hash SHA256
         // (Cargo.toml + src/**/*.rs) — plus fiable que mtime target/debug.
+        let debut = std::time::Instant::now();
         let current_hash = registry::compute_source_hash(&entry.path);
         let hash_changed = current_hash != entry.source_hash;
 
         if hash_changed {
             // Modification de code détectée
             let baseline = entry.source_hash.is_empty();
-            let old_hash = entry.source_hash.clone();
             entry.source_hash = current_hash.clone();
             // Mettre à jour la référence mtime pour cohérence
             let t_debug = registry::variant_modified_time(&entry.path, "debug")
@@ -1676,7 +2077,6 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
             if entry.version_manually_edited {
                 // Édition manuelle → PAS de bump, reset flag seulement
                 entry.version_manually_edited = false;
-                changed += 1;
             } else {
                 // Modif code → bump z normal
                 let valid = registry::validate_version(&entry.version_debug);
@@ -1697,7 +2097,10 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
                         // La Release n'est PAS bumpée ici : son binaire n'a pas
                         // été reconstruit, elle reste à sa version antérieure.
                         entry.version = v.clone();
-                        let _ = bump_manifest_version(&entry.path, &v)?;
+                        if let Err(e) = bump_manifest_version(&entry.path, &v)
+                          {
+                            alertes.push(format!("{} : Cargo.toml non mis à jour ({e})", entry.name));
+                          }
                         // Resynchroniser le hash sur le manifeste APRÈS écriture.
                         // Sans cela le hash stocké décrit l'ancienne version, alors
                         // que le manifeste porte la nouvelle : le rescan suivant y
@@ -1705,7 +2108,6 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
                         // lancement.
                         entry.source_hash = registry::compute_source_hash(&entry.path);
                         bumps.push(format!("{} : {old} → {v}", entry.name));
-                        changed += 1;
                     }
                 }
             }
@@ -1731,14 +2133,33 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
                   {
                     entry.version_release = v;
                     entry.status_release = entry.status_debug.clone();
-                    changed += 1;
                   }
                 written = true;
               }
           }
+        t_autopatch += debut.elapsed();
+        if signature_persistee(entry) != avant
+          {
+            written = true;
+            changed += 1;
+          }
       }
+    progress.close(
+      Step::RescanManifests,
+      t_manifestes,
+      format!("{total_projets} projet(s)"),
+    );
+    progress.close(
+      Step::AutoPatch,
+      t_autopatch,
+      format!(
+        "{total_projets} projet(s), {} bump(s)",
+        bumps.len()
+      ),
+    );
     if added > 0 || changed > 0 || written
       {
+        progress.begin(Step::RescanSave);
         registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
         let mut parts: Vec<String> = Vec::new();
         if !bumps.is_empty()
@@ -1765,16 +2186,67 @@ fn rescan_repertoire(app: &mut App) -> Result<()>
           {
             app.push_info(parts.join("  ·  "));
           }
+        progress.done();
       }
     else
       {
         app.push_info("Rescan : base déjà alignée sur le disque".to_string());
+        progress.skip(Step::RescanSave);
       }
     // NOTE: sync_menu_project_version appelé UNIQUEMENT au démarrage (App::new).
     // Le rescan lit déjà Cargo.toml pour tous les projets (lignes 1308-1338),
     // ce qui synchronise aussi le projet menu. Ne pas écraser un AutoPatch bump ici.
     finalize_project_list(app);
+    // Conserver la sélection courante plutôt que la ramener au dernier projet.
+    if let Some(id) = selection
+      && let Some(pos) = app.projects.iter().position(|p| p.id == id)
+      {
+        app.list_state.select(Some(pos));
+      }
+    for a in alertes
+      {
+        app.push_error(a);
+      }
     Ok(())
+  }
+
+/// Signature des champs persistés qu'un rescan peut modifier : sert à ne
+/// réécrire le registre que si quelque chose a réellement changé.
+fn signature_persistee(e: &ProjectEntry) -> String
+  {
+    [
+      e.version.clone(),
+      e.version_debug.clone(),
+      e.status_debug.clone(),
+      e.status_release.clone(),
+      e.version_release.clone(),
+      e.token.clone(),
+      e.used_pct.clone(),
+      e.spent.clone(),
+      e.total_tokens.clone(),
+      e.total_cost.clone(),
+      e.session_count.clone(),
+      e.last_session_tokens.clone(),
+      e.last_session_cost.clone(),
+      e.last_model.clone(),
+      e.last_agent.clone(),
+      e.last_time_created.clone(),
+      e.last_session_context_pct.clone(),
+      e.last_duree.clone(),
+      e.total_duree.clone(),
+      e.last_valorisation.clone(),
+      e.total_valorisation.clone(),
+      e.tarif_resume.clone(),
+      e.source_hash.clone(),
+      e.tarif_web_pays.clone(),
+      e.tarif_web_fetched_ms.to_string(),
+      e.tarif_web_series.len().to_string(),
+      e.tarif_web_secteur.to_string(),
+      e.last_compile_debug_secs.to_string(),
+      e.last_compile_release_secs.to_string(),
+      e.version_manually_edited.to_string(),
+    ]
+    .join("|")
   }
 
 /// Résumé lisible du tarif appliqué, affiché dans le popup (touche `t`).
@@ -1819,28 +2291,60 @@ fn initial_selection_index(order: SortOrder, len: usize) -> usize {
     }
 }
 
-fn sort_projects(projects: &mut [ProjectEntry], order: SortOrder) {
-    match order {
-        SortOrder::Name => {
-            projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        }
-        SortOrder::Modified => {
-            projects.sort_by(|a, b| {
-                let ta = registry::last_modified_time(&a.path);
-                let tb = registry::last_modified_time(&b.path);
-                match (ta, tb) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (None, Some(_)) => Ordering::Greater,
-                    (Some(_), None) => Ordering::Less,
-                    (None, None) => Ordering::Equal,
-                }
-            });
-        }
-    }
+/// Clé de tri projet, calculée UNE fois par projet.
+///
+/// `last_modified_time` parcourt récursivement tout l'arborescence du projet,
+/// `target/` compris : l'appeler dans le comparateur de `sort_by` le rendait
+/// O(n log n) fois, soit plus d'une seconde de démarrage sur huit projets.
+/// On décore donc chaque entrée avant de trier (decorate-sort-undecorate).
+enum CleTri
+  {
+    /// Tri alphabétique insensible à la casse.
+    Nom(String),
+    /// Tri par date de modification, du plus ancien au plus récent.
+    Modifie(Option<std::time::SystemTime>),
+  }
+
+fn sort_projects(projects: &mut Vec<ProjectEntry>, order: SortOrder) {
+    let cles: Vec<CleTri> = projects
+        .iter()
+        .map(|p| match order
+          {
+            SortOrder::Name => CleTri::Nom(p.name.to_lowercase()),
+            SortOrder::Modified => CleTri::Modifie(registry::last_modified_time(&p.path)),
+          })
+        .collect();
+
+    let mut entrees: Vec<(CleTri, ProjectEntry)> = projects
+        .drain(..)
+        .zip(cles)
+        .map(|(p, cle)| (cle, p))
+        .collect();
+    entrees.sort_by(|(a, _), (b, _)| match (a, b)
+      {
+        (CleTri::Nom(x), CleTri::Nom(y)) => x.cmp(y),
+        (CleTri::Modifie(Some(x)), CleTri::Modifie(Some(y))) => x.cmp(y),
+        (CleTri::Modifie(None), CleTri::Modifie(Some(_))) => Ordering::Greater,
+        (CleTri::Modifie(Some(_)), CleTri::Modifie(None)) => Ordering::Less,
+        (CleTri::Modifie(None), CleTri::Modifie(None)) => Ordering::Equal,
+        // Tri inhomogène : impossible, `order` est fixé pour tout l'appel.
+        (CleTri::Nom(_), _) | (_, CleTri::Nom(_)) => Ordering::Equal,
+      });
+    projects.extend(entrees.into_iter().map(|(_, p)| p));
 }
 
 fn finalize_project_list(app: &mut App) {
     sort_projects(&mut app.projects, app.sort_order);
+    refresh_project_selection(app);
+}
+
+/// Recalcule le filtrage et la sélection sans retrier.
+///
+/// `rescan_repertoire` trie déjà la liste ; le startup n'a plus qu'à
+/// réinitialiser la sélection. Retrier ici reparcourrait `target/` de tous les
+/// projets une seconde fois pour un résultat identique, puisque rien n'a
+/// modifié les dates de modification.
+fn refresh_project_selection(app: &mut App) {
     app.filtered = (0..app.projects.len()).collect();
     if !app.projects.is_empty() {
         app.list_state.select(Some(initial_selection_index(app.sort_order, app.projects.len())));
@@ -2112,6 +2616,17 @@ fn handle_creation_input(
                         PathBuf::from(shellexpand::tilde(&state.path).to_string())
                       };
 
+                    if state.id.trim().is_empty()
+                      {
+                        app.push_error("Identifiant obligatoire".to_string());
+                        return Ok(InputMode::CreatingProject(state.clone()));
+                      }
+                    if app.projects.iter().any(|p| p.id == state.id)
+                      {
+                        app.push_error(format!("Un projet d'identifiant « {} » existe déjà", state.id));
+                        return Ok(InputMode::CreatingProject(state.clone()));
+                      }
+
                     fs::create_dir_all(&dir)?;
                     if !dir.join("opencode.json").exists()
                       {
@@ -2124,22 +2639,7 @@ fn handle_creation_input(
                         )?;
                       }
 
-                    let status = state
-                      .status
-                      .clone()
-                      .or_else(|| {
-                        let v = state.input_buffer.trim();
-                        if v.is_empty()
-                          {
-                            None
-                          }
-                        else
-                          {
-                            Some(v.to_string())
-                          }
-                      });
-
-                    let status = status.unwrap_or_default();
+                    let status = state.status.clone().unwrap_or_default();
                     let version = state.version.clone();
 
                     app.projects.push(ProjectEntry {
@@ -2185,11 +2685,12 @@ debug_modified: "jamais compilée".to_string(),
                         tarif_resume: String::new(),
                     });
                     registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+                    finalize_project_list(app);
 
                     if matches!(
                       state.input_buffer.to_lowercase().as_str(),
                       "o" | "oui" | "y" | "yes"
-                    ) && !status.is_empty()
+                    )
                       {
                         app.pending_launch = Some(dir);
                         app.pending_sudo = false;
@@ -2377,28 +2878,37 @@ fn commit_edit_field(state: &mut ProjectEditState) {
 /// Valide l'ensemble des champs et applique les modifications au projet,
 /// en diffusant la variante Debug sur la variante Release (miroir).
 fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
-    if !registry::validate_version(&state.pending_version) {
+    let Some(p) = app.projects.get_mut(state.project_idx) else {
+        return false;
+    };
+    // Une valeur inchangée reste acceptée même héritée d'un ancien registre
+    // (statut libre, version vide) : seules les valeurs modifiées sont validées.
+    let version_ok = state.pending_version == p.version_debug
+        || registry::validate_version(&state.pending_version);
+    let statut_ok = state.pending_status == p.status_debug
+        || registry::validate_status(&state.pending_status);
+    let desc_ok = !state.pending_description.trim().is_empty()
+        || state.pending_description == p.description;
+    if !(version_ok && statut_ok && desc_ok) {
         return false;
     }
-    if !registry::validate_status(&state.pending_status) {
-        return false;
-    }
-    if state.pending_description.trim().is_empty() {
-        return false;
-    }
-    if let Some(p) = app.projects.get_mut(state.project_idx) {
-        p.version_debug = state.pending_version.clone();
-        p.status_debug = state.pending_status.clone();
-        p.description = state.pending_description.clone();
-        // Sans miroir : la Release garde sa version/statut tant que son
-        // binaire n'est pas reconstruit (rattrapage au prochain rescan).
-        // Champs historiques alignés sur la variante élue (Debug).
-        p.version = p.version_debug.clone();
-        p.status = p.status_debug.clone();
-        // Marquer version éditée manuellement → pas de bump AutoPatch au rescan.
-        p.version_manually_edited = true;
-        // Synchroniser Cargo.toml immédiatement.
+    p.version_debug = state.pending_version.clone();
+    p.status_debug = state.pending_status.clone();
+    p.description = state.pending_description.clone();
+    // Sans miroir : la Release garde sa version/statut tant que son
+    // binaire n'est pas reconstruit (rattrapage au prochain rescan).
+    // Champs historiques alignés sur la variante élue (Debug).
+    p.version = p.version_debug.clone();
+    p.status = p.status_debug.clone();
+    if registry::validate_version(&p.version_debug) {
+        // Le drapeau « édité manuellement » n'a de sens que si l'édition a
+        // réellement modifié le manifeste : sinon il resterait levé et
+        // avalerait le prochain vrai bump.
+        let avant = registry::compute_source_hash(&p.path);
         let _ = set_manifest_version(&p.path, &p.version_debug);
+        if registry::compute_source_hash(&p.path) != avant {
+            p.version_manually_edited = true;
+        }
     }
     true
 }
@@ -2527,7 +3037,7 @@ fn handle_tariff_input(
                         // peut re-trier la liste : on retrouve l'index du
                         // projet par son identifiant, qui est stable.
                         let id = app.projects[project_idx].id.clone();
-                        let _ = rescan_repertoire(app);
+                        let _ = rescan_repertoire(app, &mut Progress::noop());
                         if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
                           {
                             project_idx = nouveau;
@@ -2552,6 +3062,7 @@ fn handle_tariff_input(
                 if code.len() == 3 && code.chars().all(|c| c.is_ascii_alphabetic())
                   {
                     app.web_cache.country = code.clone();
+                    app.web_cache.last_failure_ms = 0;
                     // Le pays est stocké globalement : il est persisté avec
                     // le registre. La valorisation n'est recalculée qu'au
                     // rafraîchissement explicite (r), pour ne pas écraser un
@@ -2648,7 +3159,7 @@ fn handle_tariff_input(
                     message = Some("Mode manuel activé".to_string());
                   }
                 let id = app.projects[project_idx].id.clone();
-                let _ = rescan_repertoire(app);
+                let _ = rescan_repertoire(app, &mut Progress::noop());
                 if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
                   {
                     project_idx = nouveau;
@@ -2697,7 +3208,7 @@ fn handle_tariff_input(
                 message = Some(format!("Source déjà à jour ({pays})"));
               }
             // Recalcul immédiat des durées valorisées.
-            let _ = rescan_repertoire(app);
+            let _ = rescan_repertoire(app, &mut Progress::noop());
             return Ok(popup!(false, String::new(), 0, message));
           }
         _ => return Ok(popup!(false, String::new(), 0, message)),
@@ -2937,7 +3448,7 @@ fn handle_edit_input(
 #[cfg(test)]
 mod tests
   {
-    use crate::{sanitize, variant_label};
+    use crate::{sanitize, variant_label, Progress};
     use std::{fs, path::PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -3242,7 +3753,7 @@ mod tests
 
         // Lancement n°1 : bump attendu, puis hash resynchronisé sur le
         // manifeste réellement écrit.
-        let app = super::App::new(registre.clone(), super::SortOrder::Modified);
+        let app = super::App::new(registre.clone(), super::SortOrder::Modified, &mut Progress::noop());
         let apres_run1 = app
           .projects
           .iter()
@@ -3262,7 +3773,7 @@ mod tests
 
         // Lancement n°2 et n°3 : plus aucun bump, plus aucune écriture.
         for n in 2..=3 {
-            let app = super::App::new(registre.clone(), super::SortOrder::Modified);
+            let app = super::App::new(registre.clone(), super::SortOrder::Modified, &mut Progress::noop());
             let e = app
               .projects
               .iter()
@@ -3297,6 +3808,21 @@ mod tests
         assert!(content.contains("name = \"demo\""));
         assert!(content.contains("foo = \"1\""));
         assert!(content.contains("[dependencies]"));
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    #[test]
+    fn bump_manifest_version_respecte_workspace_et_apostrophes()
+      {
+        let dir = temp_dir("ws");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"a\"\nversion.workspace = true\n").unwrap();
+        assert_eq!(super::bump_manifest_version(&dir, "1.0.1").unwrap(), false);
+        let c = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert_eq!(c.matches("version").count(), 1);
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"a\"\nversion = '1.0.0' # note\n").unwrap();
+        assert_eq!(super::bump_manifest_version(&dir, "1.0.1").unwrap(), true);
+        let c = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert!(c.contains("version = \"1.0.1\" # note"), "{c}");
         fs::remove_dir_all(&dir).unwrap();
       }
 
