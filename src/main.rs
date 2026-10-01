@@ -3025,7 +3025,7 @@ fn handle_tariff_input(
                 let brut = input_buffer.trim().replace(',', ".");
                 match brut.parse::<f64>()
                   {
-                    Ok(v) if v >= 0.0 =>
+                    Ok(v) if registry::tarif_valide(v) =>
                       {
                         app.projects[project_idx].tarif_manual = v;
                         app.projects[project_idx].tarif_mode = "manuel".to_string();
@@ -3045,7 +3045,16 @@ fn handle_tariff_input(
                         ));
                         return Ok(popup!(false, String::new(), 0, message));
                       }
-                    _ =>
+                    // « 1e400 » donne `inf` : refusé, car il rendrait le
+                    // registre illisible. Le message distingue le cas.
+                    Ok(_) =>
+                      {
+                        message = Some(format!(
+                          "« {input_buffer} » n'est pas un tarif utilisable : il faut un nombre fini et positif"
+                        ));
+                        return Ok(popup!(true, input_buffer, input_offset, message));
+                      }
+                    Err(_) =>
                       {
                         message =
                           Some(format!("Saisie invalide : « {input_buffer} »"));

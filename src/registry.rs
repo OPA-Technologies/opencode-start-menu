@@ -279,6 +279,18 @@ pub(crate) fn validate_status(s: &str) -> bool {
     STATUSES.iter().any(|known| *known == s)
 }
 
+/// Tarif horaire manuel recevable : fini, et positif ou nul.
+///
+/// `f64::INFINITY` satisfait `>= 0.0`, et `serde_json` le sérialise en `null`
+/// **sans signaler d'erreur**. Le registre écrit est alors illisible au
+/// rechargement (« invalid type: null, expected f64 »), ce qui bloque toute
+/// écriture ultérieure : plus aucun projet n'est alors accessible. `NaN` échoue
+/// à toute comparaison, mais par un autre chemin. Les deux sont donc refusés
+/// d'entrée, à la saisie comme à l'écriture.
+pub(crate) fn tarif_valide(v: f64) -> bool {
+    v.is_finite() && v >= 0.0
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct Registry {
     #[serde(default)]
@@ -1486,7 +1498,8 @@ pub(crate) fn save_registry_full(
     path: &Path,
     projects: &[ProjectEntry],
     web: &WebCache,
-) -> Result<()> {    ensure_regular(path)?;
+) -> Result<()> {
+    ensure_regular(path)?;
     // Un registre illisible est mis de côté avant d'être remplacé.
     if let Ok(existant) = fs::read_to_string(path)
         && serde_json::from_str::<Registry>(&existant).is_err()
@@ -1526,7 +1539,14 @@ pub(crate) fn save_registry_full(
                 source_hash: p.source_hash.clone(),
                 active: true,
                 tarif_mode: p.tarif_mode.clone(),
-                tarif_manual: p.tarif_manual,
+                // Dernier rempart contre la corruption du registre : une valeur
+                // non finie y serait sérialisée en `null` et rendrait le fichier
+                // illisible au rechargement, sans le moindre message d'erreur.
+                tarif_manual: if tarif_valide(p.tarif_manual) {
+                    p.tarif_manual
+                } else {
+                    0.0
+                },
                 tarif_web_series: p.tarif_web_series.clone(),
                 tarif_web_fetched_ms: p.tarif_web_fetched_ms,
                 tarif_web_secteur: p.tarif_web_secteur,
@@ -1882,10 +1902,11 @@ pub(crate) fn compute_source_hash(dir: &Path) -> String {
 mod tests
   {
     use std::{collections::HashMap, fs, path::PathBuf};
+    use crate::registry::tarif_valide;
 
     use super::{
-        default_tarif_mode, default_web_country, load_registry, save_registry, TarifPoint,
-        validate_status, validate_version, ProjectEntry, STATUSES,
+        default_tarif_mode, default_web_country, load_registry, save_registry, save_registry_full,
+        TarifPoint, validate_status, validate_version, ProjectEntry, STATUSES, WebCache,
     };
 
     fn temp_registry(name: &str) -> PathBuf {
@@ -2112,6 +2133,55 @@ last_compile_debug_secs: 0,
         assert!(!validate_version("1.2.beta"));
         assert!(!validate_version(""));
         assert!(!validate_version("1.2-3"));
+    }
+
+    #[test]
+    fn tarif_valide_refuse_inf_et_nan() {
+        assert!(tarif_valide(0.0));
+        assert!(tarif_valide(0.5));
+        assert!(tarif_valide(42.0));
+        // `inf` passe `>= 0.0` : c'est exactement le trou qui corromprait le
+        // registre, puisque serde_json l'écrit en `null` sans erreur.
+        assert!(!tarif_valide(f64::INFINITY));
+        assert!(!tarif_valide(f64::NEG_INFINITY));
+        assert!(!tarif_valide(f64::NAN));
+        assert!(!tarif_valide(-1.0));
+    }
+
+    /// Régression P0-3 : un tarif non fini ne doit pas rendre le registre
+    /// illisible. `save_registry_full` neutralise la valeur ; le rechargement
+    /// doit donc réussir et rendre un tarif exploitable.
+    #[test]
+    fn un_tarif_non_fini_ne_peut_pas_corrompre_le_registre() {
+        let path = temp_registry("tarif-infini").join("projects.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "projects": { "demo": { "name": "demo", "path": "/tmp/demo", "description": "" } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut e = load_registry(&path).unwrap().remove(0);
+        e.tarif_manual = f64::INFINITY;
+        save_registry_full(&path, &[e], &WebCache::default()).unwrap();
+
+        // Le fichier produit ne doit contenir aucun `null` de tarif, et surtout
+        // rester relisible.
+        let brut = fs::read_to_string(&path).unwrap();
+        assert!(
+            !brut.contains("\"tarif_manual\": null"),
+            "un tarif infini sérialisé en null : {brut}"
+        );
+        let relu = load_registry(&path).expect("le registre doit rester lisible");
+        assert_eq!(relu.len(), 1);
+        assert!(
+            relu[0].tarif_manual.is_finite(),
+            "tarif relu non fini : {}",
+            relu[0].tarif_manual
+        );
+        assert_eq!(relu[0].tarif_manual, 0.0);
+        fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
