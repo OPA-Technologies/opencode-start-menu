@@ -289,3 +289,65 @@ fn les_arguments_sont_transmis() {
         "les arguments doivent etre transmis intacts"
     );
 }
+
+/// Régression P0-2 : le pourcentage de contexte doit être extrait de la
+/// sortie d'opencode et écrit en base.
+///
+/// Le mécanisme de démarrage est la cause : la capture redirigeait stdout vers
+/// un fichier régulier, or opencode n'écrit rien dans ce cas — il détecte un
+/// stdout non terminal et se taît. La capture restait donc vide et
+/// `context_pct` valait 0 sur toutes les sessions. Aucun test unitaire ne
+/// pouvait le voir : il faut lancer le binaire pour que le pseudo-terminal
+/// existe.
+///
+/// Le faux opencode produit une sortie de TUI réaliste (séquences ANSI et retour
+/// chariot), et non une ligne propre : c'est ce que reçoit réellement le
+/// pseudo-terminal.
+/// Le faux opencode doit reproduire le comportement mesuré d'opencode : il
+/// n'écrit rien si sa sortie n'est pas un terminal. C'est toute la cause du
+/// bug ; un faux qui écrit inconditionnellement passerait aussi avec le code
+/// d'avant la correction, et ne prouverait donc rien.
+#[test]
+fn la_capture_pty_ecrit_le_contexte_en_base() {
+    use rusqlite::Connection;
+
+    let bac = BacASable::nouveau("capture");
+    ecrire_faux_opencode(
+        bac.chemin(),
+        r#"#!/bin/sh
+[ -t 1 ] || exit 0
+printf '\033[2K\r'
+printf '  Context: 42%% used  \r\n'
+printf '\033[0m\033[38;5;33mau revoir\033[0m\n'
+"#,
+    );
+
+    let data = bac.chemin().join("donnees");
+    fs::create_dir_all(data.join("opencode")).unwrap();
+    let db = data.join("opencode").join("opencode.db");
+    {
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
+                 context_pct INTEGER DEFAULT 0);
+             INSERT INTO session VALUES ('s','/mon/projet',100,0);",
+        )
+        .unwrap();
+    }
+
+    let statut = Command::new(chemin_wrapper())
+        .env("PATH", chemin_bin(bac.chemin()))
+        .env("XDG_DATA_HOME", &data)
+        .env("OPENCODE_PROJECT_DIR", "/mon/projet")
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(statut.success(), "le wrapper doit sortir en 0");
+
+    let c = Connection::open(&db).unwrap();
+    let pct: i64 = c
+        .query_row("SELECT context_pct FROM session WHERE id = 's'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pct, 42, "le contexte du TUI doit etre extrait puis ecrit");
+}
