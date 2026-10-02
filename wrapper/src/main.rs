@@ -14,77 +14,101 @@ use tokio::process::Command;
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
 static EXCHANGE_RATE_CACHE: Lazy<Mutex<HashMap<String, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Flux du parent sur lequel une capture est restituée.
-#[derive(Clone, Copy)]
-enum Flux {
-    Stdout,
-    Stderr,
+/// Chemin du fichier de capture, unique par PID et horodatage pour que deux
+/// sessions simultanées ne se marchent pas dessus.
+fn chemin_capture(etiquette: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "opencode-wrap-{etiquette}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
-/// Capture sur fichier temporaire de la sortie d'opencode.
+/// Échappe un argument pour une ligne de commande `/bin/sh`.
 ///
-/// `Command::output()` capturait déjà stdout et stderr, mais sans stdin :
-/// opencode recevait un EOF immédiat et quittait sans laisser l'utilisateur
-/// taper. Il faut donc laisser stdin au terminal tout en conservant une copie
-/// de la sortie pour le scraping, ce qu'`output()` ne permet pas.
-///
-/// La restitution se fait après la sortie de l'enfant, en une seule fois :
-/// c'est la contrepartie assumée du correctif minimal, le rendu en direct n'est
-/// plus possible (voir `OPENCODE_WRAP_CAPTURE`).
-struct CaptureTemp {
-    path: PathBuf,
+/// `script` ne reçoit qu'une chaîne, pas un vecteur d'arguments : la ligne de
+/// commande est donc reconstruite pour `sh -c`, ce qui impose d'échapper. Sans
+/// cela, un argument contenant une quote ou un `;` Allowlisting hiatuserait la
+/// commande — le wrapper est lancé par le menu, mais rien n'interdit à un
+/// utilisateur de lui passer des arguments.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-impl CaptureTemp {
-    /// Crée le fichier de capture et renvoie le descripteur à passer à
-    /// `Stdio::from`. Le nom combine le PID et l'horodatage pour que deux
-    /// sessions simultanées, ou deux captures d'un même processus, ne se
-    /// marchent pas dessus.
-    fn nouveau(etiquette: &str) -> std::io::Result<(Self, std::fs::File)> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "opencode-wrap-{etiquette}-{}-{nanos}",
-            std::process::id()
-        ));
-        let fd = std::fs::File::create(&path)?;
-        Ok((
-            Self { path },
-            fd,
-        ))
-    }
+/// Retire les séquences ANSI et convertit les retour chariot en sauts de ligne.
+///
+/// Un TUI redessine une même ligne en revenant au début (retour chariot) puis en
+/// écrasant : supprimer `\r` seul collerait deux fragments distincts, et « 1 »
+/// suivi de « 2% » donnerait « 12% ». En saut de ligne, chaque redessin reste
+/// analysable isolément.
+fn nettoyer_sortie(brut: &[u8]) -> String {
+    let texte = String::from_utf8_lossy(brut);
+    let mut out = String::with_capacity(texte.len());
+    let mut chars = texte.chars().peekable();
 
-    /// Restitue la sortie capturée sur le flux du parent, supprime le fichier
-    /// temporaire et rend les octets capturés pour le scraping.
-    ///
-    /// Une erreur de lecture ou d'écriture est ignorée : opencode s'est déjà
-    /// terminé et la session est sauvée, seul l'affichage est en jeu.
-    fn restituer(&self, flux: Flux) -> Vec<u8> {
-        let contenu = std::fs::read(&self.path).unwrap_or_default();
-        let mut sortie: Box<dyn Write> = match flux {
-            Flux::Stdout => Box::new(std::io::stdout()),
-            Flux::Stderr => Box::new(std::io::stderr()),
-        };
-        if !contenu.is_empty() {
-            let _ = sortie.write_all(&contenu);
-            let _ = sortie.flush();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c == '\r' {
+                out.push('\n');
+            } else {
+                out.push(c);
+            }
+            continue;
         }
-        let _ = std::fs::remove_file(&self.path);
-        contenu
+
+        match chars.peek() {
+            // Séquence CSI : sautée jusqu'à sa lettre finale.
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            // Séquence OSC : sautée jusqu'à BEL ou ST.
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Échappement suivi d'un octet isolé.
+            _ => {
+                chars.next();
+            }
+        }
     }
+
+    out
 }
 
-/// Prépare la capture d'un flux. Retourne `None` si le fichier temporaire n'a
-/// pas pu être créé : on préfère alors la sortie en direct, dégradée mais
-/// lisible, à une session silencieuse.
-fn preparer_capture(etiquette: &str) -> Option<(CaptureTemp, Stdio)> {
-    match CaptureTemp::nouveau(etiquette) {
-        Ok((cap, fd)) => Some((cap, Stdio::from(fd))),
-        Err(e) => {
-            eprintln!("opencode-wrap: capture impossible ({e}), sortie en direct");
-            None
+/// Conserve un extrait de la sortie lorsque rien n'a pu être extrait.
+///
+/// Sans cela, « le scraper ne trouve rien » est indiscernable, en base, d'une
+/// session sans pourcentage de contexte : les deux laissent `context_pct` à 0.
+/// Le fichier écrit permet de vérifier les motifs sur le rendu réel de opencode
+/// au lieu de les supposer justes.
+fn journaliser_sous_motifs(sortie: &str) {
+    let path = std::env::temp_dir().join("opencode-wrap-dernier-scraping.log");
+    let extrait: Vec<&str> = sortie.lines().filter(|l| !l.trim().is_empty()).collect();
+    let debut = extrait.len().saturating_sub(200);
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = f.write_all(
+            format!("--- {} octets capturés ---\n", sortie.len()).as_bytes(),
+        );
+        for l in &extrait[debut..] {
+            let _ = f.write_all(l.as_bytes());
+            let _ = f.write_all(b"\n");
         }
     }
 }
@@ -94,45 +118,93 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let project_dir = std::env::var("OPENCODE_PROJECT_DIR").ok();
 
-    let mut cmd = Command::new("opencode");
-    cmd.args(&args);
-
-    // Régression P0-1 : sans cet héritage explicite, `output()` redirigeait
-    // stdin et opencode recevait un EOF immédiat — le TUI était inutilisable.
-    cmd.stdin(Stdio::inherit());
-
     // OPENCODE_WRAP_CAPTURE=0 : opencode écrit directement dans notre terminal.
     // Le rendu est alors en direct, mais plus rien n'est scrapé, donc ni
     // contexte ni coût ne sont enregistrés. À réserver au débogage.
     let capturer = std::env::var("OPENCODE_WRAP_CAPTURE").as_deref() != Ok("0");
 
-    let mut cap_out = None;
-    let mut cap_err = None;
+    let mut journal_capture: Option<PathBuf> = None;
+
+    let mut cmd = if capturer {
+        // Régression P0-2 : la capture redirigeait stdout et stderr vers des
+        // fichiers réguliers, et opencode n'y écrivait alors **rien** — mesuré
+        // à 0 octet, contre 7 octets pour la même commande sur un pipe. Le TUI
+        // détecte un stdout qui n'est pas un terminal et se taisait : la
+        // capture restait vide et aucun pourcentage de contexte n'était jamais
+        // enregistré. Symptôme en base : `context_pct` à 0 partout.
+        //
+        // `script` fournit un vrai pseudo-terminal à opencode tout en
+        // journalisant sa sortie dans un fichier. Le TUI s'affiche en direct —
+        // contrepartie perdue du correctif précédent, qui restituait la sortie
+        // d'un seul bloc après la fin de la session.
+        let mut ligne = String::from("opencode");
+        for arg in &args {
+            ligne.push(' ');
+            ligne.push_str(&shell_quote(arg));
+        }
+
+        let mut c = Command::new("script");
+        let journal = chemin_capture("sortie");
+        c.args([
+            "-q",
+            "-f",
+            "-e",
+            "-c",
+            &ligne,
+            journal.to_string_lossy().as_ref(),
+        ]);
+        journal_capture = Some(journal);
+        c
+    } else {
+        let mut c = Command::new("opencode");
+        c.args(&args);
+        c
+    };
+
+    // Régression P0-1 : sans cet héritage explicite, `output()` redirigeait
+    // stdin et opencode recevait un EOF immédiat — le TUI était inutilisable.
+    cmd.stdin(Stdio::inherit());
+
+    // En mode pseudo-terminal, `script` retransmet la sortie vers notre
+    // terminal : il faut laisser stdout et stderr hérités, sinon le TUI
+    // s'affiche dans le journal de capture au lieu de l'écran.
     if capturer {
-        if let Some((cap, fd)) = preparer_capture("out") {
-            cap_out = Some(cap);
-            cmd.stdout(fd);
-        }
-        if let Some((cap, fd)) = preparer_capture("err") {
-            cap_err = Some(cap);
-            cmd.stderr(fd);
-        }
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
     }
 
     // `status()` et non `output()` : on veut laisser le terminal à opencode.
-    let status = cmd.status().await?;
+    let status = match cmd.status().await {
+        Ok(s) => s,
+        Err(e) if capturer && e.kind() == std::io::ErrorKind::NotFound => {
+            // `script` absent : session utilisable, mais sans capture.
+            eprintln!(
+                "opencode-wrap: « script » introuvable, capture désactivée \
+                 (contexte et coût ne seront pas enregistrés)"
+            );
+            Command::new("opencode")
+                .args(&args)
+                .stdin(Stdio::inherit())
+                .status()
+                .await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let exit_code = status.code().unwrap_or(1);
 
-    // Restitution avant le scraping, pour que l'utilisateur n'attende pas le
-    // réseau de la conversion de devise.
-    let stdout_cap = cap_out
-        .as_ref()
-        .map(|c| c.restituer(Flux::Stdout))
-        .unwrap_or_default();
-    let stderr_cap = cap_err
-        .as_ref()
-        .map(|c| c.restituer(Flux::Stderr))
-        .unwrap_or_default();
+    // Lecture avant le traitement réseau, pour ne pas faire attendre
+    // l'utilisateur pour une conversion de devise.
+    let stdout_cap: Vec<u8> = match journal_capture {
+        Some(chemin) => {
+            let brut = std::fs::read(&chemin).unwrap_or_default();
+            let _ = std::fs::remove_file(&chemin);
+            // stdout et stderr sont confondus dans le journal du
+            // pseudo-terminal : le scraping lit les deux.
+            nettoyer_sortie(&brut).into_bytes()
+        }
+        None => Vec::new(),
+    };
+    let stderr_cap: Vec<u8> = Vec::new();
 
     if let Some(ref dir) = project_dir {
         if let Err(e) = update_session_data(dir, &stdout_cap, &stderr_cap).await {
@@ -144,8 +216,18 @@ async fn main() -> Result<()> {
 }
 
 async fn update_session_data(project_dir: &str, stdout: &[u8], stderr: &[u8]) -> Result<()> {
-    let context_pct = extract_context_pct(stdout, stderr);
-    let (currency, cost_original) = extract_cost_and_currency(stdout, stderr);
+    // Le journal du pseudo-terminal est pollué par les codes ANSI et les
+    // retour chariot : sans ce nettoyage, aucun motif ne peut s'appliquer.
+    let sortie = nettoyer_sortie(stdout).into_bytes();
+    let sortie_err = nettoyer_sortie(stderr).into_bytes();
+    let context_pct = extract_context_pct(&sortie, &sortie_err);
+    let (currency, cost_original) = extract_cost_and_currency(&sortie, &sortie_err);
+
+    // Rien d'utile trouvé : on conserve un extrait de la sortie pour pouvoir
+    // vérifier les motifs sur le rendu réel au lieu de les supposer justes.
+    if context_pct.is_none() && currency.is_none() {
+        journaliser_sous_motifs(&String::from_utf8_lossy(&sortie));
+    }
 
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -399,7 +481,6 @@ async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn extract_context_pct_basic() {
@@ -674,38 +755,59 @@ mod tests {
         assert_eq!((pct, devise.as_str(), taux, cout), (31, "GBP", None, None));
     }
 
-    /// P0-1 : la capture doit survivre à un fichier temporaire préexistant
-    /// portant le même nom, sans le tronquer ni le lire par erreur.
+    /// P0-1, adapté au pseudo-terminal : le journal de capture ne doit pas
+    /// être réutilisé d'une session à l'autre, sinon le scraping lirait la
+    /// sortie de la session précédente.
     #[test]
     fn la_capture_ne_reutilise_pas_un_fichier_ancien() {
-        let (a, _fa) = CaptureTemp::nouveau("test").unwrap();
-        let (b, fb) = CaptureTemp::nouveau("test").unwrap();
-        assert_ne!(
-            a.path, b.path,
-            "deux captures doivent avoir des fichiers distincts"
-        );
-        use std::io::Write;
-        let mut fb = fb;
-        fb.write_all(b"seconde").unwrap();
-        drop(fb);
-        assert_eq!(fs::read(&a.path).unwrap(), Vec::<u8>::new(), "la premiere capture doit rester vide");
-        assert_eq!(fs::read(&b.path).unwrap(), b"seconde");
-        fs::remove_file(&a.path).ok();
-        fs::remove_file(&b.path).ok();
+        let a = chemin_capture("test");
+        let b = chemin_capture("test");
+        assert_ne!(a, b, "deux captures doivent avoir des fichiers distincts");
     }
 
-    /// P0-1 : `restituer` rend les octets au scraping et supprime le fichier, de
-    /// sorte qu'aucune capture ne s'accumule dans le répertoire temporaire.
+    /// P0-2 : le journal du pseudo-terminal est pollué par les séquences ANSI
+    /// et les retour chariot. Sans nettoyage, « 42% » était illisible et le
+    /// contexte n'était jamais extrait.
     #[test]
-    fn restituer_rend_les_octets_puis_supprime_le_fichier() {
-        let (cap, mut fd) = CaptureTemp::nouveau("restitution").unwrap();
-        use std::io::Write;
-        fd.write_all(b"Context: 42%\nspent $12.34\n").unwrap();
-        drop(fd);
+    fn nettoyer_sortie_expose_le_contexte_d_un_tui() {
+        let brut = b"\x1b[2K\r  Context: 42% used\r\n\x1b[0m\x1b[38;5;33mfin\x1b[0m";
+        let sortie = nettoyer_sortie(brut);
+        assert!(!sortie.contains('\u{1b}'), "ANSI résiduel : {sortie:?}");
+        assert_eq!(extract_context_pct(sortie.as_bytes(), b""), Some(42));
+    }
 
-        let contenu = cap.restituer(Flux::Stdout);
-        assert_eq!(contenu, b"Context: 42%\nspent $12.34\n");
-        assert!(!cap.path.exists(), "le fichier temporaire doit etre supprime");
+    /// Deux redessins de la même ligne ne doivent pas se coller : sans le saut
+    /// de ligne au retour chariot, « 1 » puis « 2% » donneraient « 12% ».
+    #[test]
+    fn nettoyer_sortie_ne_colle_pas_les_redessins() {
+        let sortie = nettoyer_sortie(b"Context: 1\r2%");
+        assert_eq!(sortie, "Context: 1\n2%");
+    }
+
+    #[test]
+    fn shell_quote_echappe_les_quotes() {
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote("avec espace"), "'avec espace'");
+        assert_eq!(shell_quote("l'arc"), r"'l'\''arc'");
+    }
+
+    /// `script` ne reçoit qu'une chaîneInterpretation de sh -c : un argument
+    /// contenant une quote ou un séparateur de commande doit revenir intact,
+    /// sans jamais être exécuté. Test de comportement, pas de forme.
+    #[test]
+    fn shell_quote_ne_permet_pas_d_injection() {
+        let piege = "x'; touch /tmp/opencode-wrap-pwned; echo '";
+        let temoin = std::env::temp_dir().join("opencode-wrap-pwned");
+        let _ = std::fs::remove_file(&temoin);
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_quote(piege)))
+            .output()
+            .expect("sh disponible");
+
+        assert_eq!(String::from_utf8_lossy(&out.stdout), piege);
+        assert!(!temoin.exists(), "l'argument a été interprété par le shell");
     }
 
     #[test]

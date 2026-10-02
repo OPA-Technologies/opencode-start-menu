@@ -254,9 +254,16 @@ fn le_code_de_sortie_est_propage() {
         .unwrap();
 
     assert_eq!(sortie.status.code(), Some(7));
+
+    // opencode tourne dans un pseudo-terminal (sinon il n'écrit rien, cf. P0-2),
+    // et un PTY fusionne stdout et stderr en un seul flux : le message écrit
+    // par l'enfant sur sa stderr ressort donc sur notre stdout. Ce qui compte
+    // ici — et qui est vérifié — c'est qu'aucun diagnostic ne soit perdu.
+    let stdout = String::from_utf8_lossy(&sortie.stdout);
+    let stderr = String::from_utf8_lossy(&sortie.stderr);
     assert!(
-        String::from_utf8_lossy(&sortie.stderr).contains("echec"),
-        "stderr doit etre restitue"
+        stdout.contains("echec") || stderr.contains("echec"),
+        "le diagnostic de l'enfant doit etre restitue, stdout={stdout:?} stderr={stderr:?}"
     );
 }
 
