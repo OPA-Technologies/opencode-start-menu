@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::TimeZone;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -41,9 +41,6 @@ use crate::startup::{Progress, Step};
     disable_version_flag = true
 )]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
     #[arg(short = 'r', long = "root", help = "Launch as root via sudo -i")]
     root: bool,
 
@@ -68,17 +65,15 @@ struct Cli {
           help = "Trier par date de modification, le plus ancien d'abord (défaut, équivalent à -sM)")]
     sort_by_date: bool,
 
+    #[arg(long = "new", value_name = "NOM", num_args = 0..=1, default_missing_value = "",
+          help = "Ouvrir le formulaire de création (équivalent de « n » dans le menu)")]
+    new: Option<String>,
+
     #[arg(short = 'h', long = "help", help = "Show help")]
     help: bool,
 
     #[arg(help = "Project keyword (id, name, or path)")]
     keyword: Option<String>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Create a new project interactively
-    New,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, ValueEnum)]
@@ -804,11 +799,15 @@ fn binary_freshness_note(projet: &Path) -> Option<String>
 
 fn print_help() {
     println!("Usage : op [mot-clé|id|nom]");
+    println!("       op --new [nom]");
     println!();
     println!("  op            menu interactif (↑/↓ · Entrée · q) + création de projet");
     println!("  op <mot>      ouvre le projet unique correspondant, ou menu restreint");
     println!("                si plusieurs projets correspondent au mot-clé");
-    println!("  op --root <mot>");
+    println!("  op --new      ouvre directement le formulaire de création");
+    println!("                (équivalent de la touche « n » dans le menu)");
+    println!("  op --new <nom>  idem, avec le nom pré-rempli");
+    println!("  op -r, --root <mot>");
     println!("                ouvre le projet via « sudo -i » (root, environnement");
     println!("                de connexion root chargé)");
     println!("  op -l         liste les projets sans menu (variante Debug)");
@@ -1314,7 +1313,8 @@ fn main() -> Result<()> {
     };
 
     // La jauge ne concerne que le chemin interactif : -l, -V, -h et le
-    // lancement direct par mot-clé restent silencieux et rapides.
+    // lancement direct par mot-clé restent silencieux et rapides. `--new` est
+    // interactif par construction : il n'a de sens qu'avec le formulaire ouvert.
     let interactif = !cli.help && !cli.list && !cli.version && cli.keyword.is_none();
 
     let verbose = if cli.verbose
@@ -1451,13 +1451,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    match cli.command {
-        Some(Commands::New) => {
-            // Will be handled in TUI
-        }
-        None => {}
-    }
-
     let a_mot_cle = cli.keyword.is_some();
     if let Some(keyword) = cli.keyword.clone() {
         app.filter(&keyword, if cli.root { LaunchMode::Root } else { LaunchMode::Normal });
@@ -1500,11 +1493,27 @@ fn main() -> Result<()> {
         startup::trace_tail(journal, debut_wrapper.elapsed(), wrapper_ok);
       }
 
+    // `op --new [nom]` ouvre le formulaire de création, comme la touche `n`
+    // dans le menu. Le nom est pré-rempli quand il est fourni ; `default_missing_value`
+    // fait que `--new` seul arrive ici avec une chaîne vide.
+    let mode_initial = match cli.new.as_deref() {
+      Some(nom) => {
+        let mut state = ProjectCreationState::default();
+        state.name = nom.to_string();
+        // Le nom est le champ 1 : c'est lui que le curseur doit viser.
+        state.active_field = if nom.is_empty() { 0 } else { 1 };
+        state.rewrite_mode = true;
+        load_creation_field(&mut state);
+        InputMode::CreatingProject(state)
+      }
+      None => InputMode::Normal,
+    };
+
     // Session terminal unique : le menu réutilise le même terminal, et la
-    // restauration est garantie même si le menu remonte une erreur.
+    // restauration est garantie même quand le menu remonte une erreur.
     let debut_terminal = std::time::Instant::now();
     let mut terminal = open_terminal()?;
-    let resultat = run_tui(app, &mut terminal);
+    let resultat = run_tui(app, &mut terminal, mode_initial);
     close_terminal(&mut terminal);
     if let Some(journal) = verbose.as_ref()
       {
@@ -1563,12 +1572,12 @@ fn close_terminal(terminal: &mut Term)
     let _ = terminal.backend_mut().flush();
   }
 
-fn run_tui(app: App, terminal: &mut Term) -> Result<()> {
-    tui_loop(terminal, app)
+fn run_tui(app: App, terminal: &mut Term, mode_initial: InputMode) -> Result<()> {
+    tui_loop(terminal, app, mode_initial)
 }
 
-fn tui_loop(terminal: &mut Term, mut app: App) -> Result<()> {
-    let mut input_mode = InputMode::Normal;
+fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Result<()> {
+    let mut input_mode = mode_initial;
 
     loop {
         // États de création et d'édition, extraits de `input_mode` pour le rendu.
@@ -3537,7 +3546,11 @@ fn handle_edit_input(
 #[cfg(test)]
 mod tests
   {
-    use crate::{cout_affiche, normaliser_recherche, sanitize, startup, variant_label, Progress};
+    use crate::{
+        cout_affiche, normaliser_recherche, sanitize, startup, variant_label, Cli, Progress,
+        SortOrder,
+    };
+    use clap::Parser;
     use std::{fs, path::PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -3573,6 +3586,74 @@ mod tests
     #[test]
     fn sanitize_empty() {
         assert_eq!(sanitize(""), "");
+    }
+
+    // --- Surface de la ligne de commande ---------------------------------
+    // `op new` et `op --new new` se ressemblent mais n'ont rien à voir :
+    // le premier est un mot-clé de projet, le second une demande de
+    // création. C'est le genre de distinction que seul un test protège.
+
+    #[test]
+    fn op_new_est_un_mot_cle_et_non_une_creation() {
+        let cli = Cli::try_parse_from(["op", "new"]).unwrap();
+        assert_eq!(cli.keyword.as_deref(), Some("new"), "« new » est un mot-clé");
+        assert_eq!(cli.new, None, "ce n'est pas une demande de création");
+    }
+
+    #[test]
+    fn op_new_demande_un_formulaire_vide() {
+        let cli = Cli::try_parse_from(["op", "--new"]).unwrap();
+        assert_eq!(cli.new.as_deref(), Some(""), "valeur absente → chaîne vide");
+        assert_eq!(cli.keyword, None);
+    }
+
+    #[test]
+    fn op_new_vide_presuppose_le_nom_du_projet() {
+        let cli = Cli::try_parse_from(["op", "--new", "demo"]).unwrap();
+        assert_eq!(cli.new.as_deref(), Some("demo"));
+        assert_eq!(cli.keyword, None, "le nom est à la création, pas un mot-clé");
+    }
+
+    #[test]
+    fn op_new_accepte_egalement_la_forme_avec_egale() {
+        let cli = Cli::try_parse_from(["op", "--new=demo"]).unwrap();
+        assert_eq!(cli.new.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn le_lancement_par_defaut_ne_demande_rien() {
+        let cli = Cli::try_parse_from(["op"]).unwrap();
+        assert_eq!(cli.new, None);
+        assert_eq!(cli.keyword, None);
+    }
+
+    /// `--new` n'emporte que ce qui suit sur la même ligne : les options
+    /// placées avant restent des options, pas un nom de projet.
+    #[test]
+    fn les_options_precedent_le_nom_du_projet() {
+        let cli = Cli::try_parse_from(["op", "--root", "--new", "demo"]).unwrap();
+        assert!(cli.root);
+        assert_eq!(cli.new.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn le_sous_commande_new_a_disparu() {
+        // `op new` reste valide : c'est un mot-clé. Il ne doit plus exister de
+        // sous-commande, donc aucune forme ne doit se plaindre d'un sous-commande
+        // inconnu.
+        assert!(Cli::try_parse_from(["op", "new"]).is_ok());
+    }
+
+    /// Le tri retenu sur la ligne de commande prime sur la préférence, pour la
+    /// seule exécution en cours.
+    #[test]
+    fn le_tri_de_la_ligne_de_commande_est_prioritaire() {
+        let nom = Cli::try_parse_from(["op", "-sN"]).unwrap();
+        assert_eq!(nom.sort, SortOrder::Name);
+        let date = Cli::try_parse_from(["op", "-sM"]).unwrap();
+        assert_eq!(date.sort, SortOrder::Modified);
+        let defaut = Cli::try_parse_from(["op"]).unwrap();
+        assert_eq!(defaut.sort, SortOrder::Modified);
     }
 
     #[test]
