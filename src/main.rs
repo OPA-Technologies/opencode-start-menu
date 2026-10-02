@@ -636,14 +636,20 @@ impl App {
     }
 
     fn matching_indexes(&self, needle: &str) -> Vec<usize> {
-        let nlow = needle.to_lowercase();
+        // Les chemins et noms saisis par l'utilisateur ne sont pas forcément
+        // dans la même forme Unicode que ceux du registre : « Procédure-BA »
+        // peut arriver précomposé (NFC) alors qu'il est stocké décomposé
+        // (NFD), ou l'inverse. `to_lowercase` ne réconcilie pas les deux
+        // formes, donc la recherche échouait silencieusement. On compare en
+        // NFC des deux côtés.
+        let nlow = normaliser_recherche(needle);
         self.projects
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                p.id.to_lowercase().contains(&nlow)
-                    || p.name.to_lowercase().contains(&nlow)
-                    || p.path.to_string_lossy().to_lowercase().contains(&nlow)
+                normaliser_recherche(&p.id).contains(&nlow)
+                    || normaliser_recherche(&p.name).contains(&nlow)
+                    || normaliser_recherche(&p.path.to_string_lossy()).contains(&nlow)
             })
             .map(|(i, _)| i)
             .collect()
@@ -820,6 +826,17 @@ fn print_help() {
 
 pub(crate) fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Forme de comparaison pour la recherche de projets.
+///
+/// Normalise en NFC puis en minuscules, dans cet ordre : la NFC réconcilie
+/// les formes décomposées, la minuscule rend la recherche insensible à la
+/// casse. L'ordre importe : minoriser avant de recomposer peut laisser
+/// certaines combinaisons décomposées.
+fn normaliser_recherche(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect::<String>().to_lowercase()
 }
 
 #[cfg(unix)]
@@ -3521,7 +3538,7 @@ fn handle_edit_input(
 #[cfg(test)]
 mod tests
   {
-    use crate::{cout_affiche, sanitize, startup, variant_label, Progress};
+    use crate::{cout_affiche, normaliser_recherche, sanitize, startup, variant_label, Progress};
     use std::{fs, path::PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -3562,6 +3579,29 @@ mod tests
     #[test]
     fn variant_label_appends_status() {
         assert_eq!(variant_label("1.2.3", "Beta"), "1.2.3_Beta");
+    }
+
+    /// « é » précomposé (NFC, U+00E9) contre « e » + accent combinant (NFD,
+    /// U+0065 U+0301) : deux chaînes visuellement identiques, différentes pour
+    /// `contains`. Les chemins du registre et la saisie clavier ne partagent
+    /// pas forcément la même forme, d'où ce test.
+    #[test]
+    fn la_normalisation_reconcilie_les_deux_formes_unicode() {
+        let compose: String = "\u{e9}".to_string();
+        let decompose: String = "e\u{301}".to_string();
+        assert_ne!(compose, decompose, "le test suppose deux formes distinctes");
+        assert_eq!(normaliser_recherche(&compose), normaliser_recherche(&decompose));
+    }
+
+    #[test]
+    fn la_normalisation_ne_depend_pas_de_la_casse() {
+        assert_eq!(normaliser_recherche("Proc\u{e9}dure"), normaliser_recherche("proc\u{e9}dure"));
+        assert_eq!(normaliser_recherche("PROC\u{c9}DURE"), "proc\u{e9}dure");
+    }
+
+    #[test]
+    fn la_normalisation_laisse_intact_un_texte_simple() {
+        assert_eq!(normaliser_recherche("opencode-start-menu"), "opencode-start-menu");
     }
 
     #[test]

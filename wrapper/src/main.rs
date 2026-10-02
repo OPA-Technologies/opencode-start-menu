@@ -13,6 +13,13 @@ use std::sync::Mutex;
 use tokio::process::Command;
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
+/// Cache des taux de change, verrouillé.
+///
+/// Un mutex empoisonné ne rend pas ce cache inutilisable : les blocs
+/// verrouillés se contentent de lire ou d'insérer une entrée, aucun ne peut
+/// paniquer. Le verrou est donc récupéré par `into_inner()` plutôt que
+/// laissé en `unwrap()` : sinon un simple prix manquant ferait pancreatic le
+/// menu entier, y compris pour un chemin qui n'a rien à voir avec la devise.
 static EXCHANGE_RATE_CACHE: Lazy<Mutex<HashMap<String, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Chemin du fichier de capture, unique par PID et horodatage pour que deux
@@ -604,7 +611,7 @@ fn extract_cost_and_currency(stdout: &[u8], stderr: &[u8]) -> (Option<String>, O
 async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
     let cache_key = format!("{from}->{to}");
     {
-        let cache = EXCHANGE_RATE_CACHE.lock().unwrap();
+        let cache = EXCHANGE_RATE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&rate) = cache.get(&cache_key) {
             return Some(rate);
         }
@@ -616,7 +623,7 @@ async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
     let rate = json.get("rates")?.get(to)?.as_f64()?;
 
     if rate > 0.0 {
-        let mut cache = EXCHANGE_RATE_CACHE.lock().unwrap();
+        let mut cache = EXCHANGE_RATE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(cache_key, rate);
         Some(rate)
     } else {

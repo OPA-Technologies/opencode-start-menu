@@ -21,6 +21,13 @@ static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
 
 const LOCAL_CURRENCY: &str = "EUR";
 
+/// Cache des taux de change, verrouillé.
+///
+/// Un mutex empoisonné ne rend pas ce cache inutilisable : les blocs
+/// verrouillés se contentent de lire ou d'insérer une entrée, aucun ne peut
+/// paniquer. Le verrou est donc récupéré par `into_inner()` plutôt que
+/// laissé en `unwrap()` : sinon un simple prix manquant ferait pancreatic le
+/// menu entier, y compris pour un chemin qui n'a rien à voir avec la devise.
 static EXCHANGE_RATE_CACHE: LazyLock<std::sync::Mutex<HashMap<String, f64>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
@@ -30,7 +37,7 @@ async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
     }
     let cache_key = format!("{from}->{to}");
     {
-        let cache = EXCHANGE_RATE_CACHE.lock().unwrap();
+        let cache = EXCHANGE_RATE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&rate) = cache.get(&cache_key) {
             return Some(rate);
         }
@@ -50,7 +57,7 @@ async fn fetch_exchange_rate(from: &str, to: &str) -> Option<f64> {
     let rate = json.get("rates")?.get(to)?.as_f64()?;
 
     if rate > 0.0 {
-        let mut cache = EXCHANGE_RATE_CACHE.lock().unwrap();
+        let mut cache = EXCHANGE_RATE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(cache_key, rate);
         Some(rate)
     } else {
@@ -1672,7 +1679,16 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
 }
 
 fn write_private(path: &Path, content: &str) -> Result<()> {
-    fs::write(path, content)?;
+    // Le fichier est créé avec le bon mode dès l'ouverture. Un `fs::write`
+    // laissait la création à l'umask : le registre réapparuissait en 0644
+    // pendant le temps du `chmod` qui suit, lisible par le groupe et les
+    // autres. Fenêtre courte, mais inutile.
+    if path.exists() {
+        fs::write(path, content)?;
+    } else {
+        perms::create_private(path, content.as_bytes())?;
+        return Ok(());
+    }
     perms::private_file(path)?;
     Ok(())
 }
@@ -1980,6 +1996,22 @@ mod tests
         let projects = load_registry(&path).unwrap();
 
         assert!(projects.is_empty());
+        assert_0600(&path);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Le fichier ne doit jamais exister avec les droits de l'umask. La
+    /// création passe désormais par `create_private`, qui porte le mode 0600
+    /// dans l'appel `open` : avant, un `fs::write` laissait le registre
+    /// lisible par tous le temps du `chmod` qui suivait.
+    #[test]
+    fn le_registre_ne_se_cree_jamais_en_0644() {
+        let dir = temp_registry("mode_creation");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+
+        // Le contenu est bien celui écrit, pas seulement un fichier vide.
+        assert!(fs::read_to_string(&path).unwrap().contains("projects"));
         assert_0600(&path);
         fs::remove_dir_all(&dir).unwrap();
     }
