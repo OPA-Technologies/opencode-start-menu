@@ -106,6 +106,9 @@ pub(crate) struct App {
     /// Cache des séries de tarifs récupérées de la source web, partagé par
     /// tous les projets (évite un téléchargement par projet).
     pub(crate) web_cache: registry::WebCache,
+    /// Préférences globales (onglet Paramètres), en mémoire pour que chaque
+    /// bascule s'applique sans recharger le registre.
+    pub(crate) prefs: registry::Preferences,
     /// Registre présent mais illisible : aucune réindexation ni réécriture
     /// automatique tant qu'il n'est pas réparé.
     registry_broken: bool,
@@ -506,7 +509,7 @@ fn sync_menu_project_version(app: &mut App) -> Result<()>
             // Ne PAS toucher à version_manually_edited ici.
             let _ = set_manifest_version(&p.path, &p.version_debug);
             // Persister la mise à jour dans le registre.
-            registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+            registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
         }
       }
     Ok(())
@@ -556,10 +559,12 @@ impl App {
             pending_name: None,
             pending_bare: false,
             web_cache: registry::WebCache::default(),
+            prefs: registry::Preferences::default(),
             registry_broken: false,
         };
         progress.begin(Step::WebCache);
         app.web_cache = registry::load_web_cache(&app.registry_path);
+        app.prefs = registry::load_preferences(&app.registry_path);
         progress.begin(Step::Registry);
         match registry::load_registry(&app.registry_path) {
             Ok(projects) => app.projects = projects,
@@ -603,6 +608,7 @@ impl App {
             pending_name: None,
             pending_bare: false,
             web_cache: registry::WebCache::default(),
+            prefs: registry::Preferences::default(),
             registry_broken: false,
         };
         match registry::load_registry(&app.registry_path) {
@@ -615,18 +621,10 @@ impl App {
 
     fn filter(&mut self, needle: &str, mode: LaunchMode) {
         self.mode = mode;
-        let nlow = needle.to_lowercase();
-        self.filtered = self
-            .projects
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                p.id.to_lowercase().contains(&nlow)
-                    || p.name.to_lowercase().contains(&nlow)
-                    || p.path.to_string_lossy().to_lowercase().contains(&nlow)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        // Même recherche que le filtre interactif, déléguée à
+        // `matching_indexes` : les deux chemins ne peuvent plus diverger, et la
+        // normalisation Unicode s'applique donc aussi à la ligne de commande.
+        self.filtered = self.matching_indexes(needle);
 
         if self.filtered.len() == 1 {
             self.launch(self.filtered[0]);
@@ -2241,7 +2239,7 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
     if added > 0 || changed > 0 || written
       {
         progress.begin(Step::RescanSave);
-        registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+        registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
         let mut parts: Vec<String> = Vec::new();
         if !bumps.is_empty()
           {
@@ -2765,7 +2763,7 @@ debug_modified: "jamais compilée".to_string(),
                         total_valorisation: String::new(),
                         tarif_resume: String::new(),
                     });
-                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
                     finalize_project_list(app);
 
                     if matches!(
@@ -3161,6 +3159,7 @@ fn handle_tariff_input(
                       &app.registry_path,
                       &app.projects,
                       &app.web_cache,
+                      &app.prefs,
                     ) {
                       message = Some(format!("Registre non écrit : {e}"));
                     } else {
@@ -3485,7 +3484,7 @@ fn handle_edit_input(
                   }
                 else if apply_edit(app, state)
                   {
-                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
                     app.push_info(
                       "Projet mis à jour : variante Debug enregistrée".to_string(),
                     );
@@ -3512,7 +3511,7 @@ fn handle_edit_input(
               {
                 if state.active_field == EDIT_CONFIRM_FIELD && apply_edit(app, state)
                   {
-                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache)?;
+                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
                     app.push_info(
                       "Projet mis à jour : variante Debug enregistrée".to_string(),
                     );

@@ -298,10 +298,95 @@ pub(crate) fn tarif_valide(v: f64) -> bool {
     v.is_finite() && v >= 0.0
 }
 
+/// Libellés des lignes du panneau de détail, dans leur ordre d'affichage.
+///
+/// Source unique : le panneau de détail filtre sur ces libellés, et l'onglet
+/// Paramètres bascule les mêmes. Ajouter une ligne au tableau impose
+/// de l'ajouter ici, sinon l'option « colonnes visibles » ne la verra pas.
+pub(crate) const TOUTES_COLONNES: [&str; 9] = [
+  "Tokens",
+  "Contexte",
+  "Coût",
+  "Temps",
+  "Valorisation",
+  "Modèle",
+  "Agent",
+  "Date / Heure",
+  "Sessions",
+];
+
+fn colonnes_par_defaut() -> Vec<String> {
+  TOUTES_COLONNES.iter().map(|s| s.to_string()).collect()
+}
+
+fn defaut_oui() -> bool {
+  true
+}
+
+/// Ordre de tri mémorisé. Voluntaryment distinct de `SortOrder` (côté clap) :
+/// celui-ci dépend de la ligne de commande, celui-là du registre.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Tri {
+  /// Par dernière modification, le plus ancien d'abord.
+  #[default]
+  Date,
+  /// Alphabétique.
+  Nom,
+}
+
+/// Préférences globales, hors projet.
+///
+/// `#[serde(default)]` sur le champ du registre rend le bloc entièrement
+/// optionnel : un registre écrit avant son introduction se charge tel quel,
+/// sans migration, et reçoit les valeurs par défaut.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct Preferences {
+  /// Ordre de tri de la liste des projets.
+  #[serde(default)]
+  pub(crate) tri: Tri,
+  /// Libellés des lignes visibles dans le panneau de détail.
+  #[serde(default = "colonnes_par_defaut")]
+  pub(crate) colonnes: Vec<String>,
+  /// Lancer par défaut via `sudo -i`.
+  #[serde(default)]
+  pub(crate) launch_root: bool,
+  /// Laisser le wrapper extraire contexte et coûts. Désactiver désactive donc
+  /// l'écriture de `context_pct`, `currency`, `exchange_rate` et `cost_local`.
+  ///
+  /// Vrai par défaut : c'est l'état d'origine du programme, et désactiver la
+  /// capture fait perdre des données.
+  #[serde(default = "defaut_oui")]
+  pub(crate) capture: bool,
+}
+
+impl Default for Preferences {
+  fn default() -> Self
+    {
+      Self { tri: Tri::default(), colonnes: colonnes_par_defaut(), launch_root: false, capture: true }
+    }
+}
+
+impl Preferences {
+  /// Le libellé est-il visible ?
+  ///
+  /// Une liste vide est interprétée comme « aucune colonne », pas comme « tout » :
+  /// c'est le seul cas où l'utilisateur a réellement tout masqué. Une liste
+  /// contenant un libellé inconnu (ligne ajoutée par une version ultérieure)
+  /// est simplement ignorée.
+  pub(crate) fn colonne_visible(&self, libelle: &str) -> bool
+    {
+      self.colonnes.iter().any(|c| c == libelle)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct Registry {
     #[serde(default)]
     projects: HashMap<String, Project>,
+    // --- Préférences globales (onglet Paramètres) ----------------------
+    #[serde(default)]
+    preferences: Preferences,
     // --- Cache global web des tarifs OIT/ILOSTAT ------------------------
     // Par pays (ISO3) → série datée récupérée. Évitée des re-téléchargements.
     #[serde(default)]
@@ -318,6 +403,12 @@ struct Registry {
     // Horodatage (ms) du dernier échec de récupération (0 = aucun échec en cours).
     #[serde(default)]
     web_last_failure_ms: i64,
+    // Tout champ que cette version ne connaît pas est conservé tel quel, puis
+    // réécrit. Sans cela, réécrire le registre pour changer une préférence
+    // effacerait silencieusement les données ajoutées par une version plus
+    // récente — le registre est un fichier partagé entre plusieurs versions.
+    #[serde(flatten)]
+    champs_inconnus: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -1497,22 +1588,83 @@ fn capitalize(s: &str) -> String {
 
 pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
     let web = load_web_cache(path);
-    save_registry_full(path, projects, &web)
+    let prefs = load_preferences(path);
+    save_registry_full(path, projects, &web, &prefs)
 }
 
-/// Variante conservant le cache web global lors de l'écriture du registre.
+/// Charge les préférences, ou les valeurs par défaut si le registre est absent,
+/// illisible ou sans bloc `preferences`.
+///
+/// Un registre illisible ne doit pas faire échouer le chargement des
+/// préférences : le menu doit démarrer et laisser l'utilisateur réparer, pas
+/// refuser de s'ouvrir.
+pub(crate) fn load_preferences(path: &Path) -> Preferences {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Registry>(&s).ok())
+        .map(|r| r.preferences)
+        .unwrap_or_default()
+}
+
+/// Écrit le seul bloc `preferences`, en préservant tout le reste du registre.
+///
+/// Passe par un registre complet lu puis réécrit plutôt que par une
+/// réécriture depuis `ProjectEntry` : ce dernier est une vue d'usage, et
+ /// repasser par lui perdrait les champs que le registre seul connaît.
+pub(crate) fn save_preferences(path: &Path, prefs: &Preferences) -> Result<()> {
+    ensure_regular(path)?;
+    let existant = fs::read_to_string(path).unwrap_or_default();
+    let mut registry: Registry = serde_json::from_str(&existant).unwrap_or_default();
+    if registry.preferences == *prefs {
+        return Ok(());
+    }
+    registry.preferences = prefs.clone();
+    ecrire_registry_atomique(path, &registry)
+}
+
+/// Écrit le registre par fichier temporaire puis renommage.
+///
+/// Le nom du temporaire porte l'identifiant du processus : deux instances du
+/// menu ne se marchent pas dessus, contrairement à un `tmp` fixe.
+fn ecrire_registry_atomique(path: &Path, registry: &Registry) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    write_private(&tmp, &serde_json::to_string_pretty(registry)?)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Variante conservant le cache web global et les préférences lors de
+/// l'écriture du registre.
 pub(crate) fn save_registry_full(
     path: &Path,
     projects: &[ProjectEntry],
     web: &WebCache,
+    prefs: &Preferences,
 ) -> Result<()> {
     ensure_regular(path)?;
     // Un registre illisible est mis de côté avant d'être remplacé.
-    if let Ok(existant) = fs::read_to_string(path)
-        && serde_json::from_str::<Registry>(&existant).is_err()
-    {
-        let _ = fs::copy(path, path.with_extension("json.corrompu"));
-    }
+    let existant_lisible = match fs::read_to_string(path)
+      {
+        Ok(existant) =>
+          {
+            match serde_json::from_str::<Registry>(&existant)
+              {
+                Ok(r) => Some(r),
+                Err(_) =>
+                  {
+                    let _ = fs::copy(path, path.with_extension("json.corrompu"));
+                    None
+                  }
+              }
+          }
+        Err(_) => None,
+      };
+    let inconnu = existant_lisible
+        .map(|r| r.champs_inconnus)
+        .unwrap_or_default();
     let mut map = HashMap::new();
     for p in projects {
         map.insert(
@@ -1569,20 +1721,17 @@ pub(crate) fn save_registry_full(
     }
     let registry = Registry {
         projects: map,
+        preferences: prefs.clone(),
         web_rates_cache: web.rates.clone(),
         web_last_fetch_ms: web.last_fetch_ms,
         web_country: web.country.clone(),
         web_secteur: web.secteur.clone(),
         web_last_failure_ms: web.last_failure_ms,
+        // Conservés : `save_registry_full` reconstruit le registre depuis une
+        // vue `ProjectEntry`, cette reconstruction ne doit pas valoir effacement.
+        champs_inconnus: inconnu,
     };
-    // Nom temporaire propre au processus : deux instances ne se marchent pas dessus.
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    write_private(&tmp, &serde_json::to_string_pretty(&registry)?)?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
+    ecrire_registry_atomique(path, &registry)
 }
 
 pub(crate) fn is_excluded(path: &Path) -> bool {
@@ -1921,8 +2070,9 @@ mod tests
     use crate::registry::tarif_valide;
 
     use super::{
-        default_tarif_mode, default_web_country, load_registry, save_registry, save_registry_full,
-        TarifPoint, validate_status, validate_version, ProjectEntry, STATUSES, WebCache,
+        default_tarif_mode, default_web_country, load_preferences, load_registry, save_preferences,
+        save_registry, save_registry_full, Preferences, TarifPoint, Tri, validate_status,
+        validate_version, ProjectEntry, STATUSES, WebCache,
     };
 
     fn temp_registry(name: &str) -> PathBuf {
@@ -2014,6 +2164,124 @@ mod tests
         assert!(fs::read_to_string(&path).unwrap().contains("projects"));
         assert_0600(&path);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Le cas de compatibilité : un registre écrit avant l'introduction du bloc
+    /// `preferences`. Il doit se charger tel quel et recevoir les valeurs par
+    /// défaut — surtout `capture: true`, sinon le simple fait d'ouvrir un menu
+    /// ancient désactiverait la capture pour tout le monde.
+    #[test]
+    fn un_registre_anterieur_aux_preferences_se_charge_avec_les_defauts() {
+        let dir = temp_registry("backcompat");
+        let path = dir.join("opencode/projects.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                 "projects": {},
+                 "web_rates_cache": {},
+                 "web_last_fetch_ms": 0,
+                 "web_country": "FRA",
+                 "web_secteur": {},
+                 "web_last_failure_ms": 0
+               }"#,
+        )
+        .unwrap();
+
+        let prefs = load_preferences(&path);
+        assert_eq!(prefs, Preferences::default());
+        assert!(prefs.capture, "la capture doit rester active par défaut");
+        assert_eq!(prefs.tri, Tri::Date);
+        assert_eq!(prefs.colonnes.len(), super::TOUTES_COLONNES.len());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Le registre réel de l'utilisateur est écrit à la main et peut contenir
+    /// des champs qu'aucun code ne connaît. Ils doivent survivre à une écriture
+    /// de préférences : sinon upgrader le menu perdrait des données.
+    #[test]
+    fn ecrire_les_preferences_preserve_le_reste_du_registre() {
+        let dir = temp_registry("preserve");
+        let path = dir.join("opencode/projects.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                 "projects": {
+                   "demo": {
+                     "name": "Démo",
+                     "path": "/tmp/demo",
+                     "description": "d",
+                     "status": "Actif",
+                     "version": "1.0.0",
+                     "tarif_manual": 42.5,
+                     "tarif_mode": "manuel"
+                   }
+                 },
+                 "web_country": "FRA",
+                 "champ_inconnu": "a conserver"
+               }"#,
+        )
+        .unwrap();
+
+        let mut prefs = load_preferences(&path);
+        prefs.tri = Tri::Nom;
+        prefs.launch_root = true;
+        save_preferences(&path, &prefs).unwrap();
+
+        let relu = load_preferences(&path);
+        assert_eq!(relu.tri, Tri::Nom);
+        assert!(relu.launch_root);
+
+        let texte = fs::read_to_string(&path).unwrap();
+        let valeur: serde_json::Value = serde_json::from_str(&texte).unwrap();
+        assert_eq!(valeur["web_country"], "FRA", "le cache web doit survivre");
+        assert_eq!(
+            valeur["projects"]["demo"]["tarif_manual"], 42.5,
+            "les projets et leurs tarifs doivent survivre"
+        );
+        assert_eq!(
+            valeur["champ_inconnu"], "a conserver",
+            "un champ inconnu ne doit pas être écrasé"
+        );
+        assert_0600(&path);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Une écriture identique ne doit pas toucher le fichier : inutile de
+    /// réécrire, et surtout inutile de faire tourner le renommage atomique pour
+    /// rien.
+    #[test]
+    fn preferences_identiques_ne_reecrivent_pas() {
+        let dir = temp_registry("noop");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+        let prefs = load_preferences(&path);
+        save_preferences(&path, &prefs).unwrap();
+
+        // Aucun temporaire ne doit subsister.
+        let restes: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(restes.is_empty(), "temporaires résiduels : {restes:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn la_visibilite_des_colonnes_suit_la_liste() {
+        let mut prefs = Preferences::default();
+        assert!(prefs.colonne_visible("Tokens"));
+        assert!(prefs.colonne_visible("Sessions"));
+
+        prefs.colonnes.retain(|c| c != "Tokens");
+        assert!(!prefs.colonne_visible("Tokens"));
+        assert!(prefs.colonne_visible("Coût"));
+
+        // Libellé inconnu : ignoré, sans faire paniquer.
+        assert!(!prefs.colonne_visible("Colonne fantôme"));
     }
 
     #[test]
@@ -2196,7 +2464,7 @@ last_compile_debug_secs: 0,
         .unwrap();
         let mut e = load_registry(&path).unwrap().remove(0);
         e.tarif_manual = f64::INFINITY;
-        save_registry_full(&path, &[e], &WebCache::default()).unwrap();
+        save_registry_full(&path, &[e], &WebCache::default(), &Preferences::default()).unwrap();
 
         // Le fichier produit ne doit contenir aucun `null` de tarif, et surtout
         // rester relisible.
@@ -2608,7 +2876,8 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
         e.last_valorisation = "15,00 €".to_string();
         e.total_valorisation = "150,00 €".to_string();
         e.tarif_resume = "web · 21,58 €/h · 2024".to_string();
-        super::save_registry_full(&path, &[e.clone()], &super::WebCache::default()).unwrap();
+        super::save_registry_full(&path, &[e.clone()], &super::WebCache::default(), &super::Preferences::default())
+            .unwrap();
 
         let relu = super::load_registry(&path).unwrap();
         assert_eq!(relu.len(), 1);
