@@ -81,6 +81,18 @@ fn chemin_bin(repertoire: &Path) -> String {
     format!("{}:{existant}", faux_bin(repertoire).parent().unwrap().display())
 }
 
+/// Horodatage en millisecondes, unité de `session.time_created`.
+///
+/// La session du bac à sable est créée **avant** le lancement du wrapper,
+/// comme le fait opencode au début de sa propre execution : la valeur doit
+/// donc être « maintenant », pas un horodatage fixe d'époque.
+fn maintenant_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Le test central : ce que l'utilisateur tape doit atteindre opencode.
 #[test]
 fn la_saisie_utilisateur_arrive_a_opencode() {
@@ -208,8 +220,12 @@ echo "session terminee"
             "CREATE TABLE session (
                  id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
                  context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
-                 exchange_rate REAL, cost_local REAL);
-             INSERT INTO session VALUES ('s','/mon/projet',100,42,'EUR',1.0,7.5);",
+                 exchange_rate REAL, cost_local REAL);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO session VALUES ('s','/mon/projet',?1,42,'EUR',1.0,7.5)",
+            [maintenant_ms()],
         )
         .unwrap();
     }
@@ -330,8 +346,12 @@ printf '\033[0m\033[38;5;33mau revoir\033[0m\n'
         c.execute_batch(
             "CREATE TABLE session (
                  id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
-                 context_pct INTEGER DEFAULT 0);
-             INSERT INTO session VALUES ('s','/mon/projet',100,0);",
+                 context_pct INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO session VALUES ('s','/mon/projet',?1,0)",
+            [maintenant_ms()],
         )
         .unwrap();
     }

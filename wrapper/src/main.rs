@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
 use rusqlite::Connection;
+use rusqlite::params;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -113,10 +114,129 @@ fn journaliser_sous_motifs(sortie: &str) {
     }
 }
 
+/// Horodatage en millisecondes, unité de `session.time_created`.
+///
+/// Capturé **avant** le lancement d'opencode : c'est la frontière qui
+/// separates les données produites par ce run de celles des runs précédents.
+fn maintenant_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Trace le cas « aucune session identifiable », dans un fichier distinct de
+/// celui du scraping pour que les deux diagnostics ne s'écrasent pas.
+///
+/// Écrire dans une session qui n'est pas la nôtre serait pire que ne rien
+/// écrire : on préfère un silence explicable à une donnée fausse.
+fn journaliser_session_introuvable(project_dir: &str, debut_ms: i64) {
+    let path = std::env::temp_dir().join("opencode-wrap-derniere-session.log");
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = f.write_all(
+            format!(
+                "répertoire : {project_dir}\ndébut du run : {debut_ms}\n\
+                 aucune session identifiable : rien n'a été écrit\n"
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// Marge de tolérance, en millisecondes, appliquée à l'horodatage de début.
+///
+/// `debut_ms` est pris juste avant le `spawn`. Dans le cas normal la session
+/// est créée *après*, donc la comparaison stricte suffit. La marge couvre le
+/// désordre de quelques millisecondes entre l'écriture de l'horodatage et la
+/// première écriture d'opencode — et le cas d'une ligne déjà présente au
+/// moment du lancement. Une seconde est assez large pour cela, et assez
+/// étroite pour ne jamais englober une session lancée dans le même répertoire
+/// par un autre lancement antérieur.
+const MARGE_MS: i64 = 1_000;
+
+/// Identifie la session que ce run d'opencode vient d'utiliser.
+///
+/// Régression P1-3 : la cible était « la session la plus récente du
+/// répertoire », ce qui n'est pas la même chose que « ma session ». Une
+/// session reprise est souvent bien plus ancienne qu'une session créée
+/// ensuite par un essai antérieur dans le même dossier : le wrapper y
+/// écrivait le pourcentage de contexte de quelqu'un d'autre, silencieusement.
+///
+/// Résolution en quatre étapes, de la plus fiable à la plus prudente :
+///
+/// 1. la session ayant produit au moins un message pendant le run — c'est la
+///    preuve directe que c'est elle qui a travaillé ;
+/// 2. la session créée pendant le run (opencode n'a pas repris d'historique) ;
+/// 3. la session touchée pendant le run (`time_updated`) : cas de la reprise ;
+/// 4. aucune candidate → on ne modifie rien et on le trace.
+///
+/// Le critère 1 est le seul qui désambiguïse deux sessions actives du même
+/// répertoire. Les suivants sont des replis : ils peuvent viser la session
+/// d'un lancement concurrent, ce qui reste mieux que l'ancienne règle, et
+/// le verrou par répertoire du menu (`src/lock.rs`) interdit ce cas pour les
+/// lancements passés par le menu.
+fn identifier_session(
+    conn: &Connection,
+    project_dir: &str,
+    debut_ms: i64,
+) -> rusqlite::Result<Option<String>> {
+    let debut = debut_ms.saturating_sub(MARGE_MS);
+
+    // Étape 1 : messages produits pendant le run.
+    // `message` n'a pas d'index sur `time_created` seul (seulement
+    // (session_id, time_created, id)) : c'est un balayage de la table, de
+    // l'ordre de quelques dizaines de milliers de lignes, soit quelques
+    // millisecondes. On ne crée pas d'index : la base appartient à opencode.
+    // Une table `message` absente (autre schéma) fait simplement échouer la
+    // requête, et l'on retombe sur les étapes suivantes.
+    let par_messages: Option<String> = conn
+        .query_row(
+            "SELECT s.id FROM message m \
+             JOIN session s ON s.id = m.session_id \
+             WHERE m.time_created >= ?1 AND s.directory = ?2 \
+             GROUP BY s.id ORDER BY max(m.time_created) DESC LIMIT 1",
+            params![debut, project_dir],
+            |r| r.get(0),
+        )
+        .ok();
+    if par_messages.is_some() {
+        return Ok(par_messages);
+    }
+
+    // Étape 2 : session créée pendant le run.
+    let par_creation: Option<String> = conn
+        .query_row(
+            "SELECT id FROM session WHERE directory = ?1 AND time_created >= ?2 \
+             ORDER BY time_created DESC LIMIT 1",
+            params![project_dir, debut],
+            |r| r.get(0),
+        )
+        .ok();
+    if par_creation.is_some() {
+        return Ok(par_creation);
+    }
+
+    // Étape 3 : session reprise, donc existante avant le run mais touchée
+    // pendant. `time_updated` est le bon discriminant ici.
+    let par_maj: Option<String> = conn
+        .query_row(
+            "SELECT id FROM session WHERE directory = ?1 AND time_updated >= ?2 \
+             ORDER BY time_updated DESC LIMIT 1",
+            params![project_dir, debut],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(par_maj)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let project_dir = std::env::var("OPENCODE_PROJECT_DIR").ok();
+
+    // Horodatage de référence du run, pris avant tout lancement : c'est lui
+    // qui détermine ensuite quelle session est « la nôtre ».
+    let debut_ms = maintenant_ms();
 
     // OPENCODE_WRAP_CAPTURE=0 : opencode écrit directement dans notre terminal.
     // Le rendu est alors en direct, mais plus rien n'est scrapé, donc ni
@@ -207,7 +327,7 @@ async fn main() -> Result<()> {
     let stderr_cap: Vec<u8> = Vec::new();
 
     if let Some(ref dir) = project_dir {
-        if let Err(e) = update_session_data(dir, &stdout_cap, &stderr_cap).await {
+        if let Err(e) = update_session_data(dir, debut_ms, &stdout_cap, &stderr_cap).await {
             eprintln!("opencode-wrap: erreur mise à jour session: {e}");
         }
     }
@@ -215,7 +335,12 @@ async fn main() -> Result<()> {
     std::process::exit(exit_code);
 }
 
-async fn update_session_data(project_dir: &str, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+async fn update_session_data(
+    project_dir: &str,
+    debut_ms: i64,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<()> {
     // Le journal du pseudo-terminal est pollué par les codes ANSI et les
     // retour chariot : sans ce nettoyage, aucun motif ne peut s'appliquer.
     let sortie = nettoyer_sortie(stdout).into_bytes();
@@ -252,6 +377,7 @@ async fn update_session_data(project_dir: &str, stdout: &[u8], stderr: &[u8]) ->
     persist_session(
         &conn,
         project_dir,
+        debut_ms,
         context_pct,
         currency.as_deref(),
         exchange_rate,
@@ -262,7 +388,7 @@ async fn update_session_data(project_dir: &str, stdout: &[u8], stderr: &[u8]) ->
 }
 
 /// Applique les migrations de colonnes puis reporte contexte, devise et
-/// coûts sur la session la plus récente du répertoire.
+/// coûts sur la session qu'opencode vient d'utiliser dans ce répertoire.
 ///
 /// Les champs à écrire sont des `Option` : voir `maj_session` pour pourquoi un
 /// champ non extrait ne doit pas écraser la valeur précédente.
@@ -275,6 +401,7 @@ async fn update_session_data(project_dir: &str, stdout: &[u8], stderr: &[u8]) ->
 fn persist_session(
     conn: &Connection,
     project_dir: &str,
+    debut_ms: i64,
     context_pct: Option<u8>,
     currency: Option<&str>,
     exchange_rate: Option<f64>,
@@ -294,17 +421,38 @@ fn persist_session(
         [],
     );
 
-    // Cible : la session la plus récente du répertoire. La sélection passe par
-    // une sous-requête sur `id` car `ORDER BY … LIMIT` n'existe pas dans un
-    // UPDATE pour le SQLite embarqué de rusqlite (« near "ORDER": syntax
-    // error ») : la requête échouait et aucune donnée n'était jamais écrite.
-    maj_session(conn, project_dir, context_pct, currency, exchange_rate, cost_local)
+    // Rien n'a été extrait : inutile de résoudre la session, et surtout
+    // inutile de risquer une écriture.
+    if context_pct.is_none() && currency.is_none() && exchange_rate.is_none() && cost_local.is_none()
+    {
+        return Ok(0);
+    }
+
+    // Cible : la session réellement utilisée par ce run, et pas « la plus
+    // récente du dossier ». Voir `identifier_session` pour les quatre étapes
+    // et pour le cas où aucune session n'est identifiable — on n'écrit alors
+    // rien, plutôt que d'écrire dans celle d'un autre.
+    let session_id = match identifier_session(conn, project_dir, debut_ms)? {
+        Some(id) => id,
+        None => {
+            journaliser_session_introuvable(project_dir, debut_ms);
+            return Ok(0);
+        }
+    };
+
+    maj_session(
+        conn,
+        &session_id,
+        context_pct,
+        currency,
+        exchange_rate,
+        cost_local,
+    )
 }
 
-/// Reporte contexte, devise et coûts sur la session la plus récente du
-/// répertoire donné. Retourne le nombre de lignes mises à jour (0 si aucune
-/// session ne correspond, ou si rien n'a été extrait), pour que l'appelant
-/// puisse distinguer « rien à faire » d'une écriture effective.
+/// Reporte contexte, devise et coûts sur la session identifiée. Retourne le
+/// nombre de lignes mises à jour (0 si rien n'a été extrait), pour que
+/// l'appelant puisse distinguer « rien à faire » d'une écriture effective.
 ///
 /// Régression P1-2 : la requête écrivait les quatre colonnes inconditionnellement.
 /// Quand l'extraction échouait — opencode interrompu, sortie sans ligne de
@@ -317,7 +465,7 @@ fn persist_session(
 /// constants, jamais d'une entrée utilisateur, donc l'interpolation est sûre.
 fn maj_session(
     conn: &Connection,
-    project_dir: &str,
+    session_id: &str,
     context_pct: Option<u8>,
     currency: Option<&str>,
     exchange_rate: Option<f64>,
@@ -357,15 +505,10 @@ fn maj_session(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Cible : la session la plus récente du répertoire. La sélection passe par
-    // une sous-requête sur `id` car `ORDER BY … LIMIT` n'existe pas dans un
-    // UPDATE pour le SQLite embarqué de rusqlite (« near "ORDER": syntax
-    // error ») : la requête échouait et aucune donnée n'était jamais écrite.
-    let sql = format!(
-        "UPDATE session SET {set} \
-         WHERE id = (SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1)"
-    );
-    valeurs.push(Value::Text(project_dir.to_string()));
+    // Cible : l'identifiant de session déjà résolu par `identifier_session`.
+    // Le `WHERE id = ?` est donc un cas simple, sans sous-requête.
+    let sql = format!("UPDATE session SET {set} WHERE id = ?");
+    valeurs.push(Value::Text(session_id.to_string()));
     conn.execute(&sql, rusqlite::params_from_iter(valeurs.iter()))
 }
 
@@ -388,9 +531,12 @@ fn extract_context_pct(stdout: &[u8], stderr: &[u8]) -> Option<u8> {
         r"(\d{1,3})\s*%\s*used",
     ];
 
+    // Le TUI se redessine : « Context: 10 % » apparaît tôt, « Context: 80 % »
+    // à la fin. Prendre la première occurrence stockait donc un pourcentage
+    // périmé. On retient la dernière, celle qui reflète l'état à la sortie.
     for pattern in &patterns {
         if let Ok(re) = Regex::new(pattern) {
-            if let Some(caps) = re.captures(&combined) {
+            if let Some(caps) = re.captures_iter(&combined).last() {
                 if let Some(m) = caps.get(1) {
                     if let Ok(pct) = m.as_str().parse::<u8>() {
                         return Some(pct.min(100));
@@ -535,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn maj_session_ecrit_reellement_sur_la_session_la_plus_recente() {
+    fn maj_session_ecrit_reellement_sur_la_session_ciblee() {
         // Régression : la requête utilisait `ORDER BY … LIMIT` directement
         // dans un UPDATE, ce que le SQLite embarqué de rusqlite refuse
         // ("near \"ORDER\": syntax error"). L'écriture échouait donc en
@@ -558,7 +704,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = maj_session(&c, "/p", Some(42), Some("EUR"), Some(0.92), Some(9.2)).unwrap();
+        let n = maj_session(&c, "recente", Some(42), Some("EUR"), Some(0.92), Some(9.2)).unwrap();
         assert_eq!(n, 1, "une seule session doit etre mise a jour");
 
         let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
@@ -570,11 +716,28 @@ mod tests {
             .unwrap()
         };
 
-        // La plus récente du répertoire, et elle seule.
+        // La session visée, et elle seule.
         assert_eq!(lire("recente"), (42, "EUR".to_string(), Some(0.92), Some(9.2)));
         assert_eq!(lire("vieille").1, "USD".to_string());
-        assert_eq!(lire("autre").1, "USD".to_string(), "un autre répertoire ne doit pas etre touche");
+        assert_eq!(lire("autre").1, "USD".to_string(), "une autre session ne doit pas etre touchee");
     }
+
+    #[test]
+    fn maj_session_ciblee_absente_ne_echoue_pas() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);",
+        )
+        .unwrap();
+        assert_eq!(
+            maj_session(&c, "inexistant", Some(7), Some("USD"), None, None).unwrap(),
+            0
+        );
+    }
+
 
     #[test]
     fn persist_session_ecrit_meme_si_les_colonnes_existent_deja() {
@@ -599,7 +762,9 @@ mod tests {
         )
         .unwrap();
 
-        let n = persist_session(&c, "/p", Some(55), Some("GBP"), Some(1.15), Some(11.5)).unwrap();
+        // « b » a été créée pendant le run (200 >= 150), « a » avant lui.
+        let n = persist_session(&c, "/p", 150, Some(55), Some("GBP"), Some(1.15), Some(11.5))
+            .unwrap();
         assert_eq!(n, 1, "une seule session doit etre mise a jour");
 
         let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
@@ -611,7 +776,7 @@ mod tests {
             .unwrap()
         };
         assert_eq!(lire("b"), (55, "GBP".to_string(), Some(1.15), Some(11.5)));
-        assert_eq!(lire("a").0, 0, "seule la session la plus recente est touchee");
+        assert_eq!(lire("a").0, 0, "seule la session creee pendant le run est touchee");
     }
 
     #[test]
@@ -629,7 +794,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = persist_session(&c, "/p", Some(60), Some("EUR"), Some(1.0), Some(20.0)).unwrap();
+        let n = persist_session(&c, "/p", 50, Some(60), Some("EUR"), Some(1.0), Some(20.0)).unwrap();
         assert_eq!(n, 1);
         let v: (i64, String, Option<f64>, Option<f64>) = c
             .query_row(
@@ -639,22 +804,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, (60, "EUR".to_string(), Some(1.0), Some(20.0)));
-    }
-
-    #[test]
-    fn maj_session_sans_session_correspondante_ne_echoue_pas() {
-        let c = rusqlite::Connection::open_in_memory().unwrap();
-        c.execute_batch(
-            "CREATE TABLE session (
-                 id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER,
-                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
-                 exchange_rate REAL, cost_local REAL);",
-        )
-        .unwrap();
-        assert_eq!(
-            maj_session(&c, "/inconnu", Some(7), Some("USD"), None, None).unwrap(),
-            0
-        );
     }
 
     /// Régression P1-2 : c'est le test qui compte pour ce bug.
@@ -677,7 +826,7 @@ mod tests {
         .unwrap();
 
         // Contexte seul : ni devise, ni taux, ni coût extraits.
-        let n = maj_session(&c, "/p", Some(88), None, None, None).unwrap();
+        let n = maj_session(&c, "s", Some(88), None, None, None).unwrap();
         assert_eq!(n, 1);
 
         let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
@@ -710,7 +859,7 @@ mod tests {
         )
         .unwrap();
 
-        let n = maj_session(&c, "/p", None, None, None, None).unwrap();
+        let n = maj_session(&c, "s", None, None, None, None).unwrap();
         assert_eq!(n, 0, "rien a ecrire : aucune ligne ne doit etre touchee");
 
         let lire = |id: &str| -> (i64, String, Option<f64>, Option<f64>) {
@@ -743,7 +892,7 @@ mod tests {
         .unwrap();
 
         // Devise trouvée, coût trouvé, mais taux indisponible (réseau coupé).
-        let n = maj_session(&c, "/p", None, Some("GBP"), None, None).unwrap();
+        let n = maj_session(&c, "s", None, Some("GBP"), None, None).unwrap();
         assert_eq!(n, 1);
         let (pct, devise, taux, cout): (i64, String, Option<f64>, Option<f64>) = c
             .query_row(
@@ -753,6 +902,151 @@ mod tests {
             )
             .unwrap();
         assert_eq!((pct, devise.as_str(), taux, cout), (31, "GBP", None, None));
+    }
+
+    /// Régression P1-3 : le cas réel, tiré de la base de l'utilisateur.
+    ///
+    /// La session réellement ouverte est `active`, créée il y a trois jours et
+    /// reprise aujourd'hui. Une session `essai` du même répertoire a été créée
+    /// *après* elle, par un test antérieur. L'ancienne règle — « la session la
+    /// plus récente du répertoire » — visait `essai` et y écrivait le
+    /// pourcentage de contexte de `active`, en silence.
+    ///
+    /// Le seul critère qui distingue les deux est l'activité pendant le run :
+    /// `active` a produit des messages, `essai` n'en a produit aucun.
+    #[test]
+    fn la_session_reprise_est_visitee_meme_si_elle_est_plus_ancienne() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT,
+                 time_created INTEGER, time_updated INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER);
+             INSERT INTO session VALUES
+                 ('active','/p',1000,5000,0,'USD',NULL,NULL),
+                 ('essai','/p',2000,2000,0,'USD',NULL,NULL);
+             INSERT INTO message VALUES ('m1','active',4500);",
+        )
+        .unwrap();
+
+        // Run démarré à 4000 : « active » travaille, « essai » est_muette.
+        let identifiee = identifier_session(&c, "/p", 4000).unwrap();
+        assert_eq!(
+            identifiee.as_deref(),
+            Some("active"),
+            "la session qui a produit des messages pendant le run est la nôtre"
+        );
+
+        let n = persist_session(&c, "/p", 4000, Some(73), None, None, None).unwrap();
+        assert_eq!(n, 1);
+
+        let lire = |id: &str| -> i64 {
+            c.query_row("SELECT context_pct FROM session WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(lire("active"), 73, "notre session reçoit le contexte");
+        assert_eq!(lire("essai"), 0, "la session d'un essai antérieur reste intacte");
+    }
+
+    /// Reprise sans aucun message produit (opencode refermé aussitôt) : la
+    /// session a été créée avant le run mais touchée pendant. `time_updated`
+    /// est alors le seul discriminant.
+    #[test]
+    fn une_reprise_sans_message_est_identifiee_par_son_horodatage_de_maj() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT,
+                 time_created INTEGER, time_updated INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER);
+             INSERT INTO session VALUES
+                 ('active','/p',1000,4000,0,'USD',NULL,NULL),
+                 ('essai','/p',1500,1500,0,'USD',NULL,NULL);",
+        )
+        .unwrap();
+
+        // Run démarré à 3000 : la marge d'une seconde ramène le seuil à 2000,
+        // donc « essai » (créée et figée à 1500) est hors du run.
+        let identifiee = identifier_session(&c, "/p", 3000).unwrap();
+        assert_eq!(identifiee.as_deref(), Some("active"));
+    }
+
+    /// Le filet de sécurité : aucune session ne correspond au run. Écrire dans
+    /// « la plus récente du dossier » revenait à choisir au hasard ; on ne
+    /// touche à rien et on trace le fait.
+    #[test]
+    fn aucune_session_identifiable_ne_touche_a_rien() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT,
+                 time_created INTEGER, time_updated INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER);
+             INSERT INTO session VALUES ('loin','/p',1000,1000,31,'GBP',1.15,4.6);",
+        )
+        .unwrap();
+
+        assert_eq!(identifier_session(&c, "/p", 9000).unwrap(), None);
+
+        let n = persist_session(&c, "/p", 9000, Some(99), Some("EUR"), None, None).unwrap();
+        assert_eq!(n, 0, "rien ne doit être écrit quand aucune session n'est identifiable");
+
+        let v: (i64, String, Option<f64>, Option<f64>) = c
+            .query_row(
+                "SELECT context_pct, currency, exchange_rate, cost_local FROM session WHERE id = 'loin'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(v, (31, "GBP".to_string(), Some(1.15), Some(4.6)), "la session doit rester intacte");
+    }
+
+    /// Un schéma sans table `message` (autre version d'opencode) ne doit pas
+    /// empêcher l'écriture : les étapes 2 et 3 prennent le relais.
+    #[test]
+    fn l_absence_de_table_message_ne_bloque_pas_l_ecriture() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, directory TEXT,
+                 time_created INTEGER, time_updated INTEGER,
+                 context_pct INTEGER DEFAULT 0, currency TEXT DEFAULT 'USD',
+                 exchange_rate REAL, cost_local REAL);
+             INSERT INTO session VALUES ('neuve','/p',5000,5000,0,'USD',NULL,NULL);",
+        )
+        .unwrap();
+
+        let n = persist_session(&c, "/p", 4000, Some(12), None, None, None).unwrap();
+        assert_eq!(n, 1);
+        let pct: i64 = c
+            .query_row("SELECT context_pct FROM session WHERE id = 'neuve'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pct, 12);
+    }
+
+    /// Le TUI se redessine à chaque événement : la même ligne apparaît en
+    /// début de session (« Context: 3 % ») puis bien plus tard (« Context:
+    /// 81 % »). Le pourcentage à retenir est le dernier, pas le premier :
+    /// l'inverse stockait un état périmé et trahissait « le contexte baisse ».
+    #[test]
+    fn le_contexte_retient_la_derniere_occurrence_du_redessin() {
+        let sortie = b"Context: 3% used\ntravail en cours\nContext: 81% used\n";
+        assert_eq!(extract_context_pct(sortie, b""), Some(81));
+    }
+
+    /// Même principe sur l'ordre inverse des motifs : la dernière ligne lisible
+    /// reste prioritaire quand le motif générique « N % used » s'applique.
+    #[test]
+    fn le_contexte_suit_le_dernier_pourcentage_affiche() {
+        let sortie = b"  12% used   \r\n  47% used   \r\n  93% used   \r\n";
+        assert_eq!(extract_context_pct(sortie, b""), Some(93));
     }
 
     /// P0-1, adapté au pseudo-terminal : le journal de capture ne doit pas
