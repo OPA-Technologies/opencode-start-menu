@@ -621,14 +621,41 @@ fn render_help(
   }
 
 /// Champ de formulaire : texte affiché (ou « (vide) » si aucun contenu).
-fn field_text(v: &str) -> String {
-    let t = v.trim();
-    if t.is_empty() {
-        "(vide)".to_string()
+/// Placeholder affiché quand un champ n'a rien à montrer.
+const VIDE: &str = "(vide)";
+
+/// Valeur réellement affichée pour un champ de formulaire.
+///
+/// La frappe en cours (`buffer`) prime sur la valeur validée (`valide`) : c'est
+/// la règle qui manquait au formulaire de création, où seule la valeur
+/// validée à Entrée était peinte. Le texte tapé atterrissait dans `buffer`,
+/// donc rien ne bougeait à l'écran avant validation — la saisie était
+/// aveugle, alors que le curseur, lui, suivait bien `input_offset`.
+///
+/// L'onglet Projet appliquait déjà cette règle à la main ; elle est factorisée
+/// ici pour que les deux dialogues ne puissent plus diverger.
+pub(crate) fn valeur_affiche(valide: &str, buffer: &str, en_saisie: bool, placeholder: &str) -> String
+  {
+    let source = if en_saisie { buffer } else { valide };
+    if source.trim().is_empty() {
+        placeholder.to_string()
     } else {
-        t.to_string()
+        source.to_string()
     }
 }
+
+/// Colonne d'affichage du curseur dans un champ : largeur *rendue* du préfixe
+/// saisi, pas son nombre de caractères. Un offset de caractères utilisé tel
+/// quel comme colonne décale le curseur de droite sur tout caractère large
+/// (`é`, `→`, caractères CJK…).
+pub(crate) fn colonne_curseur(buffer: &str, offset_chars: usize) -> usize
+  {
+    let octets = crate::byte_index_for_char(buffer, offset_chars);
+    let prefixe = buffer.get(..octets).unwrap_or(buffer);
+    // `Line::width` mesure la largeur d'affichage réelle (une colonne par
+    // cellule), contrairement à `chars().count()`.
+    Line::from(prefixe).width()
+  }
 
 fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState)
   {
@@ -655,15 +682,30 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
       .border_style(Style::default().fg(Color::Cyan))
       .style(opaque);
 
-    // Lignes : libellé aligné + valeur. Le champ actif est surligné (REVERSED).
+// Lignes : libellé aligné + valeur. Le champ actif est surligné (REVERSED).
     let active = state.active_field.min(6);
+    // Un champ est « en saisie » quand la frappe courante lui appartient. Pour
+    // le Statut, ce n'est le cas qu'en texte libre : sinon la frappe alimente
+    // le filtre du menu déroulant, pas `input_buffer`.
+    let affiche = |valide: &str, en_saisie: bool, placeholder: &str| -> String
+      {
+        valeur_affiche(valide, &state.input_buffer, en_saisie, placeholder)
+      };
+    let saisie = |i: usize| i == active;
     let fields: [(&str, String); 6] = [
-        ("ID           ", field_text(&state.id)),
-        ("Nom          ", field_text(&state.name)),
-        ("Chemin       ", field_text(&state.path)),
-        ("Description  ", field_text(&state.description)),
-        ("Statut       ", state.status.clone().unwrap_or_else(|| "(aucun)".to_string())),
-        ("Version      ", field_text(&state.version)),
+        ("ID           ", affiche(&state.id, saisie(0), VIDE)),
+        ("Nom          ", affiche(&state.name, saisie(1), VIDE)),
+        ("Chemin       ", affiche(&state.path, saisie(2), VIDE)),
+        ("Description  ", affiche(&state.description, saisie(3), VIDE)),
+        (
+            "Statut       ",
+            affiche(
+                state.status.as_deref().unwrap_or(""),
+                saisie(4) && state.status_free_text,
+                "(aucun)",
+            ),
+        ),
+        ("Version      ", affiche(&state.version, saisie(5), VIDE)),
       ];
 
     let lbl_style = |i: usize| -> Style
@@ -753,8 +795,18 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
     // Curseur réel : sur la valeur du champ actif.
     // Colonne de début de valeur = bordure + libellé réel + « : ».
     let cursor_y = area.y + 3 + active as u16; // bordure(1) + 2 lignes vides + index champ
+    // Décalage dans le champ : largeur rendue du préfixe saisi, pas son
+    // nombre de caractères (sinon les accents décalent le curseur).
+    let dans_champ = if active == 4 && !state.status_free_text
+      {
+        0
+      }
+    else
+      {
+        colonne_curseur(&state.input_buffer, state.input_offset)
+      };
     let cursor_x = (area.x + 1 + fields.get(active).map_or(13, |f| f.0.chars().count()) as u16 + 3
-      + state.input_offset as u16)
+      + dans_champ as u16)
       .min(x.saturating_add(dialog_width).saturating_sub(2));
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
@@ -842,53 +894,24 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
       .style(opaque);
 
     let active = state.active_field.min(3);
+    // Même règle que le formulaire de création, via le helper commun : la
+    // frappe en cours l'emporte sur la valeur validée.
     let current_value = |state: &ProjectEditState, field: usize| -> String
       {
-        if state.editing && field == active
+        let valide = match field
           {
-            if state.input_buffer.is_empty()
-              {
-                "(vide)".to_string()
-              }
-            else
-              {
-                state.input_buffer.clone()
-              }
-          }
-        else
-          {
-            match field
-              {
-                0 => if state.pending_version.is_empty()
-                  {
-                    "(vide)".to_string()
-                  }
-                else
-                  {
-                    state.pending_version.clone()
-                  },
-                1 => if state.pending_status.is_empty()
-                  {
-                    "(aucun)".to_string()
-                  }
-                else
-                  {
-                    state.pending_status.clone()
-                  },
-                2 => if state.pending_description.is_empty()
-                  {
-                    "(vide)".to_string()
-                  }
-                else
-                  {
-                    state.pending_description.clone()
-                  },
-                _ =>
-                  {
-                    "o/N".to_string()
-                  }
-              }
-          }
+            0 => state.pending_version.as_str(),
+            1 => state.pending_status.as_str(),
+            2 => state.pending_description.as_str(),
+            _ => "o/N",
+          };
+        let placeholder = if field == 1 { "(aucun)" } else { VIDE };
+        valeur_affiche(
+            valide,
+            &state.input_buffer,
+            state.editing && field == active,
+            placeholder,
+          )
       };
 
     let lbl_style = |i: usize| -> Style
@@ -1617,3 +1640,143 @@ fn avertissements_tarif(web: bool) -> Vec<String> {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests
+  {
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    use super::*;
+
+    /// Contenu texte d'un buffer, ligne par ligne.
+    fn texte(buf: &Buffer) -> String
+      {
+        (0..buf.area.height)
+          .map(|y| {
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()
+          })
+          .collect::<Vec<_>>()
+          .join("\n")
+      }
+
+    /// Rend le formulaire de création dans un terminal de test.
+    fn rendre_creation(state: &ProjectCreationState) -> (String, (u16, u16))
+      {
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| render_creation_dialog(f, f.area(), state)).unwrap();
+        let curseur = term.get_cursor_position().unwrap();
+        (texte(term.backend().buffer()), (curseur.x, curseur.y))
+      }
+
+    /// Formulaire prêt à saisir : champ Nom actif, rien de validé encore.
+    fn saisie_en_cours(buffer: &str, offset: usize) -> ProjectCreationState
+      {
+        ProjectCreationState {
+            active_field: 1,
+            input_buffer: buffer.to_string(),
+            input_offset: offset,
+            ..ProjectCreationState::default()
+          }
+      }
+
+    /// Régression B1 : la frappe doit être visible *avant* validation.
+    ///
+    /// Le formulaire peignait `state.name`, alimenté uniquement par Entrée, et
+    /// non `state.input_buffer` où la frappe arrive : taper ne produisait rien
+    /// à l'écran. Le curseur, lui, suivait l'offset — d'un texte figé.
+    #[test]
+    fn le_formulaire_affiche_la_frappe_avant_entree()
+      {
+        let (rendu, _) = rendre_creation(&saisie_en_cours("hello", 5));
+        assert!(
+            rendu.contains("hello"),
+            "la frappe doit apparaître sans attendre Entrée. Rendu :\n{rendu}"
+        );
+      }
+
+    /// Le champ actif ne doit pas masquer les valeurs déjà validées des
+    /// autres champs : sinon le formulaire vidait son contenu à la frappe.
+    #[test]
+    fn les_champs_non_actifs_conservent_leur_valeur_validee()
+      {
+        let state = ProjectCreationState {
+            id: "mon-projet".to_string(),
+            name: "Mon Projet".to_string(),
+            active_field: 2,
+            input_buffer: "/tmp/x".to_string(),
+            input_offset: 6,
+            ..ProjectCreationState::default()
+          };
+        let (rendu, _) = rendre_creation(&state);
+        assert!(rendu.contains("mon-projet"), "l'ID validé a disparu :\n{rendu}");
+        assert!(rendu.contains("Mon Projet"), "le nom validé a disparu :\n{rendu}");
+      }
+
+    /// Régression B6 : le curseur doit avancer en colonnes affichées, pas en
+    /// caractères. Un caractère large occupe deux colonnes ; le compter pour
+    /// un laissait une colonne plus tôt que le texte réellement peint.
+    #[test]
+    fn le_curseur_suit_la_largeur_affichee()
+      {
+        assert_eq!(colonne_curseur("", 0), 0);
+        assert_eq!(colonne_curseur("abc", 3), 3);
+        // Un accent tient sur une colonne : comme le caractère, aucune
+        // différence — c'est le cas de référence.
+        assert_eq!(colonne_curseur("é", 1), 1);
+        // Caractère large : deux colonnes pour un seul caractère.
+        assert_eq!(colonne_curseur("あ", 1), 2);
+        assert_eq!(colonne_curseur("aあ", 2), 3);
+      }
+
+    /// Le curseur du formulaire suit la même règle que le helper.
+    ///
+    /// « あ » fait un seul caractère pour deux colonnes : il doit donc placer
+    /// le curseur exactement où le place « ab », deux caractères mais deux
+    /// colonnes. Compter les caractères le mettait une colonne trop tôt.
+    #[test]
+    fn le_curseur_du_formulaire_tient_compte_des_caracteres_larges()
+      {
+        let (_, (x_deux_caracteres, _)) = rendre_creation(&saisie_en_cours("ab", 2));
+        let (_, (x_un_caractere_large, _)) = rendre_creation(&saisie_en_cours("あ", 1));
+        assert_eq!(
+            x_un_caractere_large, x_deux_caracteres,
+            "le curseur doit suivre les colonnes affichées, pas les caractères"
+        );
+      }
+
+/// Règle centrale, testée isolément : la frappe prime sur la valeur
+    /// validée, et le placeholder ne sort que si les deux sont vides.
+    #[test]
+    fn la_frappe_prime_sur_la_valeur_validee()
+      {
+        // En saisie : le buffer gagne.
+        assert_eq!(valeur_affiche("ancien", "nouveau", true, VIDE), "nouveau");
+        // Hors saisie : la valeur validée reste.
+        assert_eq!(valeur_affiche("ancien", "nouveau", false, VIDE), "ancien");
+        // En saisie, buffer vidé : le champ est en cours d'effacement, on
+        // montre le placeholder — pas l'ancienne valeur, qui ferait croire
+        // que le texte est encore là alors qu'Entrée l'écraserait par vide.
+        assert_eq!(valeur_affiche("ancien", "", true, VIDE), VIDE);
+        // Rien du tout : placeholder.
+        assert_eq!(valeur_affiche("", "", true, VIDE), VIDE);
+        assert_eq!(valeur_affiche("", "", true, "(aucun)"), "(aucun)");
+        // Un contenu fait d'espaces reste considéré vide.
+        assert_eq!(valeur_affiche("   ", "", false, VIDE), VIDE);
+      }
+
+    /// Le champ Statut n'affiche `input_buffer` qu'en texte libre : sinon la
+    /// frappe alimente le filtre du menu déroulant, et l'afficher ici
+    /// remplacerait le statut par son propre filtre.
+    #[test]
+    fn le_statut_n_affiche_le_buffer_quen_mode_texte_libre()
+      {
+        let mut state = saisie_en_cours("Beta", 4);
+        state.active_field = 4;
+        state.status = Some("Study".to_string());
+        state.status_filter = "filtre".to_string();
+        state.status_free_text = false;
+        let (rendu, _) = rendre_creation(&state);
+        assert!(rendu.contains("Study"), "le statut choisi doit rester visible :\n{rendu}");
+        assert!(!rendu.contains("filtre"), "le filtre ne doit pas voler la ligne du statut :\n{rendu}");
+      }
+  }
