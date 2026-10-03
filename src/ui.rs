@@ -79,9 +79,11 @@ pub(crate) fn ui(
         render_creation_dialog(f, size, creation_state);
     }
 
-    // Edition dialog overlay
-    if matches!(input_mode, InputMode::EditingProject(_)) {
-        render_edit_dialog(f, size, app, edit_state);
+    // Edition dialog overlay (onglet Projet du popup unifié)
+    if let InputMode::Popup(popup) = input_mode {
+        if popup.onglet == crate::Onglet::Projet {
+            render_edit_dialog(f, size, app, &popup.projet);
+        }
     }
 
     // Module selector overlay
@@ -98,43 +100,8 @@ pub(crate) fn ui(
         render_module_dialog(f, size, name, modules, *selected);
     }
 
-    // Cost detail popup overlay
-    if let InputMode::CostDetail {
-        project_idx,
-        scroll_offset,
-    } = input_mode
-    {
-        if let Some(project) = app.projects.get(*project_idx) {
-            render_cost_detail_popup(f, size, project, *scroll_offset);
-        }
-    }
 
-    // Tariff popup overlay (valorisation du temps passé)
-    if let InputMode::Tariff {
-        project_idx,
-        active_field,
-        editing,
-        input_buffer,
-        country,
-        message,
-        fetching,
-        ..
-    } = input_mode
-    {
-        if let Some(project) = app.projects.get(*project_idx) {
-            render_tariff_popup(
-                f,
-                size,
-                app,
-                project,
-                *active_field,
-                *editing,
-                input_buffer,
-                country,
-                message.as_deref(),
-                *fetching,
-            );
-        }    }
+
 }
 
 fn render_banner(f: &mut Frame, area: Rect) {
@@ -600,25 +567,12 @@ fn render_help(
           {
             "↑/↓ Choisir module  ·  Entrée Ouvrir  ·  Échap Annuler"
           }
-        InputMode::EditingProject(state) =>
-          {
-            if state.status_menu_open
-              {
-                "↑/↓ Choisir un statut · Entrée valider · Échap annuler · Frappe filtrer"
-              }
-            else if state.editing
-              {
-                "←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée valider le champ  ·  Échap annuler"
-              }
-            else if state.active_field == 3
-              {
-                "o = Enregistrer  ·  N = Annuler  ·  Échap annuler"
-              }
-            else
-              {
-                "↑/↓ changer de champ  ·  Entrée éditer  ·  Échap annuler"
-              }
-          }
+        InputMode::Popup(_) => {
+            "↑/↓ Naviguer · ←/→ Changer onglet · Entrée Éditer · Échap Fermer"
+        }
+        InputMode::Aide { detaillee: _ } => {
+            "Échap/F1 Fermer l'aide"
+        }
         InputMode::CreatingProject(state) =>
           {
             match state.active_field
@@ -657,29 +611,7 @@ fn render_help(
                   }
               }
           }
-        InputMode::CostDetail { .. } =>
-          {
-            "↑/↓ Scroll ligne  ·  PgUp/PgDn Page  ·  Home/End Extrêmes  ·  Échap Fermer"
-          }
-        InputMode::Tariff { editing, active_field, fetching, .. } =>
-          {
-            if *fetching
-              {
-                "Consultation de la source en cours…"
-              }
-            else if *editing
-              {
-                "←/→ Curseur  ·  Frappe Saisie  ·  Entrée Valider  ·  Échap Annuler"
-              }
-            else if *active_field == 0
-              {
-                "Entrée Basculer web / manuel  ·  r Rafraîchir la source  ·  Échap Fermer"
-              }
-            else
-              {
-                "↑/↓ Champ  ·  Entrée Éditer  ·  Échap Fermer"
-              }
-          }
+
       };
 
     let paragraph = Paragraph::new(help_text)

@@ -115,36 +115,153 @@ enum LaunchMode {
     Root,
 }
 
+/// Onglet du popup unifié.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Onglet {
+    /// Réglages du projet sélectionné (version, statut, description).
+    Projet,
+    /// Valorisation et coûts, avec la synthèse des deux.
+    Couts,
+    /// Préférences générales, hors projet.
+    Parametres,
+}
+
+impl Onglet {
+    /// Onglet suivant, cyclique.
+    pub(crate) fn suivant(self) -> Self {
+        match self {
+            Onglet::Projet => Onglet::Couts,
+            Onglet::Couts => Onglet::Parametres,
+            Onglet::Parametres => Onglet::Projet,
+        }
+    }
+
+    /// Onglet précédent, cyclique.
+    pub(crate) fn precedent(self) -> Self {
+        match self {
+            Onglet::Projet => Onglet::Parametres,
+            Onglet::Couts => Onglet::Projet,
+            Onglet::Parametres => Onglet::Couts,
+        }
+    }
+
+    pub(crate) fn libelle(self) -> &'static str {
+        match self {
+            Onglet::Projet => "Projet",
+            Onglet::Couts => "Coûts",
+            Onglet::Parametres => "Paramètres",
+        }
+    }
+}
+
+impl Default for Onglet {
+    fn default() -> Self {
+        Onglet::Projet
+    }
+}
+
+/// État de l'onglet Coûts : réglage du tarif et défilement des tableaux.
+///
+/// Les deux cohabitent pour qu'un aller-retour entre la saisie d'un tarif et
+/// la lecture du tableau ne perde ni l'un ni l'autre.
+#[derive(Clone, Default)]
+pub(crate) struct EtatCouts {
+    /// Champ tarifaire actif : 0 = mode, 1 = tarif manuel (€/h), 2 = pays.
+    pub(crate) active_field: usize,
+    pub(crate) editing: bool,
+    pub(crate) input_buffer: String,
+    pub(crate) input_offset: usize,
+    pub(crate) country: String,
+    pub(crate) message: Option<String>,
+    pub(crate) fetching: bool,
+    /// Défilement du tableau des coûts par session.
+    pub(crate) scroll_offset: usize,
+}
+
+/// État de l'onglet Paramètres : une option active, éventuellement en saisie.
+#[derive(Clone, Default)]
+pub(crate) struct EtatParametres {
+    pub(crate) actif: usize,
+    /// Saisie en cours, réservée au code pays.
+    pub(crate) edition: bool,
+    pub(crate) tampon: String,
+    pub(crate) curseur: usize,
+    /// Colonne visée dans l'option « Colonnes visibles ».
+    pub(crate) colonne_focus: usize,
+    pub(crate) message: Option<String>,
+}
+
+/// Le popup unifié. Chaque onglet garde son état : saisir un tarif, aller sur
+/// Projet, puis revenir restitue la saisie intacte.
+#[derive(Clone)]
+pub(crate) struct Popup {
+    pub(crate) onglet: Onglet,
+    pub(crate) projet_idx: usize,
+    pub(crate) projet: ProjectEditState,
+    pub(crate) couts: EtatCouts,
+    pub(crate) parametres: EtatParametres,
+}
+
+impl Popup {
+    /// Popup sans projet sélectionné.
+    ///
+    /// Les préférences sont globales : `s` doit rester accessible même quand la
+    /// liste est vide. Les onglets Projet et Coûts indicate alors qu'il n'y a
+    /// rien à afficher plutôt que de bloquer l'accès aux réglages.
+    pub(crate) fn sans_projet(onglet: Onglet, country: String) -> Self {
+        Self {
+            onglet,
+            projet_idx: 0,
+            projet: ProjectEditState::default(),
+            couts: EtatCouts { country, ..EtatCouts::default() },
+            parametres: EtatParametres::default(),
+        }
+    }
+
+    pub(crate) fn nouveau(projet_idx: usize, projet: ProjectEditState, country: String) -> Self {
+        Self {
+            onglet: Onglet::Projet,
+            projet_idx,
+            projet,
+            couts: EtatCouts { country, ..EtatCouts::default() },
+            parametres: EtatParametres::default(),
+        }
+    }
+
+    /// Même popup, onglet Projet remplacé.
+    ///
+    /// Les handlers d'édition ne connaissent que leur propre état ; ils
+    /// rendent donc le popup qu'on leur a fourni, avec leur état dedans. Sans
+    /// cela, quitter l'onglet Projet pour aller voir les coûts puis revenir
+    /// réinitialiserait la saisie en cours.
+    pub(crate) fn avec_projet(&self, projet: ProjectEditState) -> Popup {
+        Popup { projet, ..self.clone() }
+    }
+
+    /// Même popup, onglet Coûts remplacé.
+    pub(crate) fn avec_couts(&self, couts: EtatCouts) -> Popup {
+        Popup { couts, ..self.clone() }
+    }
+
+    /// Même popup, onglet affiché remplacé.
+    pub(crate) fn avec_onglet(&self, onglet: Onglet) -> Popup {
+        Popup { onglet, ..self.clone() }
+    }
+}
+
 pub(crate) enum InputMode {
     Normal,
     CreatingProject(ProjectCreationState),
-    EditingProject(ProjectEditState),
     SelectModule {
         project_idx: usize,
         modules: Vec<PathBuf>,
         selected: usize,
     },
-    CostDetail {
-        project_idx: usize,
-        scroll_offset: usize,
-    },
-    /// Popup de valorisation du temps passé (touche `t`) : consultation et
-    /// réglage du tarif (source web ou saisie manuelle).
-    Tariff {
-        project_idx: usize,
-        /// Champ actif : 0 = mode, 1 = tarif manuel (€/h), 2 = pays source.
-        active_field: usize,
-        /// Saisie en cours (édition du champ actif).
-        editing: bool,
-        input_buffer: String,
-        input_offset: usize,
-        /// Pays source en cours d'édition.
-        country: String,
-        /// Message d'erreur ou d'information de la dernière action.
-        message: Option<String>,
-        /// Publication d'un nouveau tarif depuis la source web.
-        fetching: bool,
-    },
+    /// Popup unique regroupant les réglages du projet, les coûts et les
+    /// préférences. Les touches `p`, `c` et `s` y mènent.
+    Popup(Popup),
+    /// Aide contextuelle (F1) ou aide détaillée (F10).
+    Aide { detaillee: bool },
 }
 
 #[derive(Clone, Default)]
@@ -1576,6 +1693,293 @@ fn run_tui(app: App, terminal: &mut Term, mode_initial: InputMode) -> Result<()>
     tui_loop(terminal, app, mode_initial)
 }
 
+/// Ouvre le popup unifié sur l'onglet demandé, ou reste sur la liste si aucun
+/// projet n'est sélectionné.
+///
+/// Les réglages du projet (`p`) et les coûts (`c`) portent sur un projet
+/// précis : sans sélection, il n'y a rien à montrer. Les préférences (`s`) sont
+/// globales et restent donc accessibles même quand la liste est vide.
+fn ouvrir_popup(app: &mut App, onglet: Onglet) -> InputMode {
+    let Some(idx) = app.selected_project_idx() else {
+        return InputMode::Popup(Popup::sans_projet(onglet, app.web_cache.country.clone()));
+    };
+    let Some(project) = app.projects.get(idx) else {
+        return InputMode::Popup(Popup::sans_projet(onglet, app.web_cache.country.clone()));
+    };
+    let projet = ProjectEditState::from_project(project, idx);
+    let country = app.web_cache.country.clone();
+    InputMode::Popup(Popup::nouveau(idx, projet, country).avec_onglet(onglet))
+}
+
+/// Décale un défilement sans jamais passer sous zéro.
+fn deplacer_scroll(scroll: &mut usize, pas: isize)
+  {
+    *scroll =
+      if pas < 0
+        {
+          scroll.saturating_sub(pas.unsigned_abs())
+        }
+      else
+        {
+          scroll.saturating_add(pas as usize)
+        };
+  }
+
+/// Index des options de l'onglet Paramètres, dans l'ordre d'affichage.
+const OPTION_TRI: usize = 0;
+const OPTION_COLONNES: usize = 1;
+const OPTION_LANCEMENT: usize = 2;
+const OPTION_CAPTURE: usize = 3;
+const OPTION_PAYS: usize = 4;
+
+/// Nombre d'options de l'onglet Paramètres : tri, colonnes, lancement,
+/// capture, pays source.
+pub(crate) const PARAMETRES_CHAMPS: usize = 5;
+
+/// Longueur du code pays, comme l'attend l'API de conversion.
+const LONGUEUR_PAYS: usize = 3;
+
+/// Clavier de l'onglet Paramètres.
+///
+/// En saisie, le champ capte tout : sinon taper `f` dans le code pays
+/// changerait d'onglet et `j`/`k` passeraient pour de la navigation.
+fn handle_parametres_input(key: event::KeyEvent, app: &mut App, popup: &mut Popup) -> InputMode {
+  if popup.parametres.edition
+    {
+      edition_pays(key, app, popup);
+      return InputMode::Popup(popup.clone());
+    }
+  match key.code
+    {
+      KeyCode::Esc => return InputMode::Normal,
+      KeyCode::Tab => popup.onglet = popup.onglet.suivant(),
+      // `←`/`→` changent d'onglet, sauf sur Colonnes : c'est le seul écran où
+      // le curseur est horizontal, et les deux gestes s'y ressemblent trop.
+      KeyCode::Left if popup.parametres.actif != OPTION_COLONNES =>
+        {
+          popup.onglet = popup.onglet.precedent();
+        }
+      KeyCode::Right if popup.parametres.actif != OPTION_COLONNES =>
+        {
+          popup.onglet = popup.onglet.suivant();
+        }
+      KeyCode::Left => deplacer_colonne(popup, false),
+      KeyCode::Right => deplacer_colonne(popup, true),
+      KeyCode::Up | KeyCode::Char('k') => deplacer_option(popup, -1),
+      KeyCode::Down | KeyCode::Char('j') => deplacer_option(popup, 1),
+      KeyCode::Enter | KeyCode::Char(' ') => basculer_parametre(app, popup),
+      _ => {}
+    }
+  InputMode::Popup(popup.clone())
+}
+
+/// Déplace la ligne active, cycliquement.
+fn deplacer_option(popup: &mut Popup, pas: isize)
+  {
+    let n = PARAMETRES_CHAMPS as isize;
+    popup.parametres.actif = (popup.parametres.actif as isize + pas).rem_euclid(n) as usize;
+    popup.parametres.message = None;
+  }
+
+/// Déplace le curseur dans la liste des colonnes visibles, cycliquement.
+fn deplacer_colonne(popup: &mut Popup, avant: bool)
+  {
+    let n = registry::TOUTES_COLONNES.len();
+    let f = popup.parametres.colonne_focus;
+    popup.parametres.colonne_focus =
+      if avant { (f + n - 1) % n } else { (f + 1) % n };
+    popup.parametres.message = None;
+  }
+
+/// Saisie du code pays : trois lettres, chiffres et symboles refusés à la
+/// frappe pour que la valeur reste valide à tout instant.
+fn edition_pays(key: event::KeyEvent, app: &mut App, popup: &mut Popup)
+  {
+    let longueur = popup.parametres.tampon.chars().count();
+    match key.code
+      {
+        KeyCode::Esc =>
+          {
+            popup.parametres.edition = false;
+            popup.parametres.tampon.clear();
+            popup.parametres.curseur = 0;
+            popup.parametres.message = None;
+          }
+        KeyCode::Enter =>
+          {
+            let code = popup.parametres.tampon.trim().to_string();
+            popup.parametres.edition = false;
+            popup.parametres.tampon.clear();
+            popup.parametres.curseur = 0;
+            if code.is_empty()
+              {
+                popup.parametres.message = Some("Code pays inchangé".to_string());
+                return;
+              }
+            if code.len() != LONGUEUR_PAYS || !code.chars().all(|c| c.is_ascii_alphabetic())
+              {
+                popup.parametres.message =
+                  Some(format!("Code pays invalide : {LONGUEUR_PAYS} lettres (ex. FRA)"));
+                return;
+              }
+            // Le pays conditionne la valorisation : les deux emplacements
+            // doivent bouger ensemble, sinon le tarif serait recalculé dans la
+            // devise de l'ancien pays.
+            app.web_cache.country = code.clone();
+            popup.couts.country = code.clone();
+            enregistrer_parametres(app, popup, &format!("Pays source : {code}"));
+          }
+        KeyCode::Backspace =>
+          {
+            popup.parametres.tampon.pop();
+            popup.parametres.curseur = popup.parametres.tampon.chars().count();
+          }
+        KeyCode::Char(c) =>
+          {
+            if longueur >= LONGUEUR_PAYS
+              {
+                popup.parametres.message =
+                  Some(format!("Code pays : {LONGUEUR_PAYS} lettres maximum (ex. FRA)"));
+                return;
+              }
+            if !c.is_ascii_alphabetic()
+              {
+                popup.parametres.message = Some("Lettres uniquement (ex. FRA)".to_string());
+                return;
+              }
+            popup.parametres.tampon.push(c.to_ascii_uppercase());
+            popup.parametres.curseur = popup.parametres.tampon.chars().count();
+            popup.parametres.message = None;
+          }
+        _ => {}
+      }
+  }
+
+/// Applique la valeur saisie puis l'enregistre. Toute modification part dans le
+/// registre : une préférence non écrite serait perdue au prochain lancement.
+fn enregistrer_parametres(app: &mut App, popup: &mut Popup, message: &str)
+  {
+    match registry::save_preferences(&app.registry_path, &app.prefs)
+      {
+        Ok(()) => popup.parametres.message = Some(message.to_string()),
+        Err(e) =>
+          {
+            popup.parametres.message = Some(format!("Préférence non enregistrée : {e}"));
+            app.push_error(format!("Registre non écrit : {e}"));
+          }
+      }
+  }
+
+/// Bascule l'option sous le curseur, ou ouvre sa saisie.
+fn basculer_parametre(app: &mut App, popup: &mut Popup)
+  {
+    match popup.parametres.actif
+      {
+        OPTION_TRI =>
+          {
+            app.prefs.tri = match app.prefs.tri
+              {
+                registry::Tri::Date => registry::Tri::Nom,
+                registry::Tri::Nom => registry::Tri::Date,
+              };
+            appliquer_tri(app, popup);
+            let libelle = match app.prefs.tri
+              {
+                registry::Tri::Date => "Tri : par date",
+                registry::Tri::Nom => "Tri : alphabétique",
+              };
+            enregistrer_parametres(app, popup, libelle);
+          }
+        OPTION_COLONNES => basculer_colonne(app, popup),
+        OPTION_LANCEMENT =>
+          {
+            app.prefs.launch_root = !app.prefs.launch_root;
+            let libelle = if app.prefs.launch_root
+              { "Lancement root activé" } else { "Lancement root désactivé" };
+            enregistrer_parametres(app, popup, libelle);
+          }
+        OPTION_CAPTURE =>
+          {
+            app.prefs.capture = !app.prefs.capture;
+            let libelle = if app.prefs.capture
+              {
+                "Capture du wrapper activée"
+              }
+            else
+              {
+                "Capture désactivée : contexte et coûts ne seront pas enregistrés"
+              };
+            enregistrer_parametres(app, popup, libelle);
+          }
+        OPTION_PAYS =>
+          {
+            popup.parametres.edition = true;
+            popup.parametres.tampon = app.web_cache.country.clone();
+            popup.parametres.curseur = popup.parametres.tampon.chars().count();
+            popup.parametres.message = None;
+          }
+        _ => {}
+      }
+  }
+
+/// Affiche ou masque la colonne visée, puis la range dans l'ordre canonique.
+///
+/// L'ordre du registre suit celui de `TOUTES_COLONNES` : sans ce tri, des
+/// bascules successives produiraient une liste illisible et, surtout, un
+/// registre différent selon l'ordre de manipulation.
+fn basculer_colonne(app: &mut App, popup: &mut Popup)
+  {
+    let libelle = registry::TOUTES_COLONNES[popup.parametres.colonne_focus].to_string();
+    let affichee = app.prefs.colonne_visible(&libelle);
+    if affichee && app.prefs.colonnes.len() == 1
+      {
+        popup.parametres.message = Some("Au moins une colonne doit rester visible".to_string());
+        return;
+      }
+    let mut colonnes = app.prefs.colonnes.clone();
+    if affichee
+      {
+        colonnes.retain(|c| c != &libelle);
+      }
+    else
+      {
+        colonnes.push(libelle.clone());
+        colonnes.sort_by_key(|c| {
+          registry::TOUTES_COLONNES
+            .iter()
+            .position(|t| t == c)
+            .unwrap_or(usize::MAX)
+        });
+      }
+    app.prefs.colonnes = colonnes;
+    let etat = if affichee { "masquée" } else { "affichée" };
+    enregistrer_parametres(app, popup, &format!("Colonne « {libelle} » {etat}"));
+  }
+
+/// Réapplique le tri mémorisé à la liste courante.
+fn appliquer_tri(app: &mut App, popup: &mut Popup)
+  {
+    let ordre = match app.prefs.tri
+      {
+        registry::Tri::Date => SortOrder::Modified,
+        registry::Tri::Nom => SortOrder::Name,
+      };
+    // `projet_idx` est un index : le re-tri le rend caduc, et les onglets
+    // Projet puis Coûts ouvriraient un autre projet que celui demandé.
+    let id = app.projects.get(popup.projet_idx).map(|p| p.id.clone());
+    app.sort_order = ordre;
+    sort_projects(&mut app.projects, ordre);
+    if let Some(id) = id
+      {
+        if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
+          {
+            popup.projet_idx = nouveau;
+          }
+      }
+    refresh_project_selection(app);
+  }
+
+
 fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Result<()> {
     let mut input_mode = mode_initial;
 
@@ -1586,7 +1990,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             _ => ProjectCreationState::default(),
         };
         let edit_state = match &input_mode {
-            InputMode::EditingProject(state) => state.clone(),
+            InputMode::Popup(popup) => popup.projet.clone(),
             _ => ProjectEditState::default(),
         };
 
@@ -1632,13 +2036,8 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                     KeyCode::Char('n') => {
                         InputMode::CreatingProject(ProjectCreationState::default())
                     }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                        if let Some(idx) = app.selected_project_idx() {
-                            let state = ProjectEditState::from_project(&app.projects[idx], idx);
-                            InputMode::EditingProject(state)
-                        } else {
-                            InputMode::Normal
-                        }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        ouvrir_popup(&mut app, Onglet::Projet)
                     }
                     KeyCode::Char('m') => {
                         if let Some(idx) = app.selected_project_idx() {
@@ -1661,31 +2060,11 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         app.set_bare_launch();
                         InputMode::Normal
                     }
-                    KeyCode::Char('c') => {
-                        if let Some(idx) = app.selected_project_idx() {
-                            InputMode::CostDetail {
-                                project_idx: idx,
-                                scroll_offset: 0,
-                            }
-                        } else {
-                            InputMode::Normal
-                        }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        ouvrir_popup(&mut app, Onglet::Couts)
                     }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        if let Some(idx) = app.selected_project_idx() {
-                            InputMode::Tariff {
-                                project_idx: idx,
-                                active_field: 0,
-                                editing: false,
-                                input_buffer: String::new(),
-                                input_offset: 0,
-                                country: app.web_cache.country.clone(),
-                                message: None,
-                                fetching: false,
-                            }
-                        } else {
-                            InputMode::Normal
-                        }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        ouvrir_popup(&mut app, Onglet::Parametres)
                     }
                     _ => InputMode::Normal,
                 },
@@ -1743,99 +2122,59 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         }
                     }
                 }
-                InputMode::EditingProject(mut state) => {
-                    match handle_edit_input(key, &mut state, &mut app) {
-                        Ok(mode) => mode,
-                        Err(e) => {
-                            app.push_error(format!("Édition impossible : {e}"));
-                            InputMode::Normal
+                InputMode::Popup(mut popup) => {
+                    // Onglet Coûts : réglage du tarif tant qu'aucune saisie
+                    // n'est en cours, sinon défilement du tableau des coûts.
+                    if popup.onglet == Onglet::Couts && !popup.couts.editing {
+                        let scroll = &mut popup.couts.scroll_offset;
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => deplacer_scroll(scroll, -1),
+                            KeyCode::Down | KeyCode::Char('j') => deplacer_scroll(scroll, 1),
+                            KeyCode::PageUp => deplacer_scroll(scroll, -10),
+                            KeyCode::PageDown => deplacer_scroll(scroll, 10),
+                            KeyCode::Home => *scroll = 0,
+                            // `Fin` va au bout : le rendu bornera l'affichage.
+                            KeyCode::End => *scroll = usize::MAX / 2,
+                            _ => {}
                         }
+                    }
+                    match popup.onglet {
+                        Onglet::Projet => {
+                            let mut state = popup.projet.clone();
+                            let resultat = handle_edit_input(key, &mut state, &mut app, &popup);
+                            match resultat {
+                                Ok(mode) => mode,
+                                Err(e) => {
+                                    app.push_error(format!("Édition impossible : {e}"));
+                                    InputMode::Normal
+                                }
+                            }
+                        }
+                        Onglet::Couts => match handle_tariff_input(
+                            key,
+                            &mut app,
+                            &popup,
+                            popup.projet_idx,
+                            popup.couts.active_field,
+                            popup.couts.editing,
+                            popup.couts.input_buffer.clone(),
+                            popup.couts.input_offset,
+                            popup.couts.country.clone(),
+                            popup.couts.message.clone(),
+                            popup.couts.fetching,
+                        ) {
+                            Ok(mode) => mode,
+                            Err(e) => {
+                                app.push_error(format!("Valorisation : {e}"));
+                                InputMode::Normal
+                            }
+                        },
+                        Onglet::Parametres => handle_parametres_input(key, &mut app, &mut popup),
                     }
                 }
-                InputMode::CostDetail {
-                    project_idx,
-                    mut scroll_offset,
-                } => match key.code {
-                    KeyCode::Esc => InputMode::Normal,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if scroll_offset > 0 {
-                            scroll_offset -= 1;
-                        }
-                        InputMode::CostDetail {
-                            project_idx,
-                            scroll_offset,
-                        }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        scroll_offset = scroll_offset.saturating_add(1);
-                        InputMode::CostDetail {
-                            project_idx,
-                            scroll_offset,
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        if scroll_offset >= 10 {
-                            scroll_offset -= 10;
-                        } else {
-                            scroll_offset = 0;
-                        }
-                        InputMode::CostDetail {
-                            project_idx,
-                            scroll_offset,
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        scroll_offset = scroll_offset.saturating_add(10);
-                        InputMode::CostDetail {
-                            project_idx,
-                            scroll_offset,
-                        }
-                    }
-                    KeyCode::Home => {
-                        scroll_offset = 0;
-                        InputMode::CostDetail {
-                            project_idx,
-                            scroll_offset,
-                        }
-                    }
-                    KeyCode::End => {
-                        scroll_offset = usize::MAX;
-                        InputMode::CostDetail {
-                            project_idx,
-                            scroll_offset,
-                        }
-                    }
-                    _ => InputMode::CostDetail {
-                        project_idx,
-                        scroll_offset,
-                    },
-                },
-                InputMode::Tariff {
-                    project_idx,
-                    active_field,
-                    editing,
-                    input_buffer,
-                    input_offset,
-                    country,
-                    message,
-                    fetching,
-                } => match handle_tariff_input(
-                    key,
-                    &mut app,
-                    project_idx,
-                    active_field,
-                    editing,
-                    input_buffer,
-                    input_offset,
-                    country,
-                    message,
-                    fetching,
-                ) {
-                    Ok(mode) => mode,
-                    Err(e) => {
-                        app.push_error(format!("Valorisation : {e}"));
-                        InputMode::Normal
-                    }
+                InputMode::Aide { detaillee } => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => InputMode::Normal,
+                    _ => InputMode::Aide { detaillee },
                 },
             };
         }
@@ -3012,6 +3351,7 @@ const TARIF_CHAMPS: usize = 3;
 fn handle_tariff_input(
   key: event::KeyEvent,
   app: &mut App,
+  base: &Popup,
   mut project_idx: usize,
   active_field: usize,
   editing: bool,
@@ -3022,12 +3362,13 @@ fn handle_tariff_input(
   _fetching: bool,
 ) -> Result<InputMode>
    {
+    // Reconstruit l'onglet Coûts à partir des variables locales du corps, puis
+    // le rend dans le popup reçu : les deux autres onglets gardent leur état.
     macro_rules! popup
       {
         ($editing:expr, $buffer:expr, $offset:expr, $msg:expr) =>
           {
-            InputMode::Tariff {
-              project_idx,
+            InputMode::Popup(base.avec_couts(EtatCouts {
               active_field,
               editing: $editing,
               input_buffer: $buffer,
@@ -3035,7 +3376,8 @@ fn handle_tariff_input(
               country,
               message: $msg,
               fetching: false,
-            }
+              scroll_offset: base.couts.scroll_offset,
+            }))
           };
       }
 
@@ -3193,8 +3535,7 @@ fn handle_tariff_input(
         KeyCode::Up | KeyCode::Char('k') =>
           {
             let next = if active_field == 0 { TARIF_CHAMPS - 1 } else { active_field - 1 };
-            return Ok(InputMode::Tariff {
-              project_idx,
+            return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
               active_field: next,
               editing: false,
               input_buffer: String::new(),
@@ -3202,13 +3543,13 @@ fn handle_tariff_input(
               country,
               message,
               fetching: false,
-            });
+              scroll_offset: base.couts.scroll_offset,
+            })));
           }
         KeyCode::Down | KeyCode::Char('j') =>
           {
             let next = (active_field + 1) % TARIF_CHAMPS;
-            return Ok(InputMode::Tariff {
-              project_idx,
+            return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
               active_field: next,
               editing: false,
               input_buffer: String::new(),
@@ -3216,13 +3557,13 @@ fn handle_tariff_input(
               country,
               message,
               fetching: false,
-            });
+              scroll_offset: base.couts.scroll_offset,
+            })));
           }
         KeyCode::Tab =>
           {
             let next = (active_field + 1) % TARIF_CHAMPS;
-            return Ok(InputMode::Tariff {
-              project_idx,
+            return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
               active_field: next,
               editing: false,
               input_buffer: String::new(),
@@ -3230,7 +3571,8 @@ fn handle_tariff_input(
               country,
               message,
               fetching: false,
-            });
+              scroll_offset: base.couts.scroll_offset,
+            })));
           }
         KeyCode::Enter =>
           {
@@ -3317,6 +3659,7 @@ fn handle_edit_input(
   key: event::KeyEvent,
   state: &mut ProjectEditState,
   app: &mut App,
+  base: &Popup,
 ) -> Result<InputMode>
    {
     if state.editing
@@ -3326,7 +3669,7 @@ fn handle_edit_input(
             KeyCode::Esc =>
               {
                 state.editing = false;
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Left =>
               {
@@ -3335,7 +3678,7 @@ fn handle_edit_input(
                     state.input_offset -= 1;
                   }
                 state.rewrite_mode = false;
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Right =>
               {
@@ -3344,7 +3687,7 @@ fn handle_edit_input(
                     state.input_offset += 1;
                   }
                 state.rewrite_mode = false;
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Backspace =>
               {
@@ -3355,12 +3698,12 @@ fn handle_edit_input(
                     state.input_offset = idx;
                     state.rewrite_mode = false;
                   }
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Enter =>
               {
                 commit_edit_field(state);
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Char(c) =>
               {
@@ -3408,7 +3751,7 @@ fn handle_edit_input(
                     state.input_offset = (pos + 1).min(state.input_buffer.chars().count());
                   }
                 state.error = None;
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             _ =>
               {}
@@ -3423,7 +3766,7 @@ fn handle_edit_input(
                 if state.status_menu_open
                   {
                     state.status_menu_open = false;
-                    return Ok(InputMode::EditingProject(state.clone()));
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
                 return Ok(InputMode::Normal);
               }
@@ -3441,7 +3784,7 @@ fn handle_edit_input(
                       {
                         state.status_cursor -= 1;
                       }
-                    return Ok(InputMode::EditingProject(state.clone()));
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
                 let delta = if key.code == KeyCode::Up
                   {
@@ -3459,7 +3802,7 @@ fn handle_edit_input(
                   {
                     state.active_field -= 1;
                   }
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Enter =>
               {
@@ -3476,7 +3819,7 @@ fn handle_edit_input(
                             state.active_field += 1;
                           }
                       }
-                    return Ok(InputMode::EditingProject(state.clone()));
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
                 if state.active_field == 1
                   {
@@ -3484,7 +3827,7 @@ fn handle_edit_input(
                     state.status_menu_open = true;
                     state.status_filter.clear();
                     state.status_cursor = 0;
-                    return Ok(InputMode::EditingProject(state.clone()));
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
                 if state.active_field < EDIT_CONFIRM_FIELD
                   {
@@ -3505,7 +3848,7 @@ fn handle_edit_input(
                       "Corrigez les champs avant d'enregistrer (version, statut, description)".to_string(),
                     );
                   }
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Char(c) if state.status_menu_open =>
               {
@@ -3514,7 +3857,7 @@ fn handle_edit_input(
                     state.status_filter.push(c);
                     state.status_cursor = 0;
                   }
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Char('o') | KeyCode::Char('O') =>
               {
@@ -3526,7 +3869,7 @@ fn handle_edit_input(
                     );
                     return Ok(InputMode::Normal);
                   }
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             KeyCode::Char('n') | KeyCode::Char('N') =>
               {
@@ -3534,13 +3877,13 @@ fn handle_edit_input(
                   {
                     return Ok(InputMode::Normal);
                   }
-                return Ok(InputMode::EditingProject(state.clone()));
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
             _ =>
               {}
           }
       }
-    Ok(InputMode::EditingProject(state.clone()))
+    Ok(InputMode::Popup(base.avec_projet(state.clone())))
   }
 
 #[cfg(test)]
