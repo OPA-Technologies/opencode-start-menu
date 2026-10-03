@@ -79,11 +79,9 @@ pub(crate) fn ui(
         render_creation_dialog(f, size, creation_state);
     }
 
-    // Edition dialog overlay (onglet Projet du popup unifié)
+    // Popup unifié : cadre, barre d'onglets et contenu de l'onglet actif.
     if let InputMode::Popup(popup) = input_mode {
-        if popup.onglet == crate::Onglet::Projet {
-            render_edit_dialog(f, size, app, &popup.projet);
-        }
+        render_popup_unifie(f, size, app, popup);
     }
 
     // Module selector overlay
@@ -781,7 +779,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
     .centered());
 
     // Remplit les lignes restantes pour un fond entièrement opaque
-    while lines.len() < dialog_height.saturating_sub(2) as usize
+    while lines.len() < area.height as usize
       {
         lines.push(Line::from(""));
       }
@@ -821,7 +819,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
             offset = state.status_cursor - visible + 1;
           }
         let width = items.iter().map(|s| s.chars().count()).max().unwrap_or(8) + 2;
-        let px = (area.x + 3).min(x.saturating_add(dialog_width).saturating_sub(width as u16));
+        let px = (area.x + 3).min(area.x.saturating_add(area.width).saturating_sub(width as u16));
         let py = area.y + 8; // sous la ligne du champ Statut (row = area.y+7)
         let parea = Rect {
             x: px,
@@ -862,35 +860,16 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
       }
   }
 
-fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditState)
+/// Contenu de l'onglet Projet : version, statut, description.
+///
+/// Rendu dans `area` sans cadre ni centrage : le cadre commun et le titre
+/// (qui porte le nom du projet) sont dessinés par `render_popup_unifie`.
+fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
   {
-    let name = app
-      .projects
-      .get(state.project_idx)
-      .map(|p| p.name.as_str())
-      .unwrap_or("Projet");
-
-    let dialog_width = size.width.min(82);
-    let dialog_height = 12;
-    let x = (size.width.saturating_sub(dialog_width)) / 2;
-    let y = (size.height.saturating_sub(dialog_height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width: dialog_width,
-        height: dialog_height,
-      };
-    let area = area.intersection(size);
-
-    // Fond opaque : efface la zone puis repeint tout en gris foncé
-    f.render_widget(Clear, area);
-
-    let opaque = Style::default().bg(Color::DarkGray);
+    let opaque = Style::default().bg(Color::Black);
 
     let block = Block::default()
-      .title(format!(" Édition — {} ", sanitize(name)))
-      .borders(Borders::ALL)
-      .border_style(Style::default().fg(Color::Cyan))
+      .borders(Borders::NONE)
       .style(opaque);
 
     let active = state.active_field.min(3);
@@ -997,7 +976,7 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
     .centered());
 
     // Remplit les lignes restantes pour un fond entièrement opaque
-    while lines.len() < dialog_height.saturating_sub(2) as usize
+    while lines.len() < area.height as usize
       {
         lines.push(Line::from(""));
       }
@@ -1012,11 +991,12 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
     if state.editing
       {
         let cursor_y = area.y + 2 + active as u16; // bordure(1) + ligne vide(1) + index champ
-        // Colonne de début de valeur = bordure + libellé réel + « : ».
-        let value_x = area.x + 1 + labels[active].0.chars().count() as u16 + 3;
-        let cursor_x = (value_x + state.input_offset as u16).min(
-          x.saturating_add(dialog_width).saturating_sub(2),
-        );
+        // Colonne de début de valeur = libellé réel + « : », puis largeur
+        // rendue du préfixe saisi (pas son nombre de caractères).
+        let value_x = area.x + labels[active].0.chars().count() as u16 + 3;
+        let dans_champ = colonne_curseur(&state.input_buffer, state.input_offset);
+        let cursor_x =
+          (value_x + dans_champ as u16).min(area.x.saturating_add(area.width).saturating_sub(1));
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
       }
 
@@ -1031,7 +1011,7 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
             offset = state.status_cursor - visible + 1;
           }
         let width = items.iter().map(|s| s.chars().count()).max().unwrap_or(8) + 2;
-        let px = (area.x + 3).min(x.saturating_add(dialog_width).saturating_sub(width as u16));
+        let px = (area.x + 3).min(area.x.saturating_add(area.width).saturating_sub(width as u16));
         let py = area.y + 4; // sous la ligne du champ Statut (row = area.y+3)
         let parea = Rect {
             x: px,
@@ -1039,7 +1019,7 @@ fn render_edit_dialog(f: &mut Frame, size: Rect, app: &App, state: &ProjectEditS
             width: width as u16,
             height: (visible + 2) as u16,
           };
-        let parea = parea.intersection(size);
+        let parea = parea.intersection(area);
         f.render_widget(Clear, parea);
         let mut popup: Vec<Line> = Vec::new();
         for (idx, item) in items.iter().enumerate().skip(offset).take(visible)
@@ -1139,9 +1119,246 @@ fn render_module_dialog(
     f.render_widget(paragraph, area);
 }
 
-fn render_cost_detail_popup(
+/// Contenu de l'onglet Paramètres : préférences globales, hors projet.
+///
+/// La logique clavier existait déjà (`handle_parametres_input`) mais aucun
+/// rendu n'existait : l'onglet était donc invisible, ce qui rendait `p` et `c`
+/// cul-de-sac puisque Tab n'y menait pas.
+fn render_contenu_parametres(f: &mut Frame, area: Rect, app: &App, popup: &crate::Popup)
+  {
+    let etat = &popup.parametres;
+    let libelle = Style::default().fg(Color::DarkGray);
+    let actif_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+    let mut lignes: Vec<Line> = vec![Line::from("")];
+
+    // (libellé, valeur, ligne de l'option)
+    let tri = match app.prefs.tri
+      {
+        crate::registry::Tri::Date => "par date",
+        crate::registry::Tri::Nom => "alphabétique",
+      };
+    let options: [(&str, String); 5] = [
+      ("Tri de la liste", tri.to_string()),
+      (
+        "Colonnes visibles",
+        format!("{}/{}", app.prefs.colonnes.len(), crate::registry::TOUTES_COLONNES.len()),
+      ),
+      (
+        "Lancement root",
+        if app.prefs.launch_root { "activé (sudo -i)" } else { "désactivé" }.to_string(),
+      ),
+      (
+        "Capture du wrapper",
+        if app.prefs.capture { "activée" } else { "désactivée" }.to_string(),
+      ),
+      ("Pays de la source", app.web_cache.country.clone()),
+    ];
+
+    for (i, (lbl, valeur)) in options.iter().enumerate()
+      {
+        let actif = i == etat.actif;
+        let style = if actif { actif_style } else { Style::default() };
+        // L'option « Colonnes visibles » a une sous-liste : le libellé montre
+        // quelle colonne est visée, et les colonnes actives sont listées.
+        let mut spans = vec![
+          Span::styled(
+            if actif { format!(" ▸ {lbl}") } else { format!("   {lbl}") },
+            style,
+          ),
+        ];
+        if i == 1
+          {
+            let nom = crate::registry::TOUTES_COLONNES
+              .get(etat.colonne_focus)
+              .copied()
+              .unwrap_or("—");
+            let marque = if app.prefs.colonnes.iter().any(|c| c == nom) { "☑" } else { "☐" };
+            spans.push(Span::styled(
+              format!("  ←→ {nom} {marque}"),
+              if actif { actif_style } else { libelle },
+            ));
+          }
+        else
+          {
+            spans.push(Span::styled(format!("  : {valeur}"), style));
+          }
+        // En saisie du code pays, la frappe remplace la valeur.
+        if i == 4 && etat.edition
+          {
+            spans.push(Span::styled(
+              etat.tampon.clone(),
+              Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+          }
+        lignes.push(Line::from(spans));
+      }
+
+    // Liste des colonnes activées, pour que l'effet du réglage soit visible
+    // sans les ouvrir une par une.
+    lignes.push(Line::from(""));
+    lignes.push(Line::from(Span::styled(" Colonnes affichées dans le détail", libelle)));
+    let colonnes: Vec<String> = crate::registry::TOUTES_COLONNES
+      .iter()
+      .map(|c| {
+        let actif = app.prefs.colonnes.iter().any(|x| x == c);
+        if actif { format!("☑ {c}") } else { format!("☐ {c}") }
+      })
+      .collect();
+    for ligne in colonnes.chunks(3)
+      {
+        let mut spans: Vec<Span> = Vec::new();
+        for c in ligne
+          {
+            spans.push(Span::raw(format!("{c}   ")));
+          }
+        lignes.push(Line::from(spans));
+      }
+
+    lignes.push(Line::from(""));
+    lignes.push(Line::from(Span::styled(
+      " Entrée basculer  ·  ↑/↓ option  ·  ←→ colonne  ·  Échap fermer ",
+      libelle,
+    )));
+
+    if let Some(msg) = etat.message.as_deref()
+      {
+        lignes.push(Line::from(Span::styled(
+          msg.to_string(),
+          Style::default().fg(Color::Yellow),
+        )));
+      }
+
+    f.render_widget(Paragraph::new(lignes).wrap(Wrap { trim: false }), area);
+  }
+
+/// Point d'entrée unique du popup : cadre, barre d'onglets, puis le contenu
+/// de l'onglet actif.
+///
+/// Une seule implémentation dessert les trois onglets. C'était la cause des
+/// trois symptômes « touche pressée, rien ne change » : l'ancien code ne
+/// rendait que l'onglet Projet, et la navigation d'onglet n'était câblée que
+/// dans le gestionnaire de l'onglet Paramètres — donc `p` et `c` ouvraient
+/// un cul-de-sac dont on ne pouvait plus sortir.
+pub(crate) fn render_popup_unifie(f: &mut Frame, size: Rect, app: &App, popup: &crate::Popup)
+  {
+    let largeur = size.width.min(100).max(40.min(size.width));
+    let hauteur = size.height.saturating_sub(4).max(9.min(size.height));
+    let x = (size.width.saturating_sub(largeur)) / 2;
+    let y = (size.height.saturating_sub(hauteur)) / 2;
+    let area = Rect { x, y, width: largeur, height: hauteur }.intersection(size);
+    if area.width < 8 || area.height < 5
+      {
+        return;
+      }
+
+    // Fond opaque : efface la zone puis repeint, pour ne pas laisser transparaître
+    // le menu en dessous.
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(Color::Black)), area);
+
+    let bloc = Block::default()
+      .title(format!(" {} ", crate::sanitize(&titre_popup(app, popup))))
+      .borders(Borders::ALL)
+      .border_style(Style::default().fg(Color::Cyan))
+      .style(Style::default().bg(Color::Black));
+    let inner = bloc.inner(area);
+    f.render_widget(bloc, area);
+
+    // Barre d'onglets : c'est elle qui rend la structure visible. Sans elle,
+    // rien n'indiquait que le popup en avait trois, ni lequel était actif.
+    let onglets = [crate::Onglet::Projet, crate::Onglet::Couts, crate::Onglet::Parametres];
+    let libelles: Vec<String> = onglets
+      .iter()
+      .map(|o| {
+        if *o == popup.onglet {
+          format!(" ▸ {} ", o.libelle())
+        } else {
+          format!("   {} ", o.libelle())
+        }
+      })
+      .collect();
+    let tabs = Paragraph::new(Line::from(
+        libelles.into_iter().map(Span::raw).collect::<Vec<Span>>(),
+    ))
+      .style(Style::default().fg(Color::Cyan).bg(Color::Black));
+    let zones = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([Constraint::Length(1), Constraint::Min(0)])
+      .split(inner);
+    f.render_widget(tabs, zones[0]);
+
+    let contenu = zones[1];
+    // Projet et Coûts portent sur un projet précis : sans sélection, on le dit
+    // plutôt que d'afficher les valeurs d'un autre projet, ou un vide muet.
+    let projet = app.projects.get(popup.projet_idx);
+    let besoin_projet = popup.onglet != crate::Onglet::Parametres;
+    if besoin_projet && projet.is_none()
+      {
+        f.render_widget(
+          Paragraph::new("Aucun projet sélectionné.")
+            .style(Style::default().fg(Color::Yellow).bg(Color::Black))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+          contenu,
+        );
+        return;
+      }
+
+    match popup.onglet
+      {
+        crate::Onglet::Projet => render_contenu_projet(f, contenu, &popup.projet),
+        crate::Onglet::Couts => {
+          if let Some(p) = projet
+            {
+              render_contenu_couts(f, contenu, app, p, &popup.couts);
+            }
+        }
+        crate::Onglet::Parametres => render_contenu_parametres(f, contenu, app, popup),
+      }
+  }
+
+/// Titre du popup : le projet quand il y en a un.
+fn titre_popup(app: &App, popup: &crate::Popup) -> String
+  {
+    app.projects
+      .get(popup.projet_idx)
+      .map(|p| p.name.clone())
+      .unwrap_or_else(|| "Paramètres".to_string())
+  }
+
+/// Contenu de l'onglet Coûts : valorisation + réglage du tarif, puis le
+/// détail des coûts par session. Rendu dans `area` sans cadre propre : le
+/// cadre et la barre d'onglets sont dessinés une seule fois par
+/// `render_popup_unifie`.
+///
+/// Le défilement porte sur le tableau des sessions, seule partie réellement
+/// plus longue que l'espace disponible.
+fn render_contenu_couts(
     f: &mut Frame,
-    size: Rect,
+    area: Rect,
+    app: &App,
+    project: &crate::ProjectEntry,
+    couts: &crate::EtatCouts,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+    render_bloc_tarif(f, chunks[0], app, project, couts);
+    render_tableau_couts(f, chunks[1], project, couts.scroll_offset);
+}
+
+/// Tableau des coûts par session. Borné par la hauteur réellement
+/// disponible : le défilement est calculé sur ce nombre de lignes, pas sur
+/// une estimation. Sans ce calcul, `Fin` (qui pousse l'offset à l'infini)
+/// vidait le tableau au lieu d'afficher sa dernière ligne.
+fn render_tableau_couts(
+    f: &mut Frame,
+    area: Rect,
     project: &crate::ProjectEntry,
     scroll_offset: usize,
 ) {
@@ -1221,44 +1438,28 @@ fn render_cost_detail_popup(
         ]));
     }
 
-    // Scroll handling
-    let visible_rows = rows.len().saturating_sub(1); // -1 for header
-    let max_scroll = visible_rows.saturating_sub(10); // ~10 visible rows
+    // Défilement borné par la place réelle : une ligne de titre, puis autant
+    // de lignes de données que la hauteur permet, moins une ligne de pied.
+    let visibles = usize::from(area.height).saturating_sub(2).max(1);
+    let max_scroll = rows.len().saturating_sub(1).saturating_sub(visibles);
     let actual_scroll = scroll_offset.min(max_scroll);
 
     // Take visible rows
     let display_rows: Vec<Row> = if rows.len() > 1 {
         let start = 1 + actual_scroll; // skip header
-        let end = (start + 10).min(rows.len());
+        let end = (start + visibles).min(rows.len());
         let mut display = vec![rows[0].clone()]; // header
         display.extend(rows[start..end].iter().cloned());
         display
     } else {
-        rows
+        rows.clone()
     };
-
-    // Calculate popup size (80% of screen)
-    let popup_width = (size.width as f32 * 0.8) as u16;
-    let popup_height = (size.height as f32 * 0.7) as u16;
-    let x = (size.width.saturating_sub(popup_width)) / 2;
-    let y = (size.height.saturating_sub(popup_height)) / 2;
-
-    let area = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    };
-    let area = area.intersection(size);
-
-    // Clear background
-    f.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" DÉTAIL COÛTS PAR SESSION ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+      .title(" Détail des coûts ")
+      .borders(Borders::TOP)
+      .border_style(Style::default().fg(Color::DarkGray))
+      .style(Style::default().bg(Color::Black));
 
     let table = Table::new(
         display_rows,
@@ -1305,8 +1506,9 @@ fn render_cost_detail_popup(
 
     // Scroll indicator
     let scroll_info = format!(
-        "▲ {} lignes  │  ↑/↓ Ligne  PgUp/PgDn Page  Home/End Extrêmes  │  Échap Fermer",
-        visible_rows
+        "▲ {} ligne{}  │  ↑/↓ Ligne  PgUp/PgDn Page  Home/End Extrêmes",
+        rows.len().saturating_sub(1),
+        if rows.len().saturating_sub(1) > 1 { "s" } else { "" }
     );
     let scroll_area = Rect {
         x: area.x + 1,
@@ -1320,53 +1522,18 @@ fn render_cost_detail_popup(
     f.render_widget(scroll_para, scroll_area);
 }
 
-/// Popup « Valorisation du temps » (touche `t`).
+/// Bloc « valorisation du temps » : temps passé, valorisation en euros, puis
+/// le détail du tarif appliqué (origine, année, date d'actualisation).
 ///
-/// Affiche le temps passé de la dernière session et du cumul, sa valorisation
-/// en euros, puis le détail du tarif appliqué (origine, année, date
-/// d'actualisation). Les limites de la méthode sont explicitées : l'utilisateur
-/// doit savoir qu'il s'agit d'une estimation fondée sur un salaire horaire
-/// moyen statistic published, et non d'un coût réellement supporté.
-#[allow(clippy::too_many_arguments)]
-fn render_tariff_popup(
-    f: &mut Frame,
-    size: Rect,
-    app: &App,
-    project: &crate::ProjectEntry,
-    active_field: usize,
-    editing: bool,
-    input_buffer: &str,
-    country: &str,
-    message: Option<&str>,
-    fetching: bool,
-) {
-    let popup_width = size.width.min(88).saturating_sub(4);
-    let popup_height = size.height.min(30).saturating_sub(4);
-    let x = (size.width.saturating_sub(popup_width)) / 2;
-    let y = (size.height.saturating_sub(popup_height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    };
-    let area = area.intersection(size);
-
-    f.render_widget(Clear, area);
-
-    let block = Block::default()
-        .title(format!(
-            " VALORISATION DU TEMPS — {} ",
-            sanitize(&project.name)
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
-    f.render_widget(block.clone(), area);
-    let inner = block.inner(area);
-
-    // Décalage de 2 lignes pour l'en-tête de colonnes : le popup partage sa
-    // surface avec le tableau des durées, pas avec le tableau de la liste.
+/// Les limites de la méthode sont explicitées : l'utilisateur doit savoir
+/// qu'il s'agit d'une estimation fondée sur un salaire horaire moyen
+/// publié, et non d'un coût réellement supporté. Rendu dans `area` sans
+/// cadre : voir `render_contenu_couts`.
+fn render_bloc_tarif(f: &mut Frame, area: Rect, app: &App, project: &crate::ProjectEntry, couts: &crate::EtatCouts) {
+    let (active_field, editing, country) =
+        (couts.active_field, couts.editing, couts.country.as_str());
+    let (input_buffer, message, fetching) =
+        (couts.input_buffer.as_str(), couts.message.as_deref(), couts.fetching);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1374,7 +1541,7 @@ fn render_tariff_popup(
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(inner);
+        .split(area);
 
     // --- En-tête : temps passé et valorisation -------------------------
     let valeur_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
@@ -1447,19 +1614,10 @@ fn render_tariff_popup(
         }
     };
 
-    // Valeur affichée pour le champ actif pendant la saisie.
+    // Valeur affichée pour le champ actif pendant la saisie : même règle que
+    // les autres formulaires, via le helper commun.
     let champ = |i: usize, valeur: &str, actif: usize, buffer: &str, edit: bool| -> String {
-        if edit && actif == i {
-            if buffer.is_empty() {
-                "(vide)".to_string()
-            } else {
-                buffer.to_string()
-            }
-        } else if valeur.is_empty() {
-            "—".to_string()
-        } else {
-            valeur.to_string()
-        }
+        valeur_affiche(valeur, buffer, edit && actif == i, "—")
     };
 
     let mode_libelle = if web {
@@ -1596,7 +1754,7 @@ fn render_tariff_popup(
     f.render_widget(paragraphe, chunks[1]);
 
     let pied = Paragraph::new(
-        " Entrée : basculer le mode / éditer  ·  r : rafraîchir la source  ·  Échap : fermer ",
+        " Entrée : basculer le mode / éditer  ·  r : rafraîchir la source  ·  Tab : onglets  ·  Échap : fermer ",
     )
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Center);
@@ -1779,4 +1937,160 @@ mod tests
         assert!(rendu.contains("Study"), "le statut choisi doit rester visible :\n{rendu}");
         assert!(!rendu.contains("filtre"), "le filtre ne doit pas voler la ligne du statut :\n{rendu}");
       }
+    // --- Popup unifié -------------------------------------------------
+
+    /// Registre minimal avec un projet, chargé sans rescan ni réseau.
+    fn app_de_test(nom: &str) -> (crate::App, std::path::PathBuf)
+      {
+        let dir = std::env::temp_dir().join(format!("op-ui-{}-{nom}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let projet = dir.join(nom);
+        std::fs::create_dir_all(&projet).unwrap();
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                nom: {
+                    "name": nom,
+                    "path": projet.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "version_debug": "1.0.0",
+                    "description": "",
+                    "tarif_mode": "manuel"
+                }
+            }
+        });
+        std::fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let app = crate::App::new_light(registre.clone(), crate::SortOrder::Modified);
+        (app, dir)
+      }
+
+    /// Popup du projet 0, sur l'onglet demandé.
+    fn popup_de_test(app: &crate::App, onglet: crate::Onglet) -> crate::Popup
+      {
+        let projet = crate::ProjectEditState::from_project(&app.projects[0], 0);
+        crate::Popup::nouveau(0, projet, app.web_cache.country.clone()).avec_onglet(onglet)
+      }
+
+    fn rendre_popup(app: &crate::App, popup: &crate::Popup) -> String
+      {
+        let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        term.draw(|f| render_popup_unifie(f, f.area(), app, popup)).unwrap();
+        texte(term.backend().buffer())
+      }
+
+    /// Régression B5 : `c` n'affichait rien, faute de rendu pour l'onglet Coûts.
+    /// Les trois onglets doivent produire un contenu.
+    #[test]
+    fn chaque_onglet_du_popup_rend_un_contenu()
+      {
+        let (app, _dir) = app_de_test("projet-alpha");
+        for onglet in
+          [
+            crate::Onglet::Projet,
+            crate::Onglet::Couts,
+            crate::Onglet::Parametres,
+          ]
+        {
+            let popup = popup_de_test(&app, onglet);
+            let rendu = rendre_popup(&app, &popup);
+            for libelle in ["Projet", "Coûts", "Paramètres"]
+              {
+                assert!(
+                    rendu.contains(libelle),
+                    "onglet {:?} : la barre d'onglets doit montrer « {libelle} »",
+                    onglet
+                );
+              }
+            assert!(rendu.contains("▸ "), "onglet {:?} : aucun onglet actif marqué", onglet);
+          }
+      }
+
+    /// Régression B5, plan visible : l'onglet Coûts montre le réglage du tarif
+    /// *et* le tableau des coûts, dans un seul cadre.
+    #[test]
+    fn l_onglet_couts_montre_le_tarif_et_le_tableau()
+      {
+        let (mut app, _dir) = app_de_test("projet-beta");
+        app.projects[0].last_duree = "1 h 23 min".to_string();
+        app.projects[0].total_duree = "12 h 05 min".to_string();
+        app.projects[0].total_cost = "4,20 €".to_string();
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("Temps passé"), "le tableau de valorisation manque :\n{rendu}");
+        assert!(rendu.contains("Tarif manuel"), "le réglage du tarif manque :\n{rendu}");
+        assert!(rendu.contains("Pays source"), "le pays source manque :\n{rendu}");
+        assert!(rendu.contains("Détail des coûts"), "le tableau des coûts manque :\n{rendu}");
+      }
+
+    /// Régression B3 : l'onglet Paramètres n'avait aucun rendu, alors que toute
+    /// sa logique clavier existait. `p` et `c` ne pouvaient donc pas y mener.
+    #[test]
+    fn l_onglet_parametres_montre_les_preferences()
+      {
+        let (app, _dir) = app_de_test("projet-gamma");
+        let popup = popup_de_test(&app, crate::Onglet::Parametres);
+        let rendu = rendre_popup(&app, &popup);
+        for attendu in
+          [
+            "Tri de la liste",
+            "Colonnes visibles",
+            "Lancement root",
+            "Capture du wrapper",
+            "Pays de la source",
+          ]
+        {
+            assert!(rendu.contains(attendu), "« {attendu} » manque :\n{rendu}");
+          }
+      }
+
+    /// Régression B9 : les limites de la méthode étaient revenues dans une
+    /// fonction morte, jamais affichées. L'utilisateur lisait une valorisation
+    /// prise pour un coût réel.
+    #[test]
+    fn les_avertissements_de_cout_sont_affiches()
+      {
+        let (mut app, _dir) = app_de_test("projet-delta");
+        app.projects[0].tarif_mode = "web".to_string();
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(
+            rendu.contains("Estimation, pas un coût"),
+            "l'avertissement d'estimation doit être visible :\n{rendu}"
+        );
+      }
+
+    /// Régression B7 : `Fin` poussait le défilement à l'infini sans borne, et le
+    /// rendu ne le bornait pas non plus. Le tableau pouvait donc rendre vide.
+    #[test]
+    fn un_defilement_extreme_ne_vide_pas_le_tableau()
+      {
+        let (mut app, _dir) = app_de_test("projet-epsilon");
+        app.projects[0].total_cost = "4,20 €".to_string();
+        app.projects[0].session_count = "3".to_string();
+        let mut popup = popup_de_test(&app, crate::Onglet::Couts);
+        popup.couts.scroll_offset = usize::MAX / 2;
+        let rendu = rendre_popup(&app, &popup);
+        assert!(
+            rendu.contains("TOTAL") || rendu.contains("Aucune donnée"),
+            "le tableau doit rester lisible malgré un décalage hors bornes :\n{rendu}"
+        );
+      }
+
+    /// Sans projet sélectionné, les onglets Projet et Coûts n'ont rien à
+    /// montrer : ils doivent le dire plutôt qu'afficher le vide.
+    #[test]
+    fn sans_projet_l_onglet_annonce_l_absence()
+      {
+        let dir = std::env::temp_dir().join(format!("op-ui-vide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let registre = dir.join("registre.json");
+        std::fs::write(&registre, r#"{"projects":{}}"#).unwrap();
+        let app = crate::App::new_light(registre.clone(), crate::SortOrder::Modified);
+        let popup = crate::Popup::sans_projet(crate::Onglet::Couts, "FRA".to_string());
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("Aucun projet sélectionné"), "rendu :\n{rendu}");
+      }
+
   }

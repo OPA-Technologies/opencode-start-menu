@@ -3392,7 +3392,7 @@ fn handle_tariff_input(
               input_offset: $offset,
               country,
               message: $msg,
-              fetching: false,
+              fetching: base.couts.fetching,
               scroll_offset: base.couts.scroll_offset,
             }))
           };
@@ -3559,7 +3559,7 @@ fn handle_tariff_input(
               input_offset: 0,
               country,
               message,
-              fetching: false,
+              fetching: base.couts.fetching,
               scroll_offset: base.couts.scroll_offset,
             })));
           }
@@ -3573,7 +3573,7 @@ fn handle_tariff_input(
               input_offset: 0,
               country,
               message,
-              fetching: false,
+              fetching: base.couts.fetching,
               scroll_offset: base.couts.scroll_offset,
             })));
           }
@@ -3587,7 +3587,7 @@ fn handle_tariff_input(
               input_offset: 0,
               country,
               message,
-              fetching: false,
+              fetching: base.couts.fetching,
               scroll_offset: base.couts.scroll_offset,
             })));
           }
