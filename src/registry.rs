@@ -283,7 +283,7 @@ pub(crate) fn validate_version(v: &str) -> bool {
 }
 
 pub(crate) fn validate_status(s: &str) -> bool {
-    STATUSES.iter().any(|known| *known == s)
+    STATUSES.contains(&s)
 }
 
 /// Tarif horaire manuel recevable : fini, et positif ou nul.

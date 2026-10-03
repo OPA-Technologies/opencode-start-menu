@@ -372,12 +372,27 @@ fn byte_index_for_char(s: &str, char_idx: usize) -> usize
 fn insert_char_at(s: &mut String, c: char, char_idx: usize)
   {
     let byte = byte_index_for_char(s, char_idx);
+    if byte > s.len() {
+        return;
+    }
+    if !s.is_char_boundary(byte) && byte < s.len() {
+        return;
+    }
     s.insert(byte, c);
   }
 
 fn delete_char_at(s: &mut String, char_idx: usize)
   {
     let byte = byte_index_for_char(s, char_idx);
+    if byte >= s.len() || s.is_empty() {
+        return;
+    }
+    if byte == s.len() {
+        return;
+    }
+    if !s.is_char_boundary(byte) {
+        return;
+    }
     s.remove(byte);
   }
 
@@ -1328,13 +1343,15 @@ fn run_startup_gauge(
 /// Ne touche pas au terminal : l'appelant reste seul responsable de le
 /// refermer, quelle que soit la sortie.
 /// Borne `B` explicite : la jauge est ainsi testable avec un `TestBackend`,
-/// sans dépendre d'un vrai terminal.
-fn animer_jauge<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    state: &mut startup::GaugeState,
-    rx: &std::sync::mpsc::Receiver<startup::Signal>,
-    avertissements: &mut Vec<String>,
-) -> Option<Result<Option<App>>>
+/// sans dépendre d'un vrai terminal. Depuis ratatui 0.30 le trait `Backend`
+/// laisse le type d'erreur libre (`io::Error` en production, `Infallible` pour
+/// `TestBackend`) : on le contraint seulement à ce qu'`anyhow::Error` sait
+/// absorber, pour ne pas perdre la cause d'une erreur au passage.
+fn animer_jauge<B>(terminal: &mut Terminal<B>, state: &mut startup::GaugeState,
+    rx: &std::sync::mpsc::Receiver<startup::Signal>, avertissements: &mut Vec<String>) -> Option<Result<Option<App>>>
+where
+    B: ratatui::backend::Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
   {
     use std::{sync::mpsc::TryRecvError, time::Duration};
 
@@ -4389,25 +4406,38 @@ mod tests
     /// échoue, au lieu de propager l'erreur hors de la boucle.
     struct BackendEnPanne(ratatui::backend::TestBackend);
 
+    /// `TestBackend` ne peut pas échouer (`Error = Infallible`) : convertir son
+    /// résultat en `io::Error` est donc total, via l'absence de cas.
+    fn jamais(e: std::convert::Infallible) -> std::io::Error
+      {
+        match e {}
+      }
+
     impl ratatui::backend::Backend for BackendEnPanne
       {
+        // ratatui 0.30 a introduit un type d'erreur associé au trait
+        // `Backend` ; `std::io::Error` est celui des backends déjà testés.
+        type Error = std::io::Error;
+
         fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
           where
             I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>
           {
             Err(std::io::Error::other("panne du terminal simulee"))
           }
-        fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor() }
-        fn show_cursor(&mut self) -> std::io::Result<()> { self.0.show_cursor() }
+fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(jamais) }
+        fn show_cursor(&mut self) -> std::io::Result<()> { self.0.show_cursor().map_err(jamais) }
         fn get_cursor_position(&mut self) -> std::io::Result<ratatui::prelude::Position>
-          { self.0.get_cursor_position() }
+          { self.0.get_cursor_position().map_err(jamais) }
         fn set_cursor_position<P: Into<ratatui::prelude::Position>>(&mut self, p: P) -> std::io::Result<()>
-          { self.0.set_cursor_position(p) }
-        fn clear(&mut self) -> std::io::Result<()> { self.0.clear() }
-        fn size(&self) -> std::io::Result<ratatui::prelude::Size> { self.0.size() }
+          { self.0.set_cursor_position(p).map_err(jamais) }
+        fn clear(&mut self) -> std::io::Result<()> { self.0.clear().map_err(jamais) }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()>
+          { self.0.clear_region(clear_type).map_err(jamais) }
+        fn size(&self) -> std::io::Result<ratatui::prelude::Size> { self.0.size().map_err(jamais) }
         fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize>
-          { self.0.window_size() }
-        fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+          { self.0.window_size().map_err(jamais) }
+        fn flush(&mut self) -> std::io::Result<()> { self.0.flush().map_err(jamais) }
       }
 
     /// Régression P1-1 : une erreur d'affichage pendant l'initialisation
