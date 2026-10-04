@@ -1735,20 +1735,6 @@ fn ouvrir_popup(app: &mut App, onglet: Onglet) -> InputMode {
     InputMode::Popup(Popup::nouveau(idx, projet, country).avec_onglet(onglet))
 }
 
-/// Décale un défilement sans jamais passer sous zéro.
-fn deplacer_scroll(scroll: &mut usize, pas: isize)
-  {
-    *scroll =
-      if pas < 0
-        {
-          scroll.saturating_sub(pas.unsigned_abs())
-        }
-      else
-        {
-          scroll.saturating_add(pas as usize)
-        };
-  }
-
 /// Index des options de l'onglet Paramètres, dans l'ordre d'affichage.
 const OPTION_TRI: usize = 0;
 const OPTION_COLONNES: usize = 1;
@@ -2224,13 +2210,17 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                     if popup.onglet == Onglet::Couts && !popup.couts.editing {
                         let scroll = &mut popup.couts.scroll_offset;
                         match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => deplacer_scroll(scroll, -1),
-                            KeyCode::Down | KeyCode::Char('j') => deplacer_scroll(scroll, 1),
-                            KeyCode::PageUp => deplacer_scroll(scroll, -10),
-                            KeyCode::PageDown => deplacer_scroll(scroll, 10),
+                            KeyCode::Up | KeyCode::Char('k') =>
+                                *scroll = op_tui::viewport::decaler(*scroll, -1),
+                            KeyCode::Down | KeyCode::Char('j') =>
+                                *scroll = op_tui::viewport::decaler(*scroll, 1),
+                            KeyCode::PageUp =>
+                                *scroll = op_tui::viewport::decaler(*scroll, -10),
+                            KeyCode::PageDown =>
+                                *scroll = op_tui::viewport::decaler(*scroll, 10),
                             KeyCode::Home => *scroll = 0,
                             // `Fin` va au bout : le rendu bornera l'affichage.
-                            KeyCode::End => *scroll = usize::MAX / 2,
+                            KeyCode::End => *scroll = op_tui::viewport::FIN,
                             _ => {}
                         }
                     }
@@ -2283,14 +2273,17 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         // les mêmes lignes.
                         KeyCode::F(10) => suivant(!detaillee, 0),
                         KeyCode::Up | KeyCode::Char('k') => {
-                            suivant(detaillee, scroll.saturating_sub(1))
+                            suivant(detaillee, op_tui::viewport::decaler(scroll, -1))
                         }
-                        KeyCode::Down | KeyCode::Char('j') => suivant(detaillee, scroll + 1),
-                        KeyCode::PageUp => suivant(detaillee, scroll.saturating_sub(10)),
-                        KeyCode::PageDown => suivant(detaillee, scroll + 10),
+                        KeyCode::Down | KeyCode::Char('j') =>
+                            suivant(detaillee, op_tui::viewport::decaler(scroll, 1)),
+                        KeyCode::PageUp =>
+                            suivant(detaillee, op_tui::viewport::decaler(scroll, -10)),
+                        KeyCode::PageDown =>
+                            suivant(detaillee, op_tui::viewport::decaler(scroll, 10)),
                         KeyCode::Home => suivant(detaillee, 0),
                         // Le rendu borne le défilement à la dernière ligne.
-                        KeyCode::End => suivant(detaillee, usize::MAX / 2),
+                        KeyCode::End => suivant(detaillee, op_tui::viewport::FIN),
                         _ => suivant(detaillee, scroll),
                     }
                 }

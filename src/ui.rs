@@ -701,7 +701,7 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
     let visibles = usize::from(zones[0].height);
     let total = lignes.len();
     let dernier = total.saturating_sub(visibles);
-    let offset = scroll.min(dernier);
+    let offset = op_tui::viewport::borner(scroll, total, visibles);
     f.render_widget(Paragraph::new(lignes).scroll((offset as u16, 0)), zones[0]);
 
     let defilement = if dernier > 0
@@ -894,8 +894,9 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         let parea = parea.intersection(size);
         f.render_widget(Clear, parea);
         let mut popup: Vec<Line> = Vec::new();
-        for (idx, item) in items.iter().enumerate().skip(offset).take(visible)
-          {
+        let items_visibles = op_tui::viewport::fenetre(&items, offset, visible);
+        for (decalage, item) in items_visibles.iter().enumerate() {
+            let idx = decalage + offset;
             let style = if idx == state.status_cursor
               {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -1086,8 +1087,9 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         let parea = parea.intersection(area);
         f.render_widget(Clear, parea);
         let mut popup: Vec<Line> = Vec::new();
-        for (idx, item) in items.iter().enumerate().skip(offset).take(visible)
-          {
+        let items_visibles = op_tui::viewport::fenetre(&items, offset, visible);
+        for (decalage, item) in items_visibles.iter().enumerate() {
+            let idx = decalage + offset;
             let style = if idx == state.status_cursor
               {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -1498,8 +1500,8 @@ fn render_tableau_couts(
     // Défilement borné par la place réelle : une ligne de titre, puis autant
     // de lignes de données que la hauteur permet, moins une ligne de pied.
     let visibles = usize::from(area.height).saturating_sub(2).max(1);
-    let max_scroll = rows.len().saturating_sub(1).saturating_sub(visibles);
-    let actual_scroll = scroll_offset.min(max_scroll);
+    let donnees = rows.len().saturating_sub(1);
+    let actual_scroll = op_tui::viewport::borner(scroll_offset, donnees, visibles);
 
     // Take visible rows
     let display_rows: Vec<Row> = if rows.len() > 1 {
