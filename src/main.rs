@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod keymap;
 mod launch;
 mod lock;
 mod modules;
@@ -249,6 +250,7 @@ impl Popup {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum InputMode {
     Normal,
     CreatingProject(ProjectCreationState),
@@ -260,8 +262,19 @@ pub(crate) enum InputMode {
     /// Popup unique regroupant les réglages du projet, les coûts et les
     /// préférences. Les touches `p`, `c` et `s` y mènent.
     Popup(Popup),
-    /// Aide contextuelle (F1) ou aide détaillée (F10).
-    Aide { detaillee: bool },
+    /// Aide contextuelle (F1) ou liste complète (F10).
+    ///
+    Aide {
+        detaillee: bool,
+        /// Mode d'où l'aide a été ouverte, conservé pour y revenir.
+        ///
+        /// Sans cette copie, `F1` en plein milieu d'une saisie perduait le
+        /// formulaire : l'aide serait devenue destructive.
+        origine: Box<InputMode>,
+        /// Ligne du haut de la liste affichée. `F10` tient rarement en un
+        /// écran : sans défilement, la fin de la liste serait inaccessible.
+        scroll: usize,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -1756,6 +1769,29 @@ pub(crate) const PARAMETRES_CHAMPS: usize = 5;
 /// Longueur du code pays, comme l'attend l'API de conversion.
 const LONGUEUR_PAYS: usize = 3;
 
+/// Ouvre l'aide en gardant le mode courant pour y revenir.
+///
+/// Le mode est mis dans une `Box` : l'aide y range l'écran d'origine, et
+/// l'enum se référerait donc à lui-même.
+fn ouvrir_aide(origine: InputMode, detaillee: bool) -> InputMode
+  {
+    InputMode::Aide { detaillee, origine: Box::new(origine), scroll: 0 }
+  }
+
+/// Une saisie de texte est-elle en cours dans le mode courant ?
+///
+/// `F10` est refusé dans ce cas : l'utilisateur est en train de taper une
+/// version, une description ou un tarif, et la touche lui appartient.
+fn saisie_en_cours_dans(mode: &InputMode) -> bool
+  {
+    match mode
+      {
+        InputMode::CreatingProject(state) => !state.status_menu_open,
+        InputMode::Popup(popup) => saisie_en_cours(popup),
+        _ => false,
+      }
+  }
+
 /// Applique Tab et Shift+Tab : passage à l'onglet suivant ou précédent.
 ///
 /// Renvoie `true` si la touche a été consommée, pour que le popup n'envoie
@@ -2033,12 +2069,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             InputMode::CreatingProject(state) => state.clone(),
             _ => ProjectCreationState::default(),
         };
-        let edit_state = match &input_mode {
-            InputMode::Popup(popup) => popup.projet.clone(),
-            _ => ProjectEditState::default(),
-        };
-
-        terminal.draw(|f| ui::ui(f, &mut app, &input_mode, &creation_state, &edit_state))?;
+        terminal.draw(|f| ui::ui(f, &mut app, &input_mode, &creation_state))?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
@@ -2051,6 +2082,24 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             if ctrl_quit(key)
               {
                 break;
+              }
+
+            // F1 ouvre l'aide contextuelle, F10 la liste complète. Les deux
+            // sont globaux : l'aide doit être atteignable depuis n'importe
+            // quel écran. F10 est écarté pendant une saisie, sinon il
+            // volerait un caractère au champ actif.
+            // Déjà dans l'aide : ces touches appartiennent à son propre
+            // dispatch (fermer, basculer la vue), pas à celui-ci.
+            let dans_aide = matches!(input_mode, InputMode::Aide { .. });
+            if key.code == KeyCode::F(1) && !dans_aide
+              {
+                input_mode = ouvrir_aide(input_mode, false);
+                continue;
+              }
+            if key.code == KeyCode::F(10) && !dans_aide && !saisie_en_cours_dans(&input_mode)
+              {
+                input_mode = ouvrir_aide(input_mode, true);
+                continue;
               }
 
             input_mode = match input_mode {
@@ -2225,10 +2274,32 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         Onglet::Parametres => handle_parametres_input(key, &mut app, &mut popup),
                     }
                 }
-                InputMode::Aide { detaillee } => match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => InputMode::Normal,
-                    _ => InputMode::Aide { detaillee },
-                },
+                // Échap et F1 referment l'aide. F10 y bascule vers la vue
+                // complète, ce qui évite d'avoir à refermer pour y aller.
+                InputMode::Aide { detaillee, origine, scroll } => {
+                    let suivant = |detaillee: bool, scroll: usize| InputMode::Aide {
+                        detaillee,
+                        origine: origine.clone(),
+                        scroll,
+                    };
+                    match key.code {
+                        // Revenir à l'écran d'origine, formulaire intact.
+                        KeyCode::Esc | KeyCode::F(1) => *origine,
+                        // Changer de vue repart du haut : l'autre liste n'a pas
+                        // les mêmes lignes.
+                        KeyCode::F(10) => suivant(!detaillee, 0),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            suivant(detaillee, scroll.saturating_sub(1))
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => suivant(detaillee, scroll + 1),
+                        KeyCode::PageUp => suivant(detaillee, scroll.saturating_sub(10)),
+                        KeyCode::PageDown => suivant(detaillee, scroll + 10),
+                        KeyCode::Home => suivant(detaillee, 0),
+                        // Le rendu borne le défilement à la dernière ligne.
+                        KeyCode::End => suivant(detaillee, usize::MAX / 2),
+                        _ => suivant(detaillee, scroll),
+                    }
+                }
             };
         }
 

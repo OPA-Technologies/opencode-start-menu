@@ -14,7 +14,6 @@ pub(crate) fn ui(
     app: &mut App,
     input_mode: &InputMode,
     creation_state: &ProjectCreationState,
-    edit_state: &ProjectEditState,
 ) {
     let size = f.area();
 
@@ -33,6 +32,15 @@ pub(crate) fn ui(
             Constraint::Min(0),        // zone contenu
         ])
         .split(size);
+
+    // L'aide occupe tout l'écran : la barre du bas y proposerait des gestes
+    // qui ne s'appliquent pas, puisque seul `Échap` et `F1` y répondent.
+    if matches!(input_mode, InputMode::Aide { .. })
+      {
+        render_banner(f, vertical_chunks[0]);
+        render_aide(f, vertical_chunks[2], input_mode);
+        return;
+      }
 
     // Render banner
     render_banner(f, vertical_chunks[0]);
@@ -72,7 +80,7 @@ pub(crate) fn ui(
         width: size.width,
         height: 1,
     };
-    render_help(f, help_area, input_mode, creation_state, edit_state);
+    render_help(f, help_area, input_mode);
 
     // Creation dialog overlay
     if matches!(input_mode, InputMode::CreatingProject(_)) {
@@ -547,75 +555,172 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
 }
 
 
-fn render_help(
-  f: &mut Frame,
-  area: Rect,
-  input_mode: &InputMode,
-  _creation_state: &ProjectCreationState,
-  _edit_state: &ProjectEditState,
-)
+/// Barre d'aide contextuelle : une ligne, les gestes du mode courant.
+///
+/// Elle est rendue depuis `keymap::contextuel`, jamais écrite à la main :
+/// c'était la cause de l'aide mensongère (`e Modifier` et `t Valorisation`
+/// n'ont jamais existé, les touches réelles n'étaient pas annoncées).
+fn render_help(f: &mut Frame, area: Rect, input_mode: &InputMode)
   {
-    let help_text = match input_mode
+    let raccourcis = crate::keymap::contextuel(input_mode);
+    // Si la liste ne contient pas `F1`, le suffixe qui y renvoie doit être
+    // réservé d'emblée : sinon il déborde à son tour et disparaît, et la
+    // barre finit par ne plus rien dire du tout.
+    let suffixe = "F1 aide";
+    // La place du suffixe est réservée d'emblée : c'est lui qui indique que
+    // la ligne est incomplète. Sans cette marge, il déborde à son tour, et la
+    // barre ne dirait plus du tout où trouver le reste.
+    let separateur = " · ";
+    let largeur_max = usize::from(area.width)
+      .saturating_sub(suffixe.chars().count() + separateur.chars().count());
+    let mut texte = String::new();
+    let mut tronque = false;
+    for r in raccourcis
       {
-        InputMode::Normal =>
+        let morceau = format!("{} {}", r.touche, r.libelle);
+        let ajout = if texte.is_empty()
           {
-            "↑/↓ Naviguer  ·  Entrée Ouvrir  ·  m Module  ·  e Modifier  ·  n Nouveau projet  ·  c Coûts détaillés  ·  t Valorisation  ·  q Quitter"
+            morceau.chars().count()
           }
-        InputMode::SelectModule { .. } =>
+          else
           {
-            "↑/↓ Choisir module  ·  Entrée Ouvrir  ·  Échap Annuler"
-          }
-        InputMode::Popup(_) => {
-            "↑/↓ Naviguer · ←/→ Changer onglet · Entrée Éditer · Échap Fermer"
-        }
-        InputMode::Aide { detaillee: _ } => {
-            "Échap/F1 Fermer l'aide"
-        }
-        InputMode::CreatingProject(state) =>
+            separateur.chars().count() + morceau.chars().count()
+          };
+        if texte.chars().count() + ajout > largeur_max
           {
-            match state.active_field
-              {
-                0 =>
-                  {
-                    "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant"
-                  }
-                1 =>
-                  {
-                    "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant"
-                  }
-                2 =>
-                  {
-                    "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant"
-                  }
-                3 =>
-                  {
-                    "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant"
-                  }
-                4 => if state.status_menu_open
-                  {
-                    "↑/↓ Choisir un statut · Entrée valider · Échap annuler · Frappe filtrer"
-                  }
-                else
-                  {
-                    "↑/↓ changer de champ  ·  Entrée : liste des statuts · Frappe filtrer"
-                  },
-                5 =>
-                  {
-                    "↑/↓ changer de champ  ·  ←/→ déplacer le curseur  ·  Frappe saisie  ·  Entrée suivant"
-                  }
-                _ =>
-                  {
-                    "Saisir o puis Entrée = créer et ouvrir  ·  Entrée seule = créer sans ouvrir"
-                  }
-              }
+            tronque = true;
+            break;
           }
-
-      };
-
-    let paragraph = Paragraph::new(help_text)
+        if !texte.is_empty()
+          {
+            texte.push_str(separateur);
+          }
+        texte.push_str(&morceau);
+      }
+    // Ce qui n'a pas tenu sur la ligne n'est pas perdu : `F1` est annoncé pour
+    // que l'utilisateur sache où le retrouver. Sans cela, la barre mentait par
+    // silence sur ce qu'elle ne montrait pas.
+    if tronque && !texte.contains("F1")
+      {
+        if !texte.is_empty()
+          {
+            texte.push_str(separateur);
+          }
+        texte.push_str(suffixe);
+      }
+    let paragraph = Paragraph::new(texte)
       .style(Style::default().fg(Color::DarkGray))
       .alignment(Alignment::Center);
     f.render_widget(paragraph, area);
+  }
+
+/// Écran d'aide `F10` : tous les raccourcis, groupés par écran.
+///
+/// `F1` n'affiche que `contextuel` ; `F10` affiche la totalité, ce qui évite
+/// d'avoir à changer d'écran pour retrouver une touche oubliée. La barre du
+/// bas et cet écran sont deux rendus du même tableau.
+fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
+  {
+    let (detaillee, scroll) = match input_mode
+      {
+        InputMode::Aide { detaillee, scroll, .. } => (*detaillee, *scroll),
+        _ => (false, 0usize),
+      };
+    // Les gestes affichés sont ceux de l'écran d'origine, pas ceux de l'aide :
+    // c'est ce que l'utilisateur est venu chercher.
+    let contexte: Vec<crate::keymap::Raccourci> = match input_mode
+      {
+        InputMode::Aide { origine, .. } => crate::keymap::contextuel(origine),
+        _ => Vec::new(),
+      };
+    let titre = if detaillee { " Aide — tous les raccourcis " } else { " Aide " };
+    let pairs: Vec<(String, String)> = if detaillee
+      {
+        crate::keymap::complet()
+          .into_iter()
+          .flat_map(|(groupe, raccourcis)| {
+            raccourcis.into_iter().map(move |r| {
+              (
+                groupe.to_string(),
+                format!("  {}  {}", r.touche, r.libelle),
+              )
+            })
+          })
+          .collect()
+      }
+    else
+      {
+        contexte
+          .iter()
+          .map(|r| (String::new(), format!("  {}  {}", r.touche, r.libelle)))
+          .collect()
+      };
+
+    let largeur = size.width.min(84).max(24.min(size.width));
+    // La fenêtre ne cherche plus à contenir la liste : `F10` en a plus qu'un
+    // écran, et une aide tronquée sans défilement est une aide incomplète.
+    let hauteur = size.height.saturating_sub(4).max(9.min(size.height)).min(40);
+    let x = size.width.saturating_sub(largeur) / 2;
+    let y = size.height.saturating_sub(hauteur) / 2;
+    let area = Rect { x, y, width: largeur, height: hauteur }.intersection(size);
+    if area.width < 8 || area.height < 5
+      {
+        return;
+      }
+    f.render_widget(Clear, area);
+
+    let bloc = Block::default()
+      .title(titre)
+      .borders(Borders::ALL)
+      .border_style(Style::default().fg(Color::Cyan))
+      .style(Style::default().bg(Color::Black));
+    let inner = bloc.inner(area);
+    f.render_widget(bloc, area);
+
+    let mut lignes: Vec<Line> = Vec::new();
+    let mut dernier_groupe: Option<String> = None;
+    for (groupe, texte) in pairs
+      {
+        if !groupe.is_empty() && dernier_groupe.as_deref() != Some(groupe.as_str())
+          {
+            lignes.push(Line::from(Span::styled(
+              groupe.clone(),
+              Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+          }
+        dernier_groupe = Some(groupe);
+        lignes.push(Line::from(Span::raw(texte)));
+      }
+    let zones = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([Constraint::Min(0), Constraint::Length(1)])
+      .split(inner);
+    // Borné au derniere ligne affichable : `Fin` pousse le défilement à
+    // l'infini, comme pour le tableau des coûts.
+    let visibles = usize::from(zones[0].height);
+    let total = lignes.len();
+    let dernier = total.saturating_sub(visibles);
+    let offset = scroll.min(dernier);
+    f.render_widget(Paragraph::new(lignes).scroll((offset as u16, 0)), zones[0]);
+
+    let defilement = if dernier > 0
+      {
+        format!(
+          " ↑/↓ défiler ({}/{})  ·  ",
+          offset + 1,
+          total.saturating_sub(1)
+        )
+      }
+      else
+      {
+        String::new()
+      };
+    let pied = Paragraph::new(format!(
+      "{defilement}F1 : aide contextuelle  ·  F10 : tous les raccourcis  ·  Échap : fermer "
+    ))
+    .style(Style::default().fg(Color::DarkGray))
+    .alignment(Alignment::Center);
+    f.render_widget(pied, zones[1]);
   }
 
 /// Champ de formulaire : texte affiché (ou « (vide) » si aucun contenu).
@@ -2143,6 +2248,242 @@ mod tests
           !rendu.contains("bascule le mode"),
           "l'ancien pied de l'onglet Coûts doit avoir disparu :\n{rendu}"
         );
+      }
+
+    // --- Aide (F1 / F10) ------------------------------------------------
+
+    fn rendre_ecran(mode: &InputMode, largeur: u16, hauteur: u16) -> String
+      {
+        // Répertoire numéroté : les tests tournent en parallèle et partageraient
+        // sinon le même registre, que chacun supprime au début.
+        static COMPTEUR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COMPTEUR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (mut app, _dir) = app_de_test(&format!("projet-aide-{n}"));
+        let mut term = Terminal::new(TestBackend::new(largeur, hauteur)).unwrap();
+        term.draw(|f| super::ui(f, &mut app, mode, &ProjectCreationState::default())).unwrap();
+        texte(term.backend().buffer())
+      }
+
+    /// Écran d'aide ouvert depuis la liste des projets : c'est le cas le plus
+    /// courant, et il doit montrer les gestes de cet écran.
+    fn aide_contextuelle() -> InputMode
+      {
+        crate::ouvrir_aide(InputMode::Normal, false)
+      }
+
+    fn aide_detaillee() -> InputMode
+      {
+        crate::ouvrir_aide(InputMode::Normal, true)
+      }
+
+    /// Les cinq écrans qui portent une barre d'aide contextuelle, avec un nom
+    /// lisible : `InputMode` ne dérive pas de `Debug`.
+    ///
+    /// L'écran d'aide en est absent : il affiche ses propres gestes dans son
+    /// pied, sinon la barre proposerait des raccourcis qui n'y marchent pas.
+    fn ecrans_de_la_barre() -> Vec<(&'static str, InputMode)>
+      {
+        vec![
+          ("liste", InputMode::Normal),
+          (
+            "module",
+            InputMode::SelectModule { project_idx: 0, modules: vec![], selected: 0 },
+          ),
+          (
+            "popup projet",
+            InputMode::Popup(crate::Popup::sans_projet(crate::Onglet::Projet, "FRA".into())),
+          ),
+          (
+            "popup couts",
+            InputMode::Popup(crate::Popup::sans_projet(crate::Onglet::Couts, "FRA".into())),
+          ),
+          (
+            "popup parametres",
+            InputMode::Popup(crate::Popup::sans_projet(crate::Onglet::Parametres, "FRA".into())),
+          ),
+        ]
+      }
+
+    /// Régression B2 : l'aide annonçait `e Modifier` et `t Valorisation`, deux
+    /// touches qui n'ont jamais été branchées. Un utilisateur qui cherchait
+    /// `e` concluait à un programme cassé.
+    #[test]
+    fn la_barre_d_aide_n_annonce_plus_de_touches_inexistantes()
+      {
+        let rendu = rendre_ecran(&InputMode::Normal, 120, 40);
+        for fantome in ["e Modifier", "t Valorisation"]
+          {
+            assert!(!rendu.contains(fantome), "« {fantome} » n'existe pas dans le code :\n{rendu}");
+          }
+        for reel in ["p", "c", "s", "m", "F1"]
+          {
+            assert!(rendu.contains(reel), "« {reel} » est une touche réelle, elle doit être annoncée");
+          }
+      }
+
+    /// La barre du bas est rendue depuis le keymap : elle ne peut donc pas
+    /// diverger de l'aide contextuelle.
+    #[test]
+    fn la_barre_d_aide_suit_le_keymap()
+      {
+        for (nom, mode) in ecrans_de_la_barre()
+          {
+            let attendus: Vec<String> = crate::keymap::contextuel(&mode)
+              .iter()
+              .map(|r| r.touche.to_string())
+              .collect();
+            let rendu = rendre_ecran(&mode, 200, 40);
+            for touche in attendus
+              {
+                assert!(
+                  rendu.contains(&touche),
+                  "{nom} : la barre n'annonce pas « {touche} » :\n{rendu}"
+                );
+              }
+          }
+      }
+
+    /// La barre ne doit jamais annoncer un geste que le keymap ignore : c'est
+    /// l'inverse du test précédent, et c'est lui qui avait laissé passer les
+    /// touches fantômes.
+    #[test]
+    fn la_barre_d_aide_est_derivee_du_keymap()
+      {
+        for (nom, mode) in ecrans_de_la_barre()
+          {
+            let touches: Vec<&str> =
+              crate::keymap::contextuel(&mode).iter().map(|r| r.touche).collect();
+            let rendu = rendre_ecran(&mode, 200, 40);
+            for faux in ["e Modifier", "t Valorisation", "←/→ Changer onglet"]
+              {
+                assert!(
+                  !rendu.contains(faux),
+                  "{nom} : la barre affiche « {faux} », absent du keymap :\n{rendu}"
+                );
+              }
+            assert!(
+              touches.iter().any(|t| *t == "Tab/⇧Tab") || !rendu.contains("Onglet suivant"),
+              "{nom} : la barre annonce un changement d'onglet sans le gesture correspondant"
+            );
+          }
+      }
+
+    /// F1 : aide contextuelle, titre et gestes du mode courant.
+    #[test]
+    fn f1_affiche_l_aide_contextuelle()
+      {
+        let rendu = rendre_ecran(&aide_contextuelle(), 100, 34);
+        assert!(rendu.contains("Aide"), "le titre doit apparaître :\n{rendu}");
+        assert!(rendu.contains("Ouvrir"), "les gestes du mode courant doivent apparaître :\n{rendu}");
+        assert!(rendu.contains("Échap"), "la fermeture doit être annoncée :\n{rendu}");
+      }
+
+    /// F10 : tous les raccourcis, groupés par écran, y compris ceux qui ne
+    /// s'appliquent pas au mode courant.
+    #[test]
+    fn f10_affiche_tous_les_raccourcis()
+      {
+        let rendu = rendre_ecran(&aide_detaillee(), 100, 60);
+        for groupe in
+          [
+            "Liste des projets",
+            "Nouveau projet",
+            "Popup — onglet Projet",
+            "Popup — onglet Coûts",
+            "Popup — onglet Paramètres",
+          ]
+        {
+          assert!(rendu.contains(groupe), "« {groupe} » manque dans F10 :\n{rendu}");
+          }
+        assert!(rendu.contains("Ouvrir un sous-module"), "un geste rare doit figurer dans F10");
+      }
+
+    /// Régression : F1 affichait les raccourcis de l'écran d'aide lui-même,
+    /// donc un seul geste — « fermer ». L'utilisateur ouvrait l'aide depuis la
+    /// liste et n'y trouvait pas `Entrée Ouvrir` : exactement l'inverse de ce
+    /// qu'il était venu chercher.
+    #[test]
+    fn f1_affiche_les_gestes_de_l_ecran_d_origine()
+      {
+        let rendu = rendre_ecran(&aide_contextuelle(), 100, 34);
+        for geste in ["Naviguer", "Ouvrir", "Réglages projet", "Coûts"]
+          {
+            assert!(rendu.contains(geste), "« {geste} » manque pour l'écran d'origine :\n{rendu}");
+          }
+        // Et les gestes propres à l'aide restent annoncés, dans son pied.
+        assert!(rendu.contains("F10"), "le pied doit proposer la vue complète");
+        assert!(rendu.contains("fermer"), "la fermeture doit être annoncée");
+      }
+
+    /// La barre d'aide doit tenir dans la largeur du terminal et continuer à
+    /// pointer vers `F1` quand elle est tronquée : sinon elle ne dit plus
+    /// où trouver ce qu'elle a dû couper.
+    #[test]
+    fn la_barre_d_aide_tient_dans_la_largeur_et_garde_f1()
+      {
+        for largeur in [80u16, 100, 120, 200]
+          {
+            let rendu = rendre_ecran(&InputMode::Normal, largeur, 40);
+            let derniere = rendu.lines().last().unwrap_or("").to_string();
+            assert!(
+              derniere.chars().count() <= usize::from(largeur),
+              "largeur {largeur} : la barre déborde ({} caractères)",
+              derniere.chars().count()
+            );
+            assert!(
+              derniere.contains("F1"),
+              "largeur {largeur} : la barre tronquée doit pointer vers F1 :\n{derniere}"
+            );
+          }
+      }
+
+    /// `F10` liste plus de raccourcis qu'il n'y a de lignes : sans
+    /// défilement, la fin de la liste serait inaccessible et l'aide
+    /// mentirait par silence.
+    #[test]
+    fn f10_reste_defilable_jusqu_a_sa_fin()
+      {
+        let debut = aide_detaillee();
+        let rendu_debut = rendre_ecran(&debut, 100, 40);
+        // Le haut de la liste est visible, la fin ne l'est pas.
+        assert!(rendu_debut.contains("Liste des projets"), "le début doit être visible");
+        assert!(
+          !rendu_debut.contains("Défiler la liste"),
+          "la fin de la liste ne doit pas tenir dans l'écran :\\n{rendu_debut}"
+        );
+
+        // `Fin` pousse hors bornes : le rendu doit s'arrêter à la dernière
+        // ligne utile, pas vider la liste.
+        let fin = match aide_detaillee()
+          {
+            InputMode::Aide { origine, .. } => {
+              InputMode::Aide { detaillee: true, origine, scroll: usize::MAX / 2 }
+            }
+            _ => unreachable!(),
+          };
+        let rendu_fin = rendre_ecran(&fin, 100, 40);
+        assert!(rendu_fin.contains("défiler"), "la position doit être annoncée :\n{rendu_fin}");
+        for dernier in ["Fermer", "Défiler la liste"]
+          {
+            assert!(rendu_fin.contains(dernier), "« {dernier} » doit rester atteignable :\n{rendu_fin}");
+          }
+      }
+
+    /// Le défilement doit aussi pouvoir revenir en haut, sinon `Fin` est un
+    /// cul-de-sac.
+    #[test]
+    fn le_defilement_de_l_aide_revient_en_haut()
+      {
+        let mode = match aide_detaillee()
+          {
+            InputMode::Aide { origine, .. } => {
+              InputMode::Aide { detaillee: true, origine, scroll: 50 }
+            }
+            _ => unreachable!(),
+          };
+        let rendu = rendre_ecran(&mode, 100, 40);
+        assert!(!rendu.contains("Liste des projets"), "on doit avoir défilé vers le bas");
+        assert!(rendre_ecran(&aide_detaillee(), 100, 40).contains("Liste des projets"));
       }
 
   }
