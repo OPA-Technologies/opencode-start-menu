@@ -568,61 +568,19 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
 
 /// Barre d'aide contextuelle : une ligne, les gestes du mode courant.
 ///
-/// Elle est rendue depuis `keymap::contextuel`, jamais écrite à la main :
-/// c'était la cause de l'aide mensongère (`e Modifier` et `t Valorisation`
-/// n'ont jamais existé, les touches réelles n'étaient pas annoncées).
+/// Elle est rendue depuis le keymap via `op_tui::help::barre`, jamais écrite à
+/// la main : c'était la cause de l'aide mensongère (`e Modifier` et
+/// `t Valorisation` n'ont jamais existé, les touches réelles n'étaient pas
+/// annoncées).
 fn render_help(f: &mut Frame, area: Rect, input_mode: &InputMode)
   {
-    let raccourcis = crate::keymap::contextuel(input_mode);
-    // Si la liste ne contient pas `F1`, le suffixe qui y renvoie doit être
-    // réservé d'emblée : sinon il déborde à son tour et disparaît, et la
-    // barre finit par ne plus rien dire du tout.
-    let suffixe = "F1 aide";
-    // La place du suffixe est réservée d'emblée : c'est lui qui indique que
-    // la ligne est incomplète. Sans cette marge, il déborde à son tour, et la
-    // barre ne dirait plus du tout où trouver le reste.
-    let separateur = " · ";
-    let largeur_max = usize::from(area.width)
-      .saturating_sub(suffixe.chars().count() + separateur.chars().count());
-    let mut texte = String::new();
-    let mut tronque = false;
-    for r in raccourcis
-      {
-        let morceau = format!("{} {}", r.touche, r.libelle);
-        let ajout = if texte.is_empty()
-          {
-            morceau.chars().count()
-          }
-          else
-          {
-            separateur.chars().count() + morceau.chars().count()
-          };
-        if texte.chars().count() + ajout > largeur_max
-          {
-            tronque = true;
-            break;
-          }
-        if !texte.is_empty()
-          {
-            texte.push_str(separateur);
-          }
-        texte.push_str(&morceau);
-      }
-    // Ce qui n'a pas tenu sur la ligne n'est pas perdu : `F1` est annoncé pour
-    // que l'utilisateur sache où le retrouver. Sans cela, la barre mentait par
-    // silence sur ce qu'elle ne montrait pas.
-    if tronque && !texte.contains("F1")
-      {
-        if !texte.is_empty()
-          {
-            texte.push_str(separateur);
-          }
-        texte.push_str(suffixe);
-      }
-    let paragraph = Paragraph::new(texte)
-      .style(Style::default().fg(Color::DarkGray))
-      .alignment(Alignment::Center);
-    f.render_widget(paragraph, area);
+    op_tui::help::barre(
+      f,
+      area,
+      &crate::keymap::Aide(Some(input_mode)),
+      "F1 aide",
+      Style::default().fg(Color::DarkGray),
+    );
   }
 
 /// Écran d'aide `F10` : tous les raccourcis, groupés par écran.
@@ -639,36 +597,14 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
       };
     // Les gestes affichés sont ceux de l'écran d'origine, pas ceux de l'aide :
     // c'est ce que l'utilisateur est venu chercher.
-    let contexte: Vec<crate::keymap::Raccourci> = match input_mode
+    let cible = crate::keymap::Aide(match input_mode
       {
-        InputMode::Aide { origine, .. } => crate::keymap::contextuel(origine),
-        _ => Vec::new(),
-      };
+        InputMode::Aide { origine, .. } => Some(origine.as_ref()),
+        _ => None,
+      });
     // `overlay::cadre` espace lui-même le titre : le passer déjà encadré
     // produirait deux espaces de chaque côté.
     let titre = if detaillee { "Aide — tous les raccourcis" } else { "Aide" };
-    let pairs: Vec<(String, String)> = if detaillee
-      {
-        crate::keymap::complet()
-          .into_iter()
-          .flat_map(|(groupe, raccourcis)| {
-            raccourcis.into_iter().map(move |r| {
-              (
-                groupe.to_string(),
-                format!("  {}  {}", r.touche, r.libelle),
-              )
-            })
-          })
-          .collect()
-      }
-    else
-      {
-        contexte
-          .iter()
-          .map(|r| (String::new(), format!("  {}  {}", r.touche, r.libelle)))
-          .collect()
-      };
-
     let largeur = size.width.min(84).max(24.min(size.width));
     // La fenêtre ne cherche plus à contenir la liste : `F10` en a plus qu'un
     // écran, et une aide tronquée sans défilement est une aide incomplète.
@@ -678,20 +614,12 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
     };
     let inner = op_tui::overlay::cadre(f, area, titre, THEME);
 
-    let mut lignes: Vec<Line> = Vec::new();
-    let mut dernier_groupe: Option<String> = None;
-    for (groupe, texte) in pairs
-      {
-        if !groupe.is_empty() && dernier_groupe.as_deref() != Some(groupe.as_str())
-          {
-            lignes.push(Line::from(Span::styled(
-              groupe.clone(),
-              Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )));
-          }
-        dernier_groupe = Some(groupe);
-        lignes.push(Line::from(Span::raw(texte)));
-      }
+    let lignes: Vec<Line> = op_tui::help::lignes(
+      &cible,
+      detaillee,
+      Style::default(),
+      Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    );
     let zones = Layout::default()
       .direction(Direction::Vertical)
       .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -2263,8 +2191,8 @@ mod tests
       {
         for (nom, mode) in ecrans_de_la_barre()
           {
-            let touches: Vec<&str> =
-              crate::keymap::contextuel(&mode).iter().map(|r| r.touche).collect();
+            let touches: Vec<String> =
+              crate::keymap::contextuel(&mode).iter().map(|r| r.touche().to_string()).collect();
             let rendu = rendre_ecran(&mode, 200, 40);
             for faux in ["e Modifier", "t Valorisation", "←/→ Changer onglet"]
               {

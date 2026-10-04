@@ -11,21 +11,34 @@
 //! rendus du même tableau : ils ne peuvent plus diverger, et un test compare
 //! la barre affichée aux raccourcis déclarés ici.
 
+use std::borrow::Cow;
+
 use crate::InputMode;
 
-/// Un raccourci : la touche telle qu'elle se lit, et ce qu'elle fait.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct Raccourci {
-    /// Touches affichées, séparées par `/` quand plusieurs touches marchent.
-    pub(crate) touche: &'static str,
-    /// Effet, à la troisième personne : « Naviguer », « Ouvrir ».
-    pub(crate) libelle: &'static str,
-}
+/// La déclaration et son contrat vivent dans le crate partagé : ce fichier ne
+/// décrit que *ce que* ce projet sait faire, pas comment l'afficher.
+pub(crate) use op_tui::keymap::{raccourci, Cible, Raccourci};
 
-/// Raccourci construit à partir des parties données.
-const fn raccourci(touche: &'static str, libelle: &'static str) -> Raccourci {
-    Raccourci { touche, libelle }
-}
+/// L'écran courant, vu par l'aide partagée.
+///
+/// `None` quand il n'y a pas d'écran d'origine à décrire : l'aide displays
+/// alors une liste vide plutôt que celle d'un mode par défaut, qui
+/// annoncerait des gestes sans rapport avec ce qui est affiché.
+pub(crate) struct Aide<'a>(pub(crate) Option<&'a InputMode>);
+
+impl Cible for Aide<'_>
+  {
+    fn contextuel(&self) -> Vec<Raccourci>
+      {
+        self.0.map_or_else(Vec::new, contextuel)
+      }
+
+    /// L'aide complète ne dépend pas du mode : elle les liste tous.
+    fn complet(&self) -> Vec<(Cow<'static, str>, Vec<Raccourci>)>
+      {
+        complet()
+      }
+  }
 
 /// Raccourcis de la barre d'aide contextuelle, pour le mode courant.
 ///
@@ -154,10 +167,10 @@ fn popup_contextuel(popup: &crate::Popup) -> Vec<Raccourci> {
 ///
 /// `F1` montre `contextuel`, `F10` montre ceci : l'utilisateur qui a oublié
 /// une touche la retrouve sans avoir à changer d'écran.
-pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
+pub(crate) fn complet() -> Vec<(Cow<'static, str>, Vec<Raccourci>)> {
     vec![
         (
-            "Liste des projets",
+            Cow::Borrowed("Liste des projets"),
             vec![
                 raccourci("↑/↓ ou j/k", "Naviguer"),
                 raccourci("Entrée", "Ouvrir dans opencode"),
@@ -172,7 +185,7 @@ pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
             ],
         ),
         (
-            "Choix d'un module",
+            Cow::Borrowed("Choix d'un module"),
             vec![
                 raccourci("↑/↓ ou j/k", "Choisir un module"),
                 raccourci("Entrée", "Ouvrir"),
@@ -180,7 +193,7 @@ pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
             ],
         ),
         (
-            "Nouveau projet",
+            Cow::Borrowed("Nouveau projet"),
             vec![
                 raccourci("↑/↓", "Changer de champ"),
                 raccourci("←/→", "Déplacer le curseur"),
@@ -189,7 +202,7 @@ pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
             ],
         ),
         (
-            "Popup — onglet Projet",
+            Cow::Borrowed("Popup — onglet Projet"),
             vec![
                 raccourci("↑/↓", "Changer de champ"),
                 raccourci("Entrée", "Éditer le champ"),
@@ -200,7 +213,7 @@ pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
             ],
         ),
         (
-            "Popup — onglet Coûts",
+            Cow::Borrowed("Popup — onglet Coûts"),
             vec![
                 raccourci("↑/↓", "Défiler le tableau"),
                 raccourci("←/→", "Changer de champ tarifaire"),
@@ -211,7 +224,7 @@ pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
             ],
         ),
         (
-            "Popup — onglet Paramètres",
+            Cow::Borrowed("Popup — onglet Paramètres"),
             vec![
                 raccourci("↑/↓", "Changer d'option"),
                 raccourci("←/→", "Parcourir les colonnes visibles"),
@@ -221,7 +234,7 @@ pub(crate) fn complet() -> Vec<(&'static str, Vec<Raccourci>)> {
             ],
         ),
         (
-            "Aide",
+            Cow::Borrowed("Aide"),
             vec![
                 raccourci("F1", "Aide contextuelle"),
                 raccourci("F10", "Tous les raccourcis"),
