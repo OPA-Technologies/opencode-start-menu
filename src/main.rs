@@ -1756,6 +1756,41 @@ pub(crate) const PARAMETRES_CHAMPS: usize = 5;
 /// Longueur du code pays, comme l'attend l'API de conversion.
 const LONGUEUR_PAYS: usize = 3;
 
+/// Applique Tab et Shift+Tab : passage à l'onglet suivant ou précédent.
+///
+/// Renvoie `true` si la touche a été consommée, pour que le popup n'envoie
+/// pas la même touche au handler de l'onglet d'arrivée.
+fn naviguer_onglets(popup: &mut Popup, code: KeyCode) -> bool
+  {
+    if saisie_en_cours(popup)
+      {
+        return false;
+      }
+    match code
+      {
+        KeyCode::Tab =>
+          {
+            popup.onglet = popup.onglet.suivant();
+            true
+          }
+        KeyCode::BackTab =>
+          {
+            popup.onglet = popup.onglet.precedent();
+            true
+          }
+        _ => false,
+      }
+  }
+
+/// Une saisie de texte est-elle en cours dans l'un des trois onglets ?
+///
+/// Tab et Shift+Tab doivent rester dans le champ : changer d'onglet en
+/// plein milieu d'une frappe viderait le tampon.
+fn saisie_en_cours(popup: &Popup) -> bool
+  {
+    popup.projet.editing || popup.couts.editing || popup.parametres.edition
+  }
+
 /// Clavier de l'onglet Paramètres.
 ///
 /// En saisie, le champ capte tout : sinon taper `f` dans le code pays
@@ -1769,17 +1804,9 @@ fn handle_parametres_input(key: event::KeyEvent, app: &mut App, popup: &mut Popu
   match key.code
     {
       KeyCode::Esc => return InputMode::Normal,
-      KeyCode::Tab => popup.onglet = popup.onglet.suivant(),
-      // `←`/`→` changent d'onglet, sauf sur Colonnes : c'est le seul écran où
-      // le curseur est horizontal, et les deux gestes s'y ressemblent trop.
-      KeyCode::Left if popup.parametres.actif != OPTION_COLONNES =>
-        {
-          popup.onglet = popup.onglet.precedent();
-        }
-      KeyCode::Right if popup.parametres.actif != OPTION_COLONNES =>
-        {
-          popup.onglet = popup.onglet.suivant();
-        }
+      // Tab et Shift+Tab changent d'onglet : c'est le dispatch central qui
+      // s'en charge, avant d'arriver ici. `←`/`→` ne servent plus qu'au
+      // curseur de « Colonnes visibles », seul écran horizontal du popup.
       KeyCode::Left => deplacer_colonne(popup, false),
       KeyCode::Right => deplacer_colonne(popup, true),
       KeyCode::Up | KeyCode::Char('k') => deplacer_option(popup, -1),
@@ -2139,7 +2166,16 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         }
                     }
                 }
-                InputMode::Popup(mut popup) => {
+                InputMode::Popup(mut popup) => 'onglet: {
+                    // Tab et Shift+Tab changent d'onglet partout, quelle que
+                    // soit la position : c'est le seul geste qui doit marcher
+                    // dans les trois onglets. La touche est consommée, sans
+                    // reacher le handler de l'onglet vers lequel elle vient
+                    // de basculer : une touche, un effet.
+                    if naviguer_onglets(&mut popup, key.code)
+                      {
+                        break 'onglet InputMode::Popup(popup);
+                      }
                     // Onglet Coûts : réglage du tarif tant qu'aucune saisie
                     // n'est en cours, sinon défilement du tableau des coûts.
                     if popup.onglet == Onglet::Couts && !popup.couts.editing {
@@ -3549,7 +3585,11 @@ fn handle_tariff_input(
     match key.code
       {
         KeyCode::Esc | KeyCode::Char('q') => return Ok(InputMode::Normal),
-        KeyCode::Up | KeyCode::Char('k') =>
+        // `←`/`→` passent d'un champ tarifaire à l'autre. `↑`/`↓` ne le font
+        // pas : le dispatch central s'en sert pour faire défiler le tableau,
+        // et une touche ne doit pas avoir deux effets. Tab et Shift+Tab
+        // changent d'onglet, comme dans les deux autres onglets.
+        KeyCode::Left =>
           {
             let next = if active_field == 0 { TARIF_CHAMPS - 1 } else { active_field - 1 };
             return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
@@ -3563,21 +3603,7 @@ fn handle_tariff_input(
               scroll_offset: base.couts.scroll_offset,
             })));
           }
-        KeyCode::Down | KeyCode::Char('j') =>
-          {
-            let next = (active_field + 1) % TARIF_CHAMPS;
-            return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
-              active_field: next,
-              editing: false,
-              input_buffer: String::new(),
-              input_offset: 0,
-              country,
-              message,
-              fetching: base.couts.fetching,
-              scroll_offset: base.couts.scroll_offset,
-            })));
-          }
-        KeyCode::Tab =>
+        KeyCode::Right =>
           {
             let next = (active_field + 1) % TARIF_CHAMPS;
             return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
@@ -3911,6 +3937,7 @@ mod tests
         SortOrder,
     };
     use clap::Parser;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{fs, path::PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -4498,4 +4525,191 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         assert!(!err.to_string().is_empty(), "l'erreur doit etre decrite");
         drop(tx);
       }
+    // --- Navigation entre onglets (Tab / Shift+Tab) ---------------------
+
+    /// `App` avec un seul projet : le handler de l'onglet Coûts refuse un
+    /// index de projet absent, il faut donc un vrai registre sous la main.
+    ///
+    /// Le répertoire est numéroté : les tests tournent en parallèle et
+    /// partageraient sinon le même registre, que chacun supprime au début.
+    fn app_avec_projet() -> crate::App
+      {
+        static COMPTEUR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COMPTEUR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = temp_dir(&format!("onglets-{n}"));
+        let projet = dir.join("projet");
+        fs::create_dir_all(&projet).unwrap();
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "version_debug": "1.0.0",
+                    "description": "",
+                    "tarif_mode": "manuel"
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        crate::App::new_light(registre, SortOrder::Modified)
+      }
+
+    /// Un popup sans projet suffit : la navigation d'onglets ne touche qu'à
+    /// l'onglet actif et à l'état de saisie.
+    fn popup_navigation() -> crate::Popup
+      {
+        crate::Popup::sans_projet(crate::Onglet::Projet, "FRA".to_string())
+      }
+
+    /// Champ tarifaire atteint après `code`, en partant de `depart`.
+    fn champ_apres(popup: &crate::Popup, code: KeyCode, depart: usize) -> usize
+      {
+        let touche = KeyEvent::new(code, KeyModifiers::NONE);
+        match crate::handle_tariff_input(
+          touche,
+          &mut app_avec_projet(),
+          popup,
+          0,
+          depart,
+          false,
+          String::new(),
+          0,
+          "FRA".to_string(),
+          None,
+          false,
+        ) {
+          Ok(crate::InputMode::Popup(p)) => p.couts.active_field,
+          _ => panic!("{code:?} doit rester dans l'onglet Coûts"),
+        }
+      }
+
+    /// Régression : Tab n'était traité que dans l'onglet Paramètres, et
+    /// Shift+Tab nulle part. Le projet ne pouvait donc pas être quitté au
+    /// clavier, alors que la barre d'onglets l'annonçait.
+    #[test]
+    fn tab_parcourt_les_trois_onglets_et_shift_tab_revient()
+      {
+        let mut popup = popup_navigation();
+        for attendu in [crate::Onglet::Couts, crate::Onglet::Parametres, crate::Onglet::Projet]
+          {
+            assert!(crate::naviguer_onglets(&mut popup, KeyCode::Tab), "Tab doit être consommé");
+            assert_eq!(popup.onglet, attendu);
+          }
+        for attendu in [crate::Onglet::Parametres, crate::Onglet::Couts, crate::Onglet::Projet]
+          {
+            assert!(
+              crate::naviguer_onglets(&mut popup, KeyCode::BackTab),
+              "Shift+Tab doit être consommé"
+            );
+            assert_eq!(popup.onglet, attendu);
+          }
+      }
+
+    /// Tab est le geste de navigation global : il doit mener au même onglet
+    /// depuis les trois onglets, y compris Paramètres où il était le seul
+    /// implémenté.
+    #[test]
+    fn tab_mene_partout_au_meme_onglet_suivant()
+      {
+        for depart in [crate::Onglet::Projet, crate::Onglet::Couts, crate::Onglet::Parametres]
+          {
+            let mut popup = popup_navigation().avec_onglet(depart);
+            assert!(crate::naviguer_onglets(&mut popup, KeyCode::Tab));
+            assert_eq!(popup.onglet, depart.suivant(), "depuis {depart:?}");
+          }
+      }
+
+    /// Changer d'onglet pendant une frappe jetterait le tampon : le champ doit
+    /// garder la main.
+    #[test]
+    fn tab_ne_change_pas_d_onglet_pendant_une_saisie()
+      {
+        let mut popup = popup_navigation();
+        popup.projet.editing = true;
+        assert!(!crate::naviguer_onglets(&mut popup, KeyCode::Tab), "saisie projet");
+        assert_eq!(popup.onglet, crate::Onglet::Projet);
+
+        let mut popup = popup_navigation().avec_onglet(crate::Onglet::Couts);
+        popup.couts.editing = true;
+        assert!(!crate::naviguer_onglets(&mut popup, KeyCode::Tab), "saisie tarif");
+        assert_eq!(popup.onglet, crate::Onglet::Couts);
+
+        let mut popup = popup_navigation().avec_onglet(crate::Onglet::Parametres);
+        popup.parametres.edition = true;
+        assert!(!crate::naviguer_onglets(&mut popup, KeyCode::Tab), "saisie pays");
+        assert_eq!(popup.onglet, crate::Onglet::Parametres);
+      }
+
+    /// Seules Tab et Shift+Tab sont consommées : les autres touches doivent
+    /// atteindre le handler de l'onglet.
+    #[test]
+    fn les_autres_touches_ne_sont_pas_consommees()
+      {
+        let mut popup = popup_navigation();
+        for code in
+          [
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Esc,
+          ]
+        {
+            assert!(!crate::naviguer_onglets(&mut popup, code), "{code:?} ne doit rien faire");
+          }
+        assert_eq!(popup.onglet, crate::Onglet::Projet);
+      }
+
+    /// Passer d'onglet ne doit rien perdre de l'onglet quitté : ni la saisie
+    /// d'un tarif, ni la position du tableau.
+    #[test]
+    fn le_changement_d_onglet_preserve_la_saisie_tarifaire()
+      {
+        let mut popup = popup_navigation().avec_onglet(crate::Onglet::Couts);
+        popup.couts.input_buffer = "42".to_string();
+        popup.couts.scroll_offset = 7;
+        assert!(crate::naviguer_onglets(&mut popup, KeyCode::Tab));
+        assert_eq!(popup.onglet, crate::Onglet::Parametres);
+        assert_eq!(popup.couts.input_buffer, "42", "la saisie ne doit pas être jetée");
+        assert_eq!(popup.couts.scroll_offset, 7, "le défilement ne doit pas être perdu");
+      }
+
+    /// Régression : `↑`/`↓` changeaient de champ tarifaire *et* faisaient
+    /// défiler le tableau, dans le même traitement de touche. Les flèches
+    /// verticales appartiennent désormais au tableau seul ; le passage de champ
+    /// se fait avec `←`/`→`.
+    #[test]
+    fn les_fleches_verticales_ne_changent_pas_de_champ_tarifaire()
+      {
+        let popup = popup_navigation().avec_onglet(crate::Onglet::Couts);
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Char('j'), KeyCode::Char('k')]
+          {
+            assert_eq!(
+              champ_apres(&popup, code, popup.couts.active_field),
+              popup.couts.active_field,
+              "{code:?} ne doit pas changer de champ tarifaire"
+            );
+          }
+      }
+
+    /// `←`/`→` cyclent les trois champs tarifaires (mode, €/h, pays).
+    #[test]
+    fn les_fleches_horizontales_cyclent_les_champs_tarifaires()
+      {
+        let popup = popup_navigation().avec_onglet(crate::Onglet::Couts);
+        let mut champ = popup.couts.active_field;
+        for attendu in [1, 2, 0]
+          {
+            champ = champ_apres(&popup, KeyCode::Right, champ);
+            assert_eq!(champ, attendu, "→ vers le champ {attendu}");
+          }
+        champ = champ_apres(&popup, KeyCode::Left, champ);
+        assert_eq!(champ, 2, "cyclique inverse");
+        assert_eq!(champ_apres(&popup, KeyCode::Left, popup.couts.active_field), 2, "depuis 0");
+      }
+
   }

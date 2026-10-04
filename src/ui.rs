@@ -1284,11 +1284,21 @@ pub(crate) fn render_popup_unifie(f: &mut Frame, size: Rect, app: &App, popup: &
       .style(Style::default().fg(Color::Cyan).bg(Color::Black));
     let zones = Layout::default()
       .direction(Direction::Vertical)
-      .constraints([Constraint::Length(1), Constraint::Min(0)])
+      .constraints([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+      ])
       .split(inner);
     f.render_widget(tabs, zones[0]);
 
     let contenu = zones[1];
+    // Pied commun aux trois onglets : la navigation d'onglets est globale, elle
+    // doit donc être annoncée une fois pour tous, pas onglet par onglet.
+    let pied = Paragraph::new(" Tab / ⇧Tab : onglets  ·  Échap : fermer ")
+      .style(Style::default().fg(Color::DarkGray))
+      .alignment(Alignment::Center);
+    f.render_widget(pied, zones[2]);
     // Projet et Coûts portent sur un projet précis : sans sélection, on le dit
     // plutôt que d'afficher les valeurs d'un autre projet, ou un vide muet.
     let projet = app.projects.get(popup.projet_idx);
@@ -1754,7 +1764,7 @@ fn render_bloc_tarif(f: &mut Frame, area: Rect, app: &App, project: &crate::Proj
     f.render_widget(paragraphe, chunks[1]);
 
     let pied = Paragraph::new(
-        " Entrée : basculer le mode / éditer  ·  r : rafraîchir la source  ·  Tab : onglets  ·  Échap : fermer ",
+        " ↑/↓ : défiler  ·  ←/→ : champ  ·  Entrée : éditer  ·  r : rafraîchir ",
     )
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Center);
@@ -2091,6 +2101,48 @@ mod tests
         let popup = crate::Popup::sans_projet(crate::Onglet::Couts, "FRA".to_string());
         let rendu = rendre_popup(&app, &popup);
         assert!(rendu.contains("Aucun projet sélectionné"), "rendu :\n{rendu}");
+      }
+
+    /// Régression B2 : l'aide affichait des touches que le code n'écoutait pas.
+    /// Le pied commun annonce la navigation d'onglets, et le pied de l'onglet
+    /// Coûts les gestes propres au tableau et aux champs.
+    #[test]
+    fn le_pied_annonce_la_navigation_d_onglets_dans_les_trois_onglets()
+      {
+        let (app, _dir) = app_de_test("projet-pied");
+        for onglet in
+          [
+            crate::Onglet::Projet,
+            crate::Onglet::Couts,
+            crate::Onglet::Parametres,
+          ]
+        {
+          let popup = popup_de_test(&app, onglet);
+          let rendu = rendre_popup(&app, &popup);
+          assert!(
+            rendu.contains("Tab / ⇧Tab : onglets"),
+            "onglet {:?} : le pied doit annoncer la navigation d'onglets :\n{rendu}",
+            onglet
+          );
+        }
+      }
+
+    /// Le pied de l'onglet Coûts ne doit plus annoncer `Tab : onglets` : Tab
+    /// change d'onglet partout, il ne cycle plus les champs tarifaires.
+    #[test]
+    fn le_pied_des_couts_annonce_le_defilement_et_les_champs()
+      {
+        let (app, _dir) = app_de_test("projet-couts-pied");
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("↑/↓ : défiler"), "le défilement doit être annoncé :\n{rendu}");
+        assert!(rendu.contains("←/→ : champ"), "les champs doivent être annoncés :\n{rendu}");
+        // L'ancien pied annonçait `Tab : onglets` en plus de la bascule de
+        // mode : il est remplacé, pas complété.
+        assert!(
+          !rendu.contains("bascule le mode"),
+          "l'ancien pied de l'onglet Coûts doit avoir disparu :\n{rendu}"
+        );
       }
 
   }
