@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
     Frame,
 };
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 use crate::{sanitize, App, InputMode, ProjectCreationState, ProjectEditState};
 
@@ -1234,48 +1234,28 @@ pub(crate) fn render_popup_unifie(f: &mut Frame, size: Rect, app: &App, popup: &
   {
     let largeur = size.width.min(100).max(40.min(size.width));
     let hauteur = size.height.saturating_sub(4).max(9.min(size.height));
-    let Some(area) = op_tui::layout::popup_rect(size, largeur, hauteur) else {
-        return;
-    };
-    // Fond opaque inclus : le menu en dessous ne doit pas transparaître.
-    let inner = op_tui::overlay::cadre_titre(f, area, || {
-        crate::sanitize(&titre_popup(app, popup))
-    }, THEME);
-
     // Barre d'onglets : c'est elle qui rend la structure visible. Sans elle,
     // rien n'indiquait que le popup en avait trois, ni lequel était actif.
     let onglets = [crate::Onglet::Projet, crate::Onglet::Couts, crate::Onglet::Parametres];
-    let libelles: Vec<String> = onglets
-      .iter()
-      .map(|o| {
-        if *o == popup.onglet {
-          format!(" ▸ {} ", o.libelle())
-        } else {
-          format!("   {} ", o.libelle())
-        }
-      })
-      .collect();
-    let tabs = Paragraph::new(Line::from(
-        libelles.into_iter().map(Span::raw).collect::<Vec<Span>>(),
-    ))
-      .style(Style::default().fg(Color::Cyan).bg(Color::Black));
-    let zones = Layout::default()
-      .direction(Direction::Vertical)
-      .constraints([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-      ])
-      .split(inner);
-    f.render_widget(tabs, zones[0]);
-
-    let contenu = zones[1];
+    let libelles: Vec<Cow<'static, str>> =
+      onglets.iter().map(|o| Cow::Borrowed(o.libelle())).collect();
+    let actif = onglets.iter().position(|o| *o == popup.onglet).unwrap_or(0);
     // Pied commun aux trois onglets : la navigation d'onglets est globale, elle
     // doit donc être annoncée une fois pour tous, pas onglet par onglet.
-    let pied = Paragraph::new(" Tab / ⇧Tab : onglets  ·  Échap : fermer ")
-      .style(Style::default().fg(Color::DarkGray))
-      .alignment(Alignment::Center);
-    f.render_widget(pied, zones[2]);
+    let Some(contenu) = op_tui::popup::Fenetre::nouveau(
+      crate::sanitize(&titre_popup(app, popup)),
+      THEME,
+    )
+    .avec_onglets(&libelles, actif)
+    .avec_pied(" Tab / ⇧Tab : onglets  ·  Échap : fermer ")
+    .style_onglets(Style::default().fg(Color::Cyan).bg(Color::Black))
+    .style_pied(Style::default().fg(Color::DarkGray))
+    .rendu(f, size, largeur, hauteur)
+    else
+      {
+        return;
+      };
+
     // Projet et Coûts portent sur un projet précis : sans sélection, on le dit
     // plutôt que d'afficher les valeurs d'un autre projet, ou un vide muet.
     let projet = app.projects.get(popup.projet_idx);
