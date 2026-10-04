@@ -9,6 +9,17 @@ use std::path::PathBuf;
 
 use crate::{sanitize, App, InputMode, ProjectCreationState, ProjectEditState};
 
+/// Thème des popups du menu : fond noir, bordure cyan.
+///
+/// Le centrage, le fond opaque et le cadre viennent d'`op_tui` : ils étaient
+/// réécrits dans chaque popup, avec des variantes qui laissaient passer le menu
+/// du dessous.
+const THEME: op_tui::theme::Popup = op_tui::theme::Popup::SOMBRE;
+
+/// Le formulaire de création et le choix de module sont des dialogues plein
+/// cadre posés sur du gris foncé, pas des popups.
+const THEME_GRIS: op_tui::theme::Popup = op_tui::theme::Popup::GRIS;
+
 pub(crate) fn ui(
     f: &mut Frame,
     app: &mut App,
@@ -633,7 +644,9 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
         InputMode::Aide { origine, .. } => crate::keymap::contextuel(origine),
         _ => Vec::new(),
       };
-    let titre = if detaillee { " Aide — tous les raccourcis " } else { " Aide " };
+    // `overlay::cadre` espace lui-même le titre : le passer déjà encadré
+    // produirait deux espaces de chaque côté.
+    let titre = if detaillee { "Aide — tous les raccourcis" } else { "Aide" };
     let pairs: Vec<(String, String)> = if detaillee
       {
         crate::keymap::complet()
@@ -660,22 +673,10 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
     // La fenêtre ne cherche plus à contenir la liste : `F10` en a plus qu'un
     // écran, et une aide tronquée sans défilement est une aide incomplète.
     let hauteur = size.height.saturating_sub(4).max(9.min(size.height)).min(40);
-    let x = size.width.saturating_sub(largeur) / 2;
-    let y = size.height.saturating_sub(hauteur) / 2;
-    let area = Rect { x, y, width: largeur, height: hauteur }.intersection(size);
-    if area.width < 8 || area.height < 5
-      {
+    let Some(area) = op_tui::layout::popup_rect(size, largeur, hauteur) else {
         return;
-      }
-    f.render_widget(Clear, area);
-
-    let bloc = Block::default()
-      .title(titre)
-      .borders(Borders::ALL)
-      .border_style(Style::default().fg(Color::Cyan))
-      .style(Style::default().bg(Color::Black));
-    let inner = bloc.inner(area);
-    f.render_widget(bloc, area);
+    };
+    let inner = op_tui::overlay::cadre(f, area, titre, THEME);
 
     let mut lignes: Vec<Line> = Vec::new();
     let mut dernier_groupe: Option<String> = None;
@@ -763,21 +764,14 @@ pub(crate) fn colonne_curseur(buffer: &str, offset_chars: usize) -> usize
 fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState)
   {
     let dialog_width = size.width.min(76);
-    let dialog_height = 15;
-    let x = (size.width.saturating_sub(dialog_width)) / 2;
-    let y = (size.height.saturating_sub(dialog_height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width: dialog_width,
-        height: dialog_height,
-      };
-    let area = area.intersection(size);
+    let Some(area) = op_tui::layout::popup_rect(size, dialog_width, 15) else {
+        return;
+    };
 
     // Fond opaque : efface la zone puis repeint tout en gris foncé
     f.render_widget(Clear, area);
 
-    let opaque = Style::default().bg(Color::DarkGray);
+    let opaque = Style::default().bg(THEME_GRIS.fond);
 
     let block = Block::default()
       .title(" Nouveau projet ")
@@ -910,7 +904,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
       };
     let cursor_x = (area.x + 1 + fields.get(active).map_or(13, |f| f.0.chars().count()) as u16 + 3
       + dans_champ as u16)
-      .min(x.saturating_add(dialog_width).saturating_sub(2));
+      .min(area.x.saturating_add(area.width).saturating_sub(2));
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
     // Menu déroulant Statut (champ 4) : popup opaque sous la ligne du champ.
@@ -1203,22 +1197,18 @@ fn render_module_dialog(
 
     let dialog_width = size.width.min(70);
     let dialog_height = (lines.len() as u16 + 2).min(size.height.saturating_sub(2));
-    let x = (size.width.saturating_sub(dialog_width)) / 2;
-    let y = (size.height.saturating_sub(dialog_height)) / 2;
-
-    let area = Rect {
-        x,
-        y,
-        width: dialog_width,
-        height: dialog_height,
+    let Some(area) = op_tui::layout::popup_rect(size, dialog_width, dialog_height) else {
+        return;
     };
-    let area = area.intersection(size);
-
+    // Ce dialogue ne faisait aucun `Clear` : il s'appuyait sur le fond du cadre
+    // pour masquer le menu. Le fond opaque explicite est équivalent, et correct
+    // même si le cadre vient à être redessiné.
+    op_tui::overlay::fond_opaque(f, area, THEME_GRIS);
     let block = Block::default()
         .title(" Module ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::DarkGray));
+        .border_style(Style::default().fg(THEME_GRIS.bordure))
+        .style(Style::default().bg(THEME_GRIS.fond));
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
@@ -1349,26 +1339,13 @@ pub(crate) fn render_popup_unifie(f: &mut Frame, size: Rect, app: &App, popup: &
   {
     let largeur = size.width.min(100).max(40.min(size.width));
     let hauteur = size.height.saturating_sub(4).max(9.min(size.height));
-    let x = (size.width.saturating_sub(largeur)) / 2;
-    let y = (size.height.saturating_sub(hauteur)) / 2;
-    let area = Rect { x, y, width: largeur, height: hauteur }.intersection(size);
-    if area.width < 8 || area.height < 5
-      {
+    let Some(area) = op_tui::layout::popup_rect(size, largeur, hauteur) else {
         return;
-      }
-
-    // Fond opaque : efface la zone puis repeint, pour ne pas laisser transparaître
-    // le menu en dessous.
-    f.render_widget(Clear, area);
-    f.render_widget(Block::default().style(Style::default().bg(Color::Black)), area);
-
-    let bloc = Block::default()
-      .title(format!(" {} ", crate::sanitize(&titre_popup(app, popup))))
-      .borders(Borders::ALL)
-      .border_style(Style::default().fg(Color::Cyan))
-      .style(Style::default().bg(Color::Black));
-    let inner = bloc.inner(area);
-    f.render_widget(bloc, area);
+    };
+    // Fond opaque inclus : le menu en dessous ne doit pas transparaître.
+    let inner = op_tui::overlay::cadre_titre(f, area, || {
+        crate::sanitize(&titre_popup(app, popup))
+    }, THEME);
 
     // Barre d'onglets : c'est elle qui rend la structure visible. Sans elle,
     // rien n'indiquait que le popup en avait trois, ni lequel était actif.
