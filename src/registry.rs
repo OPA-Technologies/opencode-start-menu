@@ -1586,12 +1586,6 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-pub(crate) fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
-    let web = load_web_cache(path);
-    let prefs = load_preferences(path);
-    save_registry_full(path, projects, &web, &prefs)
-}
-
 /// Charge les préférences, ou les valeurs par défaut si le registre est absent,
 /// illisible ou sans bloc `preferences`.
 ///
@@ -2066,12 +2060,16 @@ pub(crate) fn compute_source_hash(dir: &Path) -> String {
 #[cfg(test)]
 mod tests
   {
-    use std::{collections::HashMap, fs, path::PathBuf};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+    };
     use crate::registry::tarif_valide;
 
     use super::{
-        default_tarif_mode, default_web_country, load_preferences, load_registry, save_preferences,
-        save_registry, save_registry_full, Preferences, TarifPoint, Tri, validate_status,
+        default_tarif_mode, default_web_country, load_preferences, load_registry, load_web_cache,
+        save_preferences, save_registry_full, Preferences, Result, TarifPoint, Tri, validate_status,
         validate_version, ProjectEntry, STATUSES, WebCache,
     };
 
@@ -2081,6 +2079,18 @@ mod tests
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Écrit un registre en ne connaissant que les projets.
+    ///
+    /// Raccourci des tests : il relit le cache et les préférences depuis le
+    /// fichier, qu'un test n'a pas forcément en main. Le programme, lui, passe
+    /// toujours l'état en mémoire à `save_registry_full` — passer par une
+    /// relecture du disque n'y serait pas équivalent.
+    fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
+        let web = load_web_cache(path);
+        let prefs = load_preferences(path);
+        save_registry_full(path, projects, &web, &prefs)
     }
 
     /// Les dossiers de sauvegarde placés sous `src/` ne doivent pas changer
