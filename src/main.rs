@@ -374,17 +374,11 @@ fn variant_label(version: &str, status: &str) -> String {
 // --- Édition de texte insensible aux octets UTF-8 : l'offset est un index
 // --- de caractères, converti en octets uniquement pour insert/remove.
 
-fn byte_index_for_char(s: &str, char_idx: usize) -> usize
-  {
-    s.char_indices()
-      .nth(char_idx)
-      .map(|(i, _)| i)
-      .unwrap_or(s.len())
-  }
+
 
 fn insert_char_at(s: &mut String, c: char, char_idx: usize)
   {
-    let byte = byte_index_for_char(s, char_idx);
+    let byte = op_tui::field::octet_pour_caractere(s, char_idx);
     if byte > s.len() {
         return;
     }
@@ -396,7 +390,7 @@ fn insert_char_at(s: &mut String, c: char, char_idx: usize)
 
 fn delete_char_at(s: &mut String, char_idx: usize)
   {
-    let byte = byte_index_for_char(s, char_idx);
+    let byte = op_tui::field::octet_pour_caractere(s, char_idx);
     if byte >= s.len() || s.is_empty() {
         return;
     }
@@ -417,7 +411,7 @@ fn version_mask_insert(buffer: &str, char_idx: usize, c: char) -> Option<(String
   {
     if c.is_ascii_digit()
       {
-        let byte = byte_index_for_char(buffer, char_idx);
+        let byte = op_tui::field::octet_pour_caractere(buffer, char_idx);
         let seg_digits = buffer[..byte]
           .rsplit('.')
           .next()
@@ -444,8 +438,8 @@ fn version_mask_insert(buffer: &str, char_idx: usize, c: char) -> Option<(String
           {
             return None;
           }
-        let byte = byte_index_for_char(buffer, char_idx);
-        let prev_byte = byte_index_for_char(buffer, char_idx - 1);
+        let byte = op_tui::field::octet_pour_caractere(buffer, char_idx);
+        let prev_byte = op_tui::field::octet_pour_caractere(buffer, char_idx - 1);
         let prev = buffer[prev_byte..byte].chars().next().unwrap();
         if prev.is_ascii_digit()
           {
@@ -4271,16 +4265,6 @@ mod tests
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn byte_index_for_char_maps_utf8()
-      {
-        let s = "café";
-        assert_eq!(super::byte_index_for_char(s, 0), 0);
-        assert_eq!(super::byte_index_for_char(s, 2), 2);
-        assert_eq!(super::byte_index_for_char(s, 3), 3);
-        assert_eq!(super::byte_index_for_char(s, 4), 5); // fin (é = 2 octets)
-        assert_eq!(super::byte_index_for_char(s, 99), 5);
-      }
 
     #[test]
     fn insert_char_at_respects_utf8_boundaries()

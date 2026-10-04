@@ -724,42 +724,7 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
     f.render_widget(pied, zones[1]);
   }
 
-/// Champ de formulaire : texte affiché (ou « (vide) » si aucun contenu).
-/// Placeholder affiché quand un champ n'a rien à montrer.
-const VIDE: &str = "(vide)";
-
-/// Valeur réellement affichée pour un champ de formulaire.
-///
-/// La frappe en cours (`buffer`) prime sur la valeur validée (`valide`) : c'est
-/// la règle qui manquait au formulaire de création, où seule la valeur
-/// validée à Entrée était peinte. Le texte tapé atterrissait dans `buffer`,
-/// donc rien ne bougeait à l'écran avant validation — la saisie était
-/// aveugle, alors que le curseur, lui, suivait bien `input_offset`.
-///
-/// L'onglet Projet appliquait déjà cette règle à la main ; elle est factorisée
-/// ici pour que les deux dialogues ne puissent plus diverger.
-pub(crate) fn valeur_affiche(valide: &str, buffer: &str, en_saisie: bool, placeholder: &str) -> String
-  {
-    let source = if en_saisie { buffer } else { valide };
-    if source.trim().is_empty() {
-        placeholder.to_string()
-    } else {
-        source.to_string()
-    }
-}
-
-/// Colonne d'affichage du curseur dans un champ : largeur *rendue* du préfixe
-/// saisi, pas son nombre de caractères. Un offset de caractères utilisé tel
-/// quel comme colonne décale le curseur de droite sur tout caractère large
-/// (`é`, `→`, caractères CJK…).
-pub(crate) fn colonne_curseur(buffer: &str, offset_chars: usize) -> usize
-  {
-    let octets = crate::byte_index_for_char(buffer, offset_chars);
-    let prefixe = buffer.get(..octets).unwrap_or(buffer);
-    // `Line::width` mesure la largeur d'affichage réelle (une colonne par
-    // cellule), contrairement à `chars().count()`.
-    Line::from(prefixe).width()
-  }
+use op_tui::field::{colonne_curseur, valeur_affiche, VIDE};
 
 fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState)
   {
@@ -1962,21 +1927,7 @@ mod tests
         assert!(rendu.contains("Mon Projet"), "le nom validé a disparu :\n{rendu}");
       }
 
-    /// Régression B6 : le curseur doit avancer en colonnes affichées, pas en
-    /// caractères. Un caractère large occupe deux colonnes ; le compter pour
-    /// un laissait une colonne plus tôt que le texte réellement peint.
-    #[test]
-    fn le_curseur_suit_la_largeur_affichee()
-      {
-        assert_eq!(colonne_curseur("", 0), 0);
-        assert_eq!(colonne_curseur("abc", 3), 3);
-        // Un accent tient sur une colonne : comme le caractère, aucune
-        // différence — c'est le cas de référence.
-        assert_eq!(colonne_curseur("é", 1), 1);
-        // Caractère large : deux colonnes pour un seul caractère.
-        assert_eq!(colonne_curseur("あ", 1), 2);
-        assert_eq!(colonne_curseur("aあ", 2), 3);
-      }
+
 
     /// Le curseur du formulaire suit la même règle que le helper.
     ///
@@ -1994,25 +1945,7 @@ mod tests
         );
       }
 
-/// Règle centrale, testée isolément : la frappe prime sur la valeur
-    /// validée, et le placeholder ne sort que si les deux sont vides.
-    #[test]
-    fn la_frappe_prime_sur_la_valeur_validee()
-      {
-        // En saisie : le buffer gagne.
-        assert_eq!(valeur_affiche("ancien", "nouveau", true, VIDE), "nouveau");
-        // Hors saisie : la valeur validée reste.
-        assert_eq!(valeur_affiche("ancien", "nouveau", false, VIDE), "ancien");
-        // En saisie, buffer vidé : le champ est en cours d'effacement, on
-        // montre le placeholder — pas l'ancienne valeur, qui ferait croire
-        // que le texte est encore là alors qu'Entrée l'écraserait par vide.
-        assert_eq!(valeur_affiche("ancien", "", true, VIDE), VIDE);
-        // Rien du tout : placeholder.
-        assert_eq!(valeur_affiche("", "", true, VIDE), VIDE);
-        assert_eq!(valeur_affiche("", "", true, "(aucun)"), "(aucun)");
-        // Un contenu fait d'espaces reste considéré vide.
-        assert_eq!(valeur_affiche("   ", "", false, VIDE), VIDE);
-      }
+
 
     /// Le champ Statut n'affiche `input_buffer` qu'en texte libre : sinon la
     /// frappe alimente le filtre du menu déroulant, et l'afficher ici
