@@ -360,7 +360,13 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             or_dash(&p.total_cost),
             or_dash(&p.session_count),
             or_dash(&p.last_session_tokens),
-            or_dash(&p.last_session_cost),
+            // « 4,20 € · 4,57 $ » quand la devise est convertible, le seul
+            // montant facturé sinon. La conversion ne fait que s'ajouter : elle
+            // disparaît si aucun taux n'est connu.
+            crate::cout_session_double(
+                &or_dash(&p.last_session_cost),
+                &p.last_session_cost_local,
+            ),
             or_dash(&p.last_model),
             or_dash(&p.last_agent),
             or_dash(&p.last_time_created),
@@ -413,27 +419,28 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         ])
     };
 
-    let mut text: Vec<Line> = Vec::new();
-    // Groupe 1
-    text.push(Line::from(vec![
-        Span::styled("Nom          : ", Style::default().fg(Color::DarkGray)),
-        Span::raw(sanitize(&name)),
-    ]));
-    text.push(Line::from(vec![
-        Span::styled("ID           : ", Style::default().fg(Color::DarkGray)),
-        Span::raw(sanitize(&id)),
-    ]));
-    text.push(Line::from(vec![
-        Span::styled("Chemin       : ", Style::default().fg(Color::DarkGray)),
-        Span::raw(sanitize(&path)),
-    ]));
-    text.push(sep());
-    // Groupe 2
-    text.push(Line::from(vec![
-        Span::styled("Description  : ", Style::default().fg(Color::DarkGray)),
-        Span::raw(sanitize(&desc)),
-    ]));
-    text.push(sep());
+    let text: Vec<Line> = vec![
+        // Groupe 1
+        Line::from(vec![
+            Span::styled("Nom          : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&name)),
+        ]),
+        Line::from(vec![
+            Span::styled("ID           : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&id)),
+        ]),
+        Line::from(vec![
+            Span::styled("Chemin       : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&path)),
+        ]),
+        sep(),
+        // Groupe 2
+        Line::from(vec![
+            Span::styled("Description  : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&desc)),
+        ]),
+        sep(),
+    ];
 
     let block = Block::default()
         .title(format!(" Détails — {} ", sanitize(&name)))
@@ -735,13 +742,22 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
           ]));
       }
 
-    // Ligne de confirmation finale o/N (toujours visible, actif si active_field == 6)
+    // Ligne de confirmation finale o/N (toujours visible, actif si active_field == 6).
+    // L'indication passe en gras quand elle est active : elle cesse d'être un
+    // simple rappel et devient l'action que la touche Entrée va déclencher.
     let confirm_lbl = Span::styled("Ouvrir ?     ", lbl_style(6));
-    let confirm_hint: &str = if active == 6 { "o/N" } else { "o/N" };
+    let confirm_style = if active == 6
+      {
+        Style::default().add_modifier(Modifier::BOLD)
+      }
+    else
+      {
+        Style::default()
+      };
     lines.push(Line::from(vec![
         confirm_lbl,
         Span::styled(" : ", Style::default().fg(Color::DarkGray)),
-        Span::raw(confirm_hint),
+        Span::styled("o/N", confirm_style),
       ]));
 
     // Confirmation d'un nouveau statut (hors liste du registre)
@@ -1362,18 +1378,29 @@ fn render_tableau_couts(
         let last_model = if project.last_model.is_empty() { "—" } else { &project.last_model };
         let last_time = if project.last_time_created.is_empty() { "—" } else { &project.last_time_created };
 
-        // Extract currency from last_session_cost
+        // Devise de la session, déduite du montant d'origine. Cette lecture ne
+        // doit jamais voir un montant converti : « 4,20 € · 4,57 $ » contient
+        // les deux symboles, et le premier test rencontré gagnerait.
         let currency = if project.last_session_cost.contains('$') { "$ (USD)" }
         else if project.last_session_cost.contains('€') { "€ (EUR)" }
         else if project.last_session_cost.contains('£') { "£ (GBP)" }
         else if project.last_session_cost.contains('¥') { "¥ (JPY)" }
         else { "—" };
 
+        // Montant équivalent en devise locale. Vide quand la devise est
+        // inconnue ou déjà locale : la colonne affiche alors « — », comme
+        // avant, plutôt qu'un montant redondant.
+        let last_session_cost_local = if project.last_session_cost_local.is_empty() {
+            "—".to_string()
+        } else {
+            project.last_session_cost_local.clone()
+        };
+
         rows.push(Row::new(vec![
             Cell::from(sanitize(last_time)),
             Cell::from(sanitize(last_model)),
             Cell::from(sanitize(&last_session_cost)),
-            Cell::from("—"),
+            Cell::from(sanitize(&last_session_cost_local)),
             Cell::from(sanitize(currency)),
         ]));
 
@@ -1784,13 +1811,38 @@ mod tests
           .join("\n")
       }
 
-    /// Rend le formulaire de création dans un terminal de test.
-    fn rendre_creation(state: &ProjectCreationState) -> (String, (u16, u16))
+    /// Rendu du formulaire dans un buffer. C'est le seul niveau où le style
+    /// d'une cellule reste observable : `texte()` ne garde que les symboles et
+    /// perdrait la mise en valeur de la ligne o/N.
+    fn creation_dans_buffer(state: &ProjectCreationState) -> (Buffer, (u16, u16))
       {
         let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
         term.draw(|f| render_creation_dialog(f, f.area(), state)).unwrap();
         let curseur = term.get_cursor_position().unwrap();
-        (texte(term.backend().buffer()), (curseur.x, curseur.y))
+        (term.backend().buffer().clone(), (curseur.x, curseur.y))
+      }
+
+    /// Style appliqué à la première cellule portant `cherche`, ou `None` si le
+    /// texte est absent du rendu.
+    fn style_de(buf: &Buffer, cherche: &str) -> Option<Modifier>
+      {
+        let rendu = texte(buf);
+        let mut lignes = rendu.lines();
+        for y in 0..buf.area.height
+          {
+            if let Some(x) = lignes.next()?.find(cherche)
+              {
+                return Some(buf[(x as u16, y)].modifier);
+              }
+          }
+        None
+      }
+
+    /// Rend le formulaire de création dans un terminal de test.
+    fn rendre_creation(state: &ProjectCreationState) -> (String, (u16, u16))
+      {
+        let (buf, curseur) = creation_dans_buffer(state);
+        (texte(&buf), curseur)
       }
 
     /// Formulaire prêt à saisir : champ Nom actif, rien de validé encore.
@@ -1872,6 +1924,37 @@ mod tests
         assert!(rendu.contains("Study"), "le statut choisi doit rester visible :\n{rendu}");
         assert!(!rendu.contains("filtre"), "le filtre ne doit pas voler la ligne du statut :\n{rendu}");
       }
+
+    /// La ligne de confirmation finale doit se distinguer du simple rappel
+    /// qu'elle est la plupart du temps : le champ 6 n'est atteignable que par
+    /// Entrée sur Version, donc la frappe ne donne aucun autre indice que le
+    /// gras.
+    #[test]
+    fn l_indication_de_confirmation_est_en_gras_quand_elle_est_active()
+      {
+        let mut state = saisie_en_cours("", 0);
+        state.active_field = 6;
+        let (buf, _) = creation_dans_buffer(&state);
+        let modificateurs = style_de(&buf, "o/N")
+          .unwrap_or_else(|| panic!("l'indication o/N doit rester affichée :\n{}", texte(&buf)));
+        assert!(
+          modificateurs.contains(Modifier::BOLD),
+          "o/N doit être en gras quand le champ de confirmation est actif"
+        );
+      }
+
+    #[test]
+    fn l_indication_de_confirmation_est_simple_tant_qu_elle_est_inactive()
+      {
+        let (buf, _) = creation_dans_buffer(&saisie_en_cours("", 0));
+        let modificateurs = style_de(&buf, "o/N")
+          .unwrap_or_else(|| panic!("l'indication o/N doit rester affichée :\n{}", texte(&buf)));
+        assert!(
+          !modificateurs.contains(Modifier::BOLD),
+          "o/N ne doit pas être en gras tant que la confirmation n'est pas active"
+        );
+      }
+
     // --- Popup unifié -------------------------------------------------
 
     /// Registre minimal avec un projet, chargé sans rescan ni réseau.
@@ -1909,9 +1992,122 @@ mod tests
 
     fn rendre_popup(app: &crate::App, popup: &crate::Popup) -> String
       {
-        let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        rendre_popup_en(app, popup, 110, 34)
+      }
+
+    /// Rendu du popup dans une taille imposée : c'est la largeur qui décide
+    /// d'une troncature de colonne.
+    fn rendre_popup_en(app: &crate::App, popup: &crate::Popup, largeur: u16, hauteur: u16) -> String
+      {
+        let mut term = Terminal::new(TestBackend::new(largeur, hauteur)).unwrap();
         term.draw(|f| render_popup_unifie(f, f.area(), app, popup)).unwrap();
         texte(term.backend().buffer())
+      }
+
+    /// Un projet dont la dernière session a un coût dans une devise convertible.
+    ///
+    /// La sélection est forcée sur le projet : le panneau Détails ne lit que le
+    /// projet sélectionné, et une application fraîchement chargée n'en a pas.
+    fn projet_avec_cout_converti(app: &mut crate::App)
+      {
+        app.filtered = (0..app.projects.len()).collect();
+        app.list_state.select(Some(0));
+        let p = &mut app.projects[0];
+        p.total_cost = "12,00 €".to_string();
+        p.session_count = "3".to_string();
+        p.last_session_cost = "4,57 $".to_string();
+        p.last_session_cost_local = "4,20 €".to_string();
+        p.last_model = "claude".to_string();
+        p.last_time_created = "01/10/2026 12:00".to_string();
+      }
+
+    /// L'onglet Coûts a une colonne « Converti », vide jusqu'ici. Elle doit
+    /// porter l'équivalent en devise locale, à côté du montant facturé.
+    #[test]
+    fn la_colonne_converti_porte_le_montant_local()
+      {
+        let (mut app, _dir) = app_de_test("projet-converti");
+        projet_avec_cout_converti(&mut app);
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("Converti"), "la colonne doit rester là :\n{rendu}");
+        assert!(
+          rendu.contains("4,57 $"),
+          "le montant d'origine doit rester affiché :\n{rendu}"
+        );
+        assert!(
+          rendu.contains("4,20 €"),
+          "le montant converti doit remplir la colonne « Converti » :\n{rendu}"
+        );
+      }
+
+    /// Régression : la colonne « Devise » déduit la devise en cherchant un
+    /// symbole dans le montant d'origine. Si elle recevait un montant combiné,
+    /// « 4,20 € · 4,57 $ » porterait les deux symboles et le premier test
+    /// rencontré gagnerait — la ligne serait annoncée en USD alors que son
+    /// montant local est en euros.
+    #[test]
+    fn la_colonne_devise_decrit_la_devise_facturee()
+      {
+        let (mut app, _dir) = app_de_test("projet-devise");
+        projet_avec_cout_converti(&mut app);
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(
+          rendu.contains("$ (USD)"),
+          "la devise facturée est le dollar, même convertie en euros :\n{rendu}"
+        );
+        assert!(
+          !rendu.contains("€ (EUR)"),
+          "la devise locale ne doit pas remplacer la devise facturée :\n{rendu}"
+        );
+      }
+
+    /// Sans taux connu, la colonne « Converti » reste vide et la ligne porte
+    /// « — » comme avant le changement.
+    #[test]
+    fn sans_taux_la_colonne_converti_reste_vide()
+      {
+        let (mut app, _dir) = app_de_test("projet-sans-taux");
+        projet_avec_cout_converti(&mut app);
+        app.projects[0].last_session_cost_local = String::new();
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("4,57 $"), "le montant d'origine reste :\n{rendu}");
+        assert!(
+          !rendu.contains("4,20 €"),
+          "rien ne doit être inventé sans taux :\n{rendu}"
+        );
+      }
+
+    /// La vue principale, rendue dans une taille imposée : c'est la largeur
+    /// qui décide d'une troncature de colonne.
+    fn rendre_vue_en(app: &mut crate::App, largeur: u16, hauteur: u16) -> String
+      {
+        let mut term = Terminal::new(TestBackend::new(largeur, hauteur)).unwrap();
+        let mode = crate::InputMode::Normal;
+        term.draw(|f| ui(f, app, &mode, &crate::ProjectCreationState::default())).unwrap();
+        texte(term.backend().buffer())
+      }
+
+    /// Les deux montants tiennent dans la colonne « Coût » du panneau
+    /// Détails, y compris quand la fenêtre rétrécit. C'est une colonne de
+    /// 35 % d'un panneau lui-même à 65 % de la largeur : la place manque
+    /// vite, et un montant tronqué au milieu d'un séparateur se lit comme une
+    /// erreur d'affichage.
+    #[test]
+    fn les_deux_montants_tiennent_en_page_etroite()
+      {
+        let (mut app, _dir) = app_de_test("projet-etroit");
+        projet_avec_cout_converti(&mut app);
+        for largeur in [80u16, 100, 120]
+          {
+            let rendu = rendre_vue_en(&mut app, largeur, 34);
+            assert!(
+              rendu.contains("4,20 €") && rendu.contains("4,57 $"),
+              "les deux montants doivent rester lisibles en {largeur} colonnes :\n{rendu}"
+            );
+          }
       }
 
     /// Régression B5 : `c` n'affichait rien, faute de rendu pour l'onglet Coûts.

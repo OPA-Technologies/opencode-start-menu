@@ -1,3 +1,10 @@
+// La propriété « zéro warning » est vérifiée par les builds eux-mêmes : deux
+// affectations mortes et un popup mal réaligné ont dormi ici parce que rien ne
+// les signalait. `clippy::all` reste hors du déni, son contenu évolue avec les
+// versions de clippy : ce sont les diagnostics de rustc qui bloquent, pas ceux
+// d'un outil annexe.
+#![deny(warnings)]
+
 use anyhow::Result;
 use chrono::TimeZone;
 use clap::{Parser, ValueEnum};
@@ -117,9 +124,10 @@ enum LaunchMode {
 }
 
 /// Onglet du popup unifié.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) enum Onglet {
     /// Réglages du projet sélectionné (version, statut, description).
+    #[default]
     Projet,
     /// Valorisation et coûts, avec la synthèse des deux.
     Couts,
@@ -152,12 +160,6 @@ impl Onglet {
             Onglet::Couts => "Coûts",
             Onglet::Parametres => "Paramètres",
         }
-    }
-}
-
-impl Default for Onglet {
-    fn default() -> Self {
-        Onglet::Projet
     }
 }
 
@@ -248,6 +250,42 @@ impl Popup {
     pub(crate) fn avec_onglet(&self, onglet: Onglet) -> Popup {
         Popup { onglet, ..self.clone() }
     }
+
+    /// Même popup, projet affiché remplacé.
+    ///
+    /// `projet_idx` est un index, pas une référence : tout re-tri ou rescan de
+    /// `app.projects` le rend caduc. Les handlers qui déclenchent un rescan
+    /// doivent donc réaligner le popup via ce builder — sinon le titre et
+    /// l'onglet Coûts décrivent un autre projet que l'onglet Projet.
+    pub(crate) fn avec_projet_idx(&self, projet_idx: usize) -> Popup {
+        Popup { projet_idx, ..self.clone() }
+    }
+}
+
+/// Réaligne `popup.projet_idx` sur le projet d'identifiant `id`.
+///
+/// `projet_idx` est un index, pas une référence. L'appelant lit l'identifiant
+/// correspondant **avant** de re-trier `app.projects`, puis cette fonction rend
+/// au popup l'index qu'occupe le projet identifié après le re-tri. L'ordre des
+/// deux opérations est essentiel : lire l'identifiant après le tri relirait un
+/// index déjà caduc, et la correction serait sans effet.
+///
+/// Un identifiant absent — projet supprimé, ou liste vidée — laisse l'index
+/// inchangé : l'affichage rend alors le projet absent plutôt qu'un autre projet
+/// au hasard.
+fn popup_aligne(app: &App, popup: &Popup, id: Option<&str>) -> Popup {
+  match id.and_then(|id| app.projects.iter().position(|p| p.id == id)) {
+    Some(nouveau) => popup.avec_projet_idx(nouveau),
+    None => popup.clone(),
+  }
+}
+
+/// Identifiant du projet que désigne `projet_idx`.
+///
+/// À appeler avant tout re-tri ou rescan : c'est la seule valeur stable d'un
+/// index.
+fn id_a_l_index(app: &App, projet_idx: usize) -> Option<String> {
+  app.projects.get(projet_idx).map(|p| p.id.clone())
 }
 
 #[derive(Clone)]
@@ -1044,6 +1082,28 @@ fn cout_affiche(cout: f64, tokens: u64, devise: &str) -> String {
   }
 }
 
+/// La devise de la session est-elle déjà la devise locale ?
+///
+/// Une session payée en euros n'a pas d'équivalent à afficher : la colonne
+/// « Converti » resterait vide et la cellule combinée se répéterait deux fois.
+fn devise_est_locale(devise: &str) -> bool {
+  devise.eq_ignore_ascii_case(LOCAL_CURRENCY)
+}
+
+/// Montant d'une session « 4,20 € · 4,57 $ » : l'équivalent local d'abord,
+/// pour qu'il soit en tête à l'œil, puis le montant réellement facturé.
+///
+/// `local` vide (aucun taux connu, ou coût non communiqué) retombe sur le seul
+/// montant d'origine : mieux vaut une valeur qui existe qu'une conversion qui
+/// n'existe pas. Un espace fine sépare les deux montants.
+fn cout_session_double(orig: &str, local: &str) -> String {
+  if local.is_empty() || local == "—" {
+    orig.to_string()
+  } else {
+    format!("{local}\u{2009}·\u{2009}{orig}")
+  }
+}
+
 fn format_datetime(ts: i64) -> String {
     // opencode stocke time_created en millisecondes ; un timestamp en secondes
     // reste en dessous de 10^10 jusqu'en 2286, un ms est > 10^12.
@@ -1368,7 +1428,7 @@ where
     'attente: while issue.is_none()
       {
         state.tick();
-        if let Err(e) = terminal.draw(|f| startup::render(f, &state))
+        if let Err(e) = terminal.draw(|f| startup::render(f, state))
           {
             issue = Some(Err(e.into()));
             break;
@@ -1639,11 +1699,13 @@ fn main() -> Result<()> {
     // fait que `--new` seul arrive ici avec une chaîne vide.
     let mode_initial = match cli.new.as_deref() {
       Some(nom) => {
-        let mut state = ProjectCreationState::default();
-        state.name = nom.to_string();
-        // Le nom est le champ 1 : c'est lui que le curseur doit viser.
-        state.active_field = if nom.is_empty() { 0 } else { 1 };
-        state.rewrite_mode = true;
+        let mut state = ProjectCreationState {
+          name: nom.to_string(),
+          // Le nom est le champ 1 : c'est lui que le curseur doit viser.
+          active_field: if nom.is_empty() { 0 } else { 1 },
+          rewrite_mode: true,
+          ..ProjectCreationState::default()
+        };
         load_creation_field(&mut state);
         InputMode::CreatingProject(state)
       }
@@ -1692,7 +1754,7 @@ fn open_terminal() -> Result<Term>
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     if let Err(e) = terminal.clear()
       {
-        let _ = close_terminal(&mut terminal);
+        close_terminal(&mut terminal);
         return Err(e.into());
       }
     Ok(terminal)
@@ -2026,16 +2088,11 @@ fn appliquer_tri(app: &mut App, popup: &mut Popup)
       };
     // `projet_idx` est un index : le re-tri le rend caduc, et les onglets
     // Projet puis Coûts ouvriraient un autre projet que celui demandé.
-    let id = app.projects.get(popup.projet_idx).map(|p| p.id.clone());
+    // L'identifiant est capturé **avant** le tri, c'est lui qui est stable.
+    let id = id_a_l_index(app, popup.projet_idx);
     app.sort_order = ordre;
     sort_projects(&mut app.projects, ordre);
-    if let Some(id) = id
-      {
-        if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
-          {
-            popup.projet_idx = nouveau;
-          }
-      }
+    *popup = popup_aligne(app, popup, id.as_deref());
     refresh_project_selection(app);
   }
 
@@ -2517,6 +2574,22 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
               {
                 entry.last_session_tokens = format_number(ls.tokens);
                 entry.last_session_cost = cout_affiche(ls.cost, ls.tokens, &ls.currency);
+                // Montant équivalent en devise locale, pour la colonne
+                // « Converti » et les totaux. Il manque tant qu'aucun taux n'est
+                // connu pour cette devise, et il ne vaut pas « 0,00 € » quand le
+                // fournisseur ne publie aucun tarif — les deux cas sont traités
+                // par `montant_local`, qui renvoie `None` dans les deux.
+                entry.last_session_cost_local =
+                  match registry::montant_local(
+                    ls.cost,
+                    &ls.currency,
+                    ls.exchange_rate,
+                    ls.cost_local,
+                  ) {
+                    Some(local) if !devise_est_locale(&ls.currency) =>
+                      format_currency(local, LOCAL_CURRENCY),
+                    _ => String::new(),
+                  };
                 entry.last_model = ls.model.clone();
                 entry.last_agent = ls.agent.clone();
                 entry.last_time_created = format_datetime(ls.time_created);
@@ -2547,6 +2620,7 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                 // Aucune session rattachée au projet : rien à afficher, pas un
                 // montant à zéro.
                 entry.last_session_cost = "—".to_string();
+                entry.last_session_cost_local = String::new();
                 entry.last_model = String::new();
                 entry.last_agent = String::new();
                 entry.last_time_created = String::new();
@@ -2584,6 +2658,7 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
             entry.session_count = String::new();
             entry.last_session_tokens = String::new();
             entry.last_session_cost = String::new();
+            entry.last_session_cost_local = String::new();
             entry.last_model = String::new();
             entry.last_agent = String::new();
             entry.last_time_created = String::new();
@@ -2654,26 +2729,26 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
         // Release rattrapage : si target/release reconstruit
         let t_release = registry::variant_modified_time(&entry.path, "release")
           .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
-        if let Some(t) = t_release {
-            if t > entry.last_compile_release_secs {
-                entry.last_compile_release_secs = t;
-                // Rattrapage : la Release reconstruite reprend la version et le
-                // statut du code courant (variante Debug élue / manifeste).
-                let v = if entry.version_debug.is_empty()
-                  {
-                    entry.version.clone()
-                  }
-                else
-                  {
-                    entry.version_debug.clone()
-                  };
-                if !v.is_empty()
-                  {
-                    entry.version_release = v;
-                    entry.status_release = entry.status_debug.clone();
-                  }
-                written = true;
+        if let Some(t) = t_release
+          && t > entry.last_compile_release_secs
+        {
+            entry.last_compile_release_secs = t;
+            // Rattrapage : la Release reconstruite reprend la version et le
+            // statut du code courant (variante Debug élue / manifeste).
+            let v = if entry.version_debug.is_empty()
+              {
+                entry.version.clone()
               }
+            else
+              {
+                entry.version_debug.clone()
+              };
+            if !v.is_empty()
+              {
+                entry.version_release = v;
+                entry.status_release = entry.status_debug.clone();
+              }
+            written = true;
           }
         t_autopatch += debut.elapsed();
         if signature_persistee(entry) != avant
@@ -3197,6 +3272,7 @@ fn handle_creation_input(
                         session_count: String::new(),
                         last_session_tokens: String::new(),
                         last_session_cost: String::new(),
+                        last_session_cost_local: String::new(),
                         last_agent: String::new(),
                         last_time_created: String::new(),
                         last_session_context_pct: String::new(),
@@ -3387,14 +3463,11 @@ fn commit_edit_field(state: &mut ProjectEditState) {
                 false
             }
         }
-        2 => {
-            if !value.is_empty() {
-                state.pending_description = value;
-                true
-            } else {
-                false
-            }
+        2 if !value.is_empty() => {
+            state.pending_description = value;
+            true
         }
+        2 => false,
         _ => false,
     };
     if ok {
@@ -3463,7 +3536,7 @@ fn handle_tariff_input(
   key: event::KeyEvent,
   app: &mut App,
   base: &Popup,
-  mut project_idx: usize,
+  project_idx: usize,
   active_field: usize,
   editing: bool,
   mut input_buffer: String,
@@ -3473,21 +3546,29 @@ fn handle_tariff_input(
   _fetching: bool,
 ) -> Result<InputMode>
    {
+    // Copie modifiable du popup reçu. Les deux sites qui déclenchent un rescan
+    // doivent réaligner son `projet_idx`, sans muter l'état du dispatcheur.
+    //
+    // Elle est déclarée *avant* la macro et utilisée sous le nom `popup_base` :
+    // `macro_rules!` résout ses identifiants libres sur le site de définition,
+    // donc un simple masquage de `base` resterait invisible depuis `popup!`.
+    let mut popup_base = base.clone();
+
     // Reconstruit l'onglet Coûts à partir des variables locales du corps, puis
     // le rend dans le popup reçu : les deux autres onglets gardent leur état.
     macro_rules! popup
       {
         ($editing:expr, $buffer:expr, $offset:expr, $msg:expr) =>
           {
-            InputMode::Popup(base.avec_couts(EtatCouts {
+            InputMode::Popup(popup_base.avec_couts(EtatCouts {
               active_field,
               editing: $editing,
               input_buffer: $buffer,
               input_offset: $offset,
               country,
               message: $msg,
-              fetching: base.couts.fetching,
-              scroll_offset: base.couts.scroll_offset,
+              fetching: popup_base.couts.fetching,
+              scroll_offset: popup_base.couts.scroll_offset,
             }))
           };
       }
@@ -3506,10 +3587,7 @@ fn handle_tariff_input(
             KeyCode::Esc => return Ok(popup!(false, String::new(), 0, message)),
             KeyCode::Left =>
               {
-                if input_offset > 0
-                  {
-                    input_offset -= 1;
-                  }
+                input_offset = input_offset.saturating_sub(1);
                 return Ok(popup!(true, input_buffer, input_offset, message));
               }
             KeyCode::Right =>
@@ -3575,14 +3653,11 @@ fn handle_tariff_input(
                         app.projects[project_idx].tarif_mode = "manuel".to_string();
                         // Le changement de tarif doit être persisté et la
                         // valorisation recalculée immédiatement. Le rescan
-                        // peut re-trier la liste : on retrouve l'index du
-                        // projet par son identifiant, qui est stable.
-                        let id = app.projects[project_idx].id.clone();
+                        // peut re-trier la liste : l'identifiant est capturé
+                        // avant, le popup est réaligné après.
+                        let id = id_a_l_index(app, project_idx);
                         let _ = rescan_repertoire(app, &mut Progress::noop());
-                        if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
-                          {
-                            project_idx = nouveau;
-                          }
+                        popup_base = popup_aligne(app, &popup_base, id.as_deref());
                         message = Some(format!(
                           "Tarif manuel enregistré : {} /h",
                           format_currency(v, LOCAL_CURRENCY)
@@ -3642,7 +3717,7 @@ fn handle_tariff_input(
     // Navigation entre champs et actions.
     match key.code
       {
-        KeyCode::Esc | KeyCode::Char('q') => return Ok(InputMode::Normal),
+        KeyCode::Esc | KeyCode::Char('q') => Ok(InputMode::Normal),
         // `←`/`→` passent d'un champ tarifaire à l'autre. `↑`/`↓` ne le font
         // pas : le dispatch central s'en sert pour faire défiler le tableau,
         // et une touche ne doit pas avoir deux effets. Tab et Shift+Tab
@@ -3650,30 +3725,33 @@ fn handle_tariff_input(
         KeyCode::Left =>
           {
             let next = if active_field == 0 { TARIF_CHAMPS - 1 } else { active_field - 1 };
-            return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
+            // `popup_base` et non `base` : la copie alignée après rescan. Ces
+            // deux bras n'emploient pas `popup!` parce qu'ils déplacent le champ
+            // actif, que la macro prend tel quel dans ses variables locales.
+            Ok(InputMode::Popup(popup_base.avec_couts(EtatCouts {
               active_field: next,
               editing: false,
               input_buffer: String::new(),
               input_offset: 0,
               country,
               message,
-              fetching: base.couts.fetching,
-              scroll_offset: base.couts.scroll_offset,
-            })));
+              fetching: popup_base.couts.fetching,
+              scroll_offset: popup_base.couts.scroll_offset,
+            })))
           }
         KeyCode::Right =>
           {
             let next = (active_field + 1) % TARIF_CHAMPS;
-            return Ok(InputMode::Popup(base.avec_couts(EtatCouts {
+            Ok(InputMode::Popup(popup_base.avec_couts(EtatCouts {
               active_field: next,
               editing: false,
               input_buffer: String::new(),
               input_offset: 0,
               country,
               message,
-              fetching: base.couts.fetching,
-              scroll_offset: base.couts.scroll_offset,
-            })));
+              fetching: popup_base.couts.fetching,
+              scroll_offset: popup_base.couts.scroll_offset,
+            })))
           }
         KeyCode::Enter =>
           {
@@ -3699,12 +3777,9 @@ fn handle_tariff_input(
                     projet.tarif_mode = "manuel".to_string();
                     message = Some("Mode manuel activé".to_string());
                   }
-                let id = app.projects[project_idx].id.clone();
+                let id = id_a_l_index(app, project_idx);
                 let _ = rescan_repertoire(app, &mut Progress::noop());
-                if let Some(nouveau) = app.projects.iter().position(|p| p.id == id)
-                  {
-                    project_idx = nouveau;
-                  }
+                popup_base = popup_aligne(app, &popup_base, id.as_deref());
                 return Ok(popup!(false, String::new(), 0, message));
               }
             let buffer = match active_field
@@ -3717,7 +3792,7 @@ fn handle_tariff_input(
                 _ => String::new(),
               };
             let offset = buffer.chars().count();
-            return Ok(popup!(true, buffer, offset, message));
+            Ok(popup!(true, buffer, offset, message))
           }
         KeyCode::Char('r') | KeyCode::Char('R') =>
           {
@@ -3750,9 +3825,9 @@ fn handle_tariff_input(
               }
             // Recalcul immédiat des durées valorisées.
             let _ = rescan_repertoire(app, &mut Progress::noop());
-            return Ok(popup!(false, String::new(), 0, message));
+            Ok(popup!(false, String::new(), 0, message))
           }
-        _ => return Ok(popup!(false, String::new(), 0, message)),
+        _ => Ok(popup!(false, String::new(), 0, message)),
       }
    }
 
@@ -4170,6 +4245,7 @@ mod tests
             session_count: String::new(),
             last_session_tokens: String::new(),
             last_session_cost: String::new(),
+            last_session_cost_local: String::new(),
             last_agent: String::new(),
             last_time_created: String::new(),
             last_session_context_pct: String::new(),
@@ -4344,7 +4420,7 @@ mod tests
           "[package]\nname = \"demo\"\nversion = \"1.2.3\"\n\n[dependencies]\nfoo = { version = \"7.8.9\" }\n",
         )
         .unwrap();
-        assert_eq!(super::bump_manifest_version(&dir, "1.2.4").unwrap(), true);
+        assert!(super::bump_manifest_version(&dir, "1.2.4").unwrap());
         let content = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert!(content.contains("version = \"1.2.4\""));
         assert!(content.contains("foo = { version = \"7.8.9\" }"));
@@ -4430,7 +4506,7 @@ mod tests
       {
         let dir = temp_dir("nomanifest");
         fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n").unwrap();
-        assert_eq!(super::bump_manifest_version(&dir, "1.2.4").unwrap(), false);
+        assert!(!super::bump_manifest_version(&dir, "1.2.4").unwrap());
         let content = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert!(!content.contains("1.2.4"));
         fs::remove_dir_all(&dir).unwrap();
@@ -4441,7 +4517,7 @@ mod tests
       {
         let dir = temp_dir("nover");
         fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n\n[dependencies]\nfoo = \"1\"\n").unwrap();
-        assert_eq!(super::bump_manifest_version(&dir, "0.0.1").unwrap(), true);
+        assert!(super::bump_manifest_version(&dir, "0.0.1").unwrap());
         let content = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert!(content.contains("version = \"0.0.1\""));
         assert!(content.contains("name = \"demo\""));
@@ -4455,11 +4531,11 @@ mod tests
       {
         let dir = temp_dir("ws");
         fs::write(dir.join("Cargo.toml"), "[package]\nname = \"a\"\nversion.workspace = true\n").unwrap();
-        assert_eq!(super::bump_manifest_version(&dir, "1.0.1").unwrap(), false);
+        assert!(!super::bump_manifest_version(&dir, "1.0.1").unwrap());
         let c = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert_eq!(c.matches("version").count(), 1);
         fs::write(dir.join("Cargo.toml"), "[package]\nname = \"a\"\nversion = '1.0.0' # note\n").unwrap();
-        assert_eq!(super::bump_manifest_version(&dir, "1.0.1").unwrap(), true);
+        assert!(super::bump_manifest_version(&dir, "1.0.1").unwrap());
         let c = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert!(c.contains("version = \"1.0.1\" # note"), "{c}");
         fs::remove_dir_all(&dir).unwrap();
@@ -4758,6 +4834,200 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         champ = champ_apres(&popup, KeyCode::Left, champ);
         assert_eq!(champ, 2, "cyclique inverse");
         assert_eq!(champ_apres(&popup, KeyCode::Left, popup.couts.active_field), 2, "depuis 0");
+      }
+
+    /// Un projet enregistré (« zeta ») et un dossier frère présent sur le
+    /// disque mais absent du registre (« alpha »). Le rescan va découvrir
+    /// « alpha », et le tri par nom le place devant « zeta ».
+    ///
+    /// C'est le mécanisme exact du défaut corrigé : le rescan réindexe, la
+    /// liste change de longueur, et l'index que porte le popup devient caduc.
+    fn app_avec_projet_decouvert() -> crate::App
+      {
+        static COMPTEUR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COMPTEUR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = temp_dir(&format!("rescan-{n}"));
+        let zeta = dir.join("zeta");
+        fs::create_dir_all(&zeta).unwrap();
+        fs::create_dir_all(dir.join("alpha")).unwrap();
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "zeta": {
+                    "name": "zeta",
+                    "path": zeta.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "description": "",
+                    "tarif_mode": "manuel"
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = crate::App::new_light(registre, SortOrder::Name);
+        // Aucun appel réseau pendant un test : le cache se déclare en échec
+        // récent, ce qui interdit à `rescan_repertoire` de rafraîchir les
+        // tarifs.
+        app.web_cache.last_failure_ms = crate::registry::maintenant_ms();
+        app
+      }
+
+    /// Le rescan doit avoir bien changé la liste, sinon le test qui suit ne
+    /// prouverait rien.
+    fn assert_rescan_a_deplace(app: &crate::App)
+      {
+        assert_eq!(app.projects.len(), 2, "le rescan doit avoir découvert alpha");
+        assert_eq!(app.projects[0].name, "alpha", "tri par nom : alpha avant zeta");
+        assert_eq!(app.projects[1].name, "zeta");
+      }
+
+    /// Un index seul ne survit pas à un re-tri : seul l'identifiant du projet
+    /// est stable. `popup_aligne` s'en sert pour réaligner le popup.
+    #[test]
+    fn popup_aligne_suit_le_projet_reordonne()
+      {
+        let mut app = app_avec_projet_decouvert();
+        assert_eq!(app.projects.len(), 1, "un seul projet au départ");
+        // Le popup désigne le projet « zeta », seul, donc l'index 0.
+        let popup = popup_navigation().avec_projet_idx(0);
+        crate::rescan_repertoire(&mut app, &mut crate::Progress::noop()).unwrap();
+        assert_rescan_a_deplace(&app);
+
+        let aligne = crate::popup_aligne(&app, &popup, Some("zeta"));
+        assert_eq!(aligne.projet_idx, 1, "zeta a changé de place, le popup doit le suivre");
+        assert_eq!(app.projects[aligne.projet_idx].name, "zeta");
+      }
+
+    /// Un projet disparu laisse l'index inchangé : l'affichage le rend alors
+    /// absent plutôt que valide, et surtout il ne pointe pas sur un autre
+    /// projet par hasard.
+    #[test]
+    fn popup_aligne_laisse_un_projet_absent()
+      {
+        let app = app_avec_projet_decouvert();
+        let popup = popup_navigation().avec_projet_idx(7);
+        assert_eq!(crate::popup_aligne(&app, &popup, None).projet_idx, 7);
+        assert_eq!(
+          crate::popup_aligne(&app, &popup, Some("disparu")).projet_idx,
+          7,
+          "un identifiant inconnu ne doit pas faire pointer sur un autre projet"
+        );
+      }
+
+    /// Régression : enregistrer un tarif manuel déclenche un rescan, qui peut
+    /// découvrir un projet et re-trier la liste. Le popup rendu doit continuer
+    /// de désigner le projet dont le tarif vient d'être enregistré.
+    ///
+    /// Le défaut était une affectation de l'index dans une variable locale
+    /// par valeur, jamais relue : le popup repartait avec son index d'origine,
+    /// et son titre et son onglet Coûts décrivaient un autre projet que
+    /// l'onglet Projet.
+    #[test]
+    fn le_tarif_manuel_ne_decale_pas_le_projet_du_popup()
+      {
+        let mut app = app_avec_projet_decouvert();
+        let popup = popup_navigation().avec_projet_idx(0);
+        let touche = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // Saisie du tarif manuel (champ 2), puis validation : c'est ce chemin
+        // qui déclenche le rescan.
+        let mode = crate::handle_tariff_input(
+          touche,
+          &mut app,
+          &popup,
+          0,
+          1,
+          true,
+          "42,50".to_string(),
+          5,
+          "FRA".to_string(),
+          None,
+          false,
+        )
+        .unwrap();
+
+        assert_rescan_a_deplace(&app);
+        let crate::InputMode::Popup(p) = mode else {
+          panic!("l'onglet Coûts doit rester ouvert");
+        };
+        assert_eq!(
+          app.projects[p.projet_idx].name, "zeta",
+          "le popup doit désigner le projet dont le tarif vient d'être enregistré"
+        );
+        assert_eq!(p.projet_idx, 1);
+      }
+
+    /// Le même chemin, par la bascule de mode : le rescan y est déclenché par
+    /// la touche Entrée sur le champ 0.
+    #[test]
+    fn la_bascule_de_mode_ne_decale_pas_le_projet_du_popup()
+      {
+        let mut app = app_avec_projet_decouvert();
+        let popup = popup_navigation().avec_projet_idx(0);
+        let touche = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        let mode = crate::handle_tariff_input(
+          touche,
+          &mut app,
+          &popup,
+          0,
+          0,
+          false,
+          String::new(),
+          0,
+          "FRA".to_string(),
+          None,
+          false,
+        )
+        .unwrap();
+
+        assert_rescan_a_deplace(&app);
+        let crate::InputMode::Popup(p) = mode else {
+          panic!("l'onglet Coûts doit rester ouvert");
+        };
+        assert_eq!(app.projects[p.projet_idx].name, "zeta");
+      }
+
+    /// Une session en devise locale n'a pas d'équivalent à afficher : la
+    /// colonne « Converti » resterait vide et la cellule combinée se
+    /// répéterait deux fois.
+    #[test]
+    fn devise_locale_ne_redouble_pas_le_montant()
+      {
+        assert!(crate::devise_est_locale("EUR"));
+        assert!(crate::devise_est_locale("eur"), "la casse ne tranche rien");
+        assert!(!crate::devise_est_locale("USD"));
+        assert!(!crate::devise_est_locale(""));
+      }
+
+    /// La cellule « Coût » affiche l'équivalent local puis le montant facturé,
+    /// séparés par une espace fine — la place est comptée en colonnes, et une
+    /// espace ordinaire ferait basculer la mise en page d'une colonne.
+    #[test]
+    fn cout_session_double_ajoute_la_conversion()
+      {
+        assert_eq!(
+          crate::cout_session_double("4,57 $", "4,20 €"),
+          "4,20 €\u{2009}·\u{2009}4,57 $"
+        );
+        // Pas de taux, ou coût non communiqué : le seul montant d'origine.
+        assert_eq!(crate::cout_session_double("4,57 $", ""), "4,57 $");
+        assert_eq!(crate::cout_session_double("—", ""), "—");
+        // Un « — » en local ne double pas un montant réel.
+        assert_eq!(crate::cout_session_double("4,57 $", "—"), "4,57 $");
+      }
+
+    /// Le coût nul d'une session sans grille tarifaire ne doit produire aucun
+    /// montant converti : « 0,00 € · 4,57 $ » afficherait une gratuité qui
+    /// n'existe pas. Les deux cellules retombent sur « — ».
+    #[test]
+    fn un_cout_non_communique_ne_produit_aucun_montant_local()
+      {
+        // `montant_local` refuse un coût nul…
+        assert_eq!(crate::registry::montant_local(0.0, "USD", Some(0.92), Some(0.0)), None);
+        // …donc le champ converti reste vide…
+        let local = String::new();
+        // …et la cellule n'affiche que le montant d'origine, déjà « — ».
+        assert_eq!(crate::cout_session_double("—", &local), "—");
       }
 
   }

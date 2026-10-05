@@ -1,5 +1,8 @@
+// Voir `src/main.rs` du menu : la propriété « zéro warning » est appliquée par
+// le build, pas laissée à la relecture.
+#![deny(warnings)]
+
 use anyhow::Result;
-use dirs;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -12,7 +15,7 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
 
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
+static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 /// Cache des taux de change, verrouillé.
 ///
 /// Un mutex empoisonné ne rend pas ce cache inutilisable : les blocs
@@ -21,6 +24,13 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
 /// laissé en `unwrap()` : sinon un simple prix manquant ferait pancreatic le
 /// menu entier, y compris pour un chemin qui n'a rien à voir avec la devise.
 static EXCHANGE_RATE_CACHE: Lazy<Mutex<HashMap<String, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Motif du repli de `extract_context_pct` : un pourcentage isolé.
+///
+/// Compilé une fois. Il était recompilé à chaque ligne candidate du repli,
+/// c'est-à-dire jusqu'à cinquante fois par session, pour un motif qui ne change
+/// jamais et ne dépend d'aucune entrée.
+static PCT_ISOLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d{1,3})\s*%").unwrap());
 
 /// Chemin du fichier de capture, unique par PID et horodatage pour que deux
 /// sessions simultanées ne se marchent pas dessus.
@@ -333,10 +343,10 @@ async fn main() -> Result<()> {
     };
     let stderr_cap: Vec<u8> = Vec::new();
 
-    if let Some(ref dir) = project_dir {
-        if let Err(e) = update_session_data(dir, debut_ms, &stdout_cap, &stderr_cap).await {
-            eprintln!("opencode-wrap: erreur mise à jour session: {e}");
-        }
+    if let Some(ref dir) = project_dir
+        && let Err(e) = update_session_data(dir, debut_ms, &stdout_cap, &stderr_cap).await
+    {
+        eprintln!("opencode-wrap: erreur mise à jour session: {e}");
     }
 
     std::process::exit(exit_code);
@@ -542,26 +552,23 @@ fn extract_context_pct(stdout: &[u8], stderr: &[u8]) -> Option<u8> {
     // à la fin. Prendre la première occurrence stockait donc un pourcentage
     // périmé. On retient la dernière, celle qui reflète l'état à la sortie.
     for pattern in &patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            if let Some(caps) = re.captures_iter(&combined).last() {
-                if let Some(m) = caps.get(1) {
-                    if let Ok(pct) = m.as_str().parse::<u8>() {
-                        return Some(pct.min(100));
-                    }
-                }
-            }
+        if let Ok(re) = Regex::new(pattern)
+            && let Some(caps) = re.captures_iter(&combined).last()
+            && let Some(m) = caps.get(1)
+            && let Ok(pct) = m.as_str().parse::<u8>()
+        {
+            return Some(pct.min(100));
         }
     }
 
     for line in combined.lines().rev().take(50) {
         let line_lower = line.to_lowercase();
-        if line_lower.contains("context") && line_lower.contains('%') {
-            let re = Regex::new(r"(\d{1,3})\s*%").unwrap();
-            if let Some(caps) = re.captures(line) {
-                if let Ok(pct) = caps.get(1).unwrap().as_str().parse::<u8>() {
-                    return Some(pct.min(100));
-                }
-            }
+        if line_lower.contains("context")
+            && line_lower.contains('%')
+            && let Some(caps) = PCT_ISOLE.captures(line)
+            && let Ok(pct) = caps.get(1).unwrap().as_str().parse::<u8>()
+        {
+            return Some(pct.min(100));
         }
     }
 

@@ -78,6 +78,44 @@ fn fallback_exchange_rate(from: &str, to: &str) -> Option<f64> {
     }
 }
 
+/// Montant d'une session exprimé en `LOCAL_CURRENCY`.
+///
+/// Trois sources sont essayées dans l'ordre, du plus fiable au moins fiable :
+/// le montant déjà converti écrit par le registre, le taux stocké avec la
+/// session, puis le taux de repli embarqué. Les deux premières viennent des
+/// colonnes de `session` ; la troisième permet d'afficher un total quand
+/// opencode n'a encore rien écrit pour cette devise.
+///
+/// Le cumul des totaux et l'affichage de la dernière session passent tous deux
+/// par cette fonction : c'est la seule façon d'éviter que la ligne « Converti »
+/// et la ligne TOTAL ne se contredisent quand un taux change entre deux scans.
+///
+/// Renvoie `None` si la devise n'a aucun taux connu, ou si le coût est nul :
+/// opencode écrit `cost = 0` quand le fournisseur ne publie aucune grille, et
+/// convertir ce zéro en « 0,00 € » afficherait un montant qui n'existe pas.
+///
+/// Un taux stocké mais aberrant (infini, négatif) est écarté au profit du taux
+/// de repli : il rendrait le total affiché illisible.
+pub(crate) fn montant_local(
+  cost: f64,
+  devise: &str,
+  exchange_rate: Option<f64>,
+  cost_local: Option<f64>,
+) -> Option<f64>
+  {
+    if cost <= 0.0 {
+      return None;
+    }
+    if let Some(local) = cost_local.filter(|v| v.is_finite() && *v > 0.0) {
+      return Some(local);
+    }
+    let taux = exchange_rate
+      .filter(|t| t.is_finite() && *t > 0.0)
+      .or_else(|| fallback_exchange_rate(devise, LOCAL_CURRENCY))
+      .filter(|t| t.is_finite() && *t > 0.0)?;
+    Some(cost * taux)
+  }
+
 // Nouvelles structures pour les données d'usage
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LastSession {
@@ -198,6 +236,10 @@ pub(crate) struct Project {
     last_session_tokens: String,
     #[serde(default)]
     last_session_cost: String,
+    /// Montant de la dernière session converti en `LOCAL_CURRENCY`, pour
+    /// l'onglet Coûts. Vide quand aucun taux n'est connu.
+    #[serde(default)]
+    last_session_cost_local: String,
     #[serde(default)]
     last_agent: String,
     #[serde(default)]
@@ -430,6 +472,11 @@ pub(crate) struct ProjectEntry {
     pub(crate) session_count: String,
     pub(crate) last_session_tokens: String,
     pub(crate) last_session_cost: String,
+    /// Montant de la dernière session converti en `LOCAL_CURRENCY`.
+    /// Volontairement distinct de `last_session_cost`, qui reste le montant
+    /// d'origine : l'onglet Coûts en déduit la devise en cherchant son
+    /// symbole dans cette chaîne.
+    pub(crate) last_session_cost_local: String,
     pub(crate) last_agent: String,
     pub(crate) last_time_created: String,
     pub(crate) last_session_context_pct: String,
@@ -545,6 +592,7 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 session_count: p.session_count,
                 last_session_tokens: p.last_session_tokens,
                 last_session_cost: p.last_session_cost,
+                last_session_cost_local: p.last_session_cost_local,
                 last_agent: p.last_agent,
                 last_time_created: p.last_time_created,
                 last_session_context_pct: p.last_session_context_pct,
@@ -658,9 +706,11 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
         let stmt = conn.prepare(
             "SELECT id, currency, cost FROM session WHERE directory IS NOT NULL AND (exchange_rate IS NULL OR exchange_rate = 0) AND cost > 0",
         );
-        if let Ok(mut stmt) = stmt {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
+        if let Ok(mut stmt) = stmt
+            && let Ok(mut rows) = stmt.query([])
+        {
+            while let Ok(Some(row)) = rows.next()
+                {
                     let id: String = row.get(0).unwrap_or_default();
                     let currency: String = row.get(1).unwrap_or_else(|_| "USD".to_string());
                     let cost: f64 = row.get(2).unwrap_or(0.0);
@@ -668,7 +718,6 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
                         sessions_to_update.push((id, currency, cost));
                     }
                 }
-            }
         }
     }
 
@@ -737,63 +786,61 @@ pub(crate) fn load_usage(db_path: &Path) -> HashMap<PathBuf, ProjectUsage> {
             row.get::<_, f64>(10)?,
         ))
     });
-    match rows {
-        Ok(iter) => {
-            for r in iter.flatten() {
-                let (id, dir, cost, tokens, model, agent, t, context_pct, currency, exchange_rate, cost_local) = r;
-                let duree = durations.get(&id).copied().unwrap_or(0);
-                let entry = usage
-                    .entry(PathBuf::from(dir))
-                    .or_insert_with(|| ProjectUsage {
-                        cumulative: CumulativeUsage::default(),
-                        last_session: None,
-                        sessions: Vec::new(),
-                    });
-                // Cumuler les totaux par devise
-                if cost > 0.0 {
-                    *entry.cumulative.cost_by_currency.entry(currency.clone()).or_insert(0.0) += cost;
-                    if cost_local > 0.0 {
-                        entry.cumulative.total_cost_local += cost_local;
-                    } else if exchange_rate > 0.0 {
-                        entry.cumulative.total_cost_local += cost * exchange_rate;
-                    } else {
-                        // Fallback si pas de taux
-                        if let Some(rate) = fallback_exchange_rate(&currency, LOCAL_CURRENCY) {
-                            entry.cumulative.total_cost_local += cost * rate;
-                        }
-                    }
-                }
-                entry.cumulative.total_tokens += tokens;
-                entry.cumulative.session_count += 1;
-                entry.cumulative.total_duration_ms += duree;
-                entry.sessions.push(SessionDuree {
-                    time_created_ms: t,
-                    duration_ms: duree,
+    if let Ok(iter) = rows {
+        for r in iter.flatten() {
+            let (id, dir, cost, tokens, model, agent, t, context_pct, currency, exchange_rate, cost_local) = r;
+            let duree = durations.get(&id).copied().unwrap_or(0);
+            let entry = usage
+                .entry(PathBuf::from(dir))
+                .or_insert_with(|| ProjectUsage {
+                    cumulative: CumulativeUsage::default(),
+                    last_session: None,
+                    sessions: Vec::new(),
                 });
-                // Dernière session (la première rencontrée car ORDER BY time_created DESC)
-                if entry.last_session.is_none() {
-                    let model_id = model.and_then(|m| {
-                        serde_json::from_str::<serde_json::Value>(&m)
-                            .ok()
-                            .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
-                    });
-                    let agent_cap = agent.map(|a| capitalize(&a));
-                    entry.last_session = Some(LastSession {
-                        tokens,
-                        cost,
-                        currency,
-                        exchange_rate: if exchange_rate > 0.0 { Some(exchange_rate) } else { None },
-                        cost_local: if cost_local > 0.0 { Some(cost_local) } else { None },
-                        model: model_id.unwrap_or_default(),
-                        agent: agent_cap.unwrap_or_default(),
-                        time_created: t,
-                        context_pct,
-                        duration_ms: duree,
-                    });
+            // Cumuler les totaux par devise
+            if cost > 0.0 {
+                *entry.cumulative.cost_by_currency.entry(currency.clone()).or_insert(0.0) += cost;
+                // Même priorité que l'affichage de la dernière session :
+                // montant converti stocké, puis taux de la session, puis
+                // taux de repli.
+                if let Some(local) = montant_local(
+                    cost,
+                    &currency,
+                    Some(exchange_rate),
+                    Some(cost_local),
+                ) {
+                    entry.cumulative.total_cost_local += local;
                 }
             }
+            entry.cumulative.total_tokens += tokens;
+            entry.cumulative.session_count += 1;
+            entry.cumulative.total_duration_ms += duree;
+            entry.sessions.push(SessionDuree {
+                time_created_ms: t,
+                duration_ms: duree,
+            });
+            // Dernière session (la première rencontrée car ORDER BY time_created DESC)
+            if entry.last_session.is_none() {
+                let model_id = model.and_then(|m| {
+                    serde_json::from_str::<serde_json::Value>(&m)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                });
+                let agent_cap = agent.map(|a| capitalize(&a));
+                entry.last_session = Some(LastSession {
+                    tokens,
+                    cost,
+                    currency,
+                    exchange_rate: if exchange_rate > 0.0 { Some(exchange_rate) } else { None },
+                    cost_local: if cost_local > 0.0 { Some(cost_local) } else { None },
+                    model: model_id.unwrap_or_default(),
+                    agent: agent_cap.unwrap_or_default(),
+                    time_created: t,
+                    context_pct,
+                    duration_ms: duree,
+                });
+            }
         }
-        Err(_) => {}
     }
     usage
 }
@@ -1364,13 +1411,13 @@ pub(crate) fn serie_du_projet(
 
     if copie_valide {
         let local_fetched = p.tarif_web_fetched_ms;
-        // Préférer la version la plus fraîche.
-        if cache_fetched > local_fetched && cache_serie.is_some() {
-            return (
-                cache_serie.unwrap().clone(),
-                cache_secteur,
-                cache_fetched,
-            );
+        // Préférer la version la plus fraîche : le cache n'est retenu que s'il
+        // existe, condition qu'un enchaînement `let` exprime sans retester le
+        // même `Option`.
+        if let Some(serie) = cache_serie
+            && cache_fetched > local_fetched
+        {
+            return (serie.clone(), cache_secteur, cache_fetched);
         }
         return (
             p.tarif_web_series.clone(),
@@ -1520,11 +1567,11 @@ impl WebCache {
         if self.last_failure_ms > 0 && maintenant_ms - self.last_failure_ms < ECHEC_PAUSE_MS {
             return false;
         }
-        if let Some(serie) = self.rates.get(&self.country) {
-            if let Some(p) = serie.last() {
-                let age_jours = (maintenant_ms - p.fetched_ms) / 86_400_000;
-                return age_jours >= WEB_FETCH_JOURS;
-            }
+        if let Some(serie) = self.rates.get(&self.country)
+            && let Some(p) = serie.last()
+        {
+            let age_jours = (maintenant_ms - p.fetched_ms) / 86_400_000;
+            return age_jours >= WEB_FETCH_JOURS;
         }
         true // série absente → il faut fetcher
     }
@@ -1678,6 +1725,7 @@ pub(crate) fn save_registry_full(
                 session_count: p.session_count.clone(),
                 last_session_tokens: p.last_session_tokens.clone(),
                 last_session_cost: p.last_session_cost.clone(),
+                last_session_cost_local: p.last_session_cost_local.clone(),
                 last_agent: p.last_agent.clone(),
                 last_time_created: p.last_time_created.clone(),
                 status_debug: p.status_debug.clone(),
@@ -1791,6 +1839,7 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
             session_count: String::new(),
             last_session_tokens: String::new(),
             last_session_cost: String::new(),
+            last_session_cost_local: String::new(),
             last_agent: String::new(),
                 last_time_created: String::new(),
                 last_session_context_pct: String::new(),
@@ -2069,8 +2118,8 @@ mod tests
 
     use super::{
         default_tarif_mode, default_web_country, load_preferences, load_registry, load_web_cache,
-        save_preferences, save_registry_full, Preferences, Result, TarifPoint, Tri, validate_status,
-        validate_version, ProjectEntry, STATUSES, WebCache,
+        montant_local, save_preferences, save_registry_full, Preferences, Result, TarifPoint, Tri,
+        validate_status, validate_version, ProjectEntry, STATUSES, WebCache,
     };
 
     fn temp_registry(name: &str) -> PathBuf {
@@ -2319,6 +2368,7 @@ mod tests
                 session_count: String::new(),
                 last_session_tokens: String::new(),
                 last_session_cost: String::new(),
+                last_session_cost_local: String::new(),
                 last_agent: String::new(),
                 last_time_created: String::new(),
                 last_session_context_pct: String::new(),
@@ -2386,6 +2436,7 @@ mod tests
                     session_count: String::new(),
                     last_session_tokens: String::new(),
                     last_session_cost: String::new(),
+                    last_session_cost_local: String::new(),
                     last_agent: String::new(),
                     last_time_created: String::new(),
                     last_session_context_pct: String::new(),
@@ -3031,6 +3082,7 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             session_count: String::new(),
             last_session_tokens: String::new(),
             last_session_cost: String::new(),
+            last_session_cost_local: String::new(),
             last_agent: String::new(),
             last_time_created: String::new(),
             last_session_context_pct: String::new(),
@@ -3240,4 +3292,78 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
         let champs2 = super::parse_csv_line(ligne2);
         assert_eq!(champs2[2], r#"Il a dit "Bonjour""#);
     }
+
+    /// Les montants en virgule flottante : 10,0 × 0,92 ne vaut pas exactement
+    /// 9,2 en binaire, et un `assert_eq!` échouerait sur la seule façon dont
+    /// l'ordinateur représente le résultat, pas sur sa valeur.
+    fn assert_proche(obtenu: Option<f64>, attendu: f64, quoi: &str)
+      {
+        match obtenu
+          {
+            Some(v) => assert!(
+              (v - attendu).abs() < 1e-9,
+              "{quoi} : {v} devrait valoir {attendu}"
+            ),
+            None => panic!("{quoi} : aucun montant, {attendu} attendu"),
+          }
+      }
+
+    /// La conversion d'une session suit trois sources dans l'ordre. Cet ordre
+    /// est aussi celui du cumul des totaux : les deux passent par la même
+    /// fonction, donc la ligne « Converti » et la ligne TOTAL ne peuvent pas
+    /// se contredire.
+    #[test]
+    fn montant_local_suit_la_priorite_des_taux()
+      {
+        // Le montant déjà converti prime sur le taux de la session.
+        assert_proche(montant_local(10.0, "USD", Some(0.5), Some(9.2)), 9.2, "montant stocké");
+        // Sans montant converti, le taux stocké avec la session.
+        assert_proche(montant_local(10.0, "USD", Some(0.5), None), 5.0, "taux de session");
+        // Sans rien, le taux de repli — celui qu'utiliserait le cumul.
+        assert_proche(montant_local(10.0, "USD", None, None), 9.2, "taux de repli");
+        // Un taux nul est absent, pas nul : le repli prend le relais.
+        assert_proche(montant_local(10.0, "USD", Some(0.0), None), 9.2, "taux nul");
+      }
+
+    /// Un taux aberrant ne doit pas rendre le total illisible : il est écarté
+    /// au profit du repli, comme le taux nul.
+    #[test]
+    fn montant_local_ecarte_les_taux_aberrants()
+      {
+        // Un taux infini est écarté comme un taux nul : le repli prend le relais.
+        assert_proche(
+          montant_local(10.0, "USD", Some(f64::INFINITY), None),
+          9.2,
+          "taux infini",
+        );
+        // Un montant converti infini est écarté lui aussi, puis le taux l'est
+        // aussi : il ne reste que le repli.
+        assert_proche(
+          montant_local(10.0, "USD", Some(f64::INFINITY), Some(f64::INFINITY)),
+          9.2,
+          "montant et taux infinis",
+        );
+        // Sans repli, il ne reste rien : aucune conversion plutôt qu'une
+        // conversion infinie.
+        assert_eq!(montant_local(10.0, "XXX", Some(f64::INFINITY), Some(f64::INFINITY)), None);
+      }
+
+    /// opencode écrit `cost = 0` quand le fournisseur ne publie aucune grille
+    /// tarifaire. Convertir ce zéro donnerait « 0,00 € », qui se lit comme une
+    /// session gratuite : il n'y a pas de montant à convertir.
+    #[test]
+    fn montant_local_refuse_un_cout_nul()
+      {
+        assert_eq!(montant_local(0.0, "USD", Some(0.92), Some(0.0)), None);
+        assert_eq!(montant_local(0.0, "EUR", Some(1.0), Some(0.0)), None);
+      }
+
+    /// Une devise sans taux ni repli n'a rien à afficher : mieux vaut une case
+    /// vide qu'un montant inventé.
+    #[test]
+    fn montant_local_renvoie_none_sans_taux_connu()
+      {
+        assert_eq!(montant_local(10.0, "XXX", None, None), None);
+        assert_eq!(montant_local(10.0, "", None, None), None);
+      }
   }
