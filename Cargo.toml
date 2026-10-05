@@ -1,6 +1,6 @@
 [package]
 name = "opencode-start-menu"
-version = "0.20.17"
+version = "0.20.18"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
