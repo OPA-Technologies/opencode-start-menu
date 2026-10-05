@@ -245,6 +245,11 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
+        // `REVERSED` annule ici la barre blanche voulue : chaque ligne porte
+        // déjà `bg(White) + fg(Black) + BOLD` quand elle est sélectionnée, et
+        // l'inversion rend la ligne en blanc gras sur noir. La sélection reste
+        // nette — le `►` et le gras suffisent — mais l'effet est à l'inverse de
+        // l'intention, comme les `REVERSED` retirés des libellés de formulaire.
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("► ");
 
@@ -679,7 +684,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
       .border_style(Style::default().fg(Color::Cyan))
       .style(opaque);
 
-// Lignes : libellé aligné + valeur. Le champ actif est surligné (REVERSED).
+// Lignes : libellé aligné + valeur. Le champ actif est surligné.
     let active = state.active_field.min(6);
     // Un champ est « en saisie » quand la frappe courante lui appartient. Pour
     // le Statut, ce n'est le cas qu'en texte libre : sinon la frappe alimente
@@ -705,11 +710,17 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         ("Version      ", affiche(&state.version, saisie(5), VIDE)),
       ];
 
+    // Le libellé du champ actif est le repère de navigation : noir sur cyan. Sans
+    // `REVERSED`, qui échange les deux plans à l'affichage et annulait donc le
+    // surlignage. Ce formulaire étant posé sur un fond gris, le champ actif
+    // restait repérable par son fond noir — le défaut y était un style jamais
+    // affiché. Dans l'éditeur, sur fond noir, la même inversion rendait le champ
+    // actif strictement identique aux inactifs.
     let lbl_style = |i: usize| -> Style
       {
         if i == active
           {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::REVERSED)
+            Style::default().fg(Color::Black).bg(Color::Cyan)
           }
         else
           {
@@ -902,11 +913,14 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
           )
       };
 
+    // Même repère que le formulaire de création, et pour la même raison : le
+    // libellé est surligné sans `REVERSED`, dont la vidéo inversée annulerait
+    // les deux couleurs et rendrait le champ actif indiscernable.
     let lbl_style = |i: usize| -> Style
       {
         if i == active
           {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::REVERSED)
+            Style::default().fg(Color::Black).bg(Color::Cyan)
           }
         else
           {
@@ -1796,7 +1810,11 @@ fn avertissements_tarif(web: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests
   {
-    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+    use ratatui::{
+        backend::TestBackend,
+        buffer::{Buffer, Cell},
+        Terminal,
+    };
 
     use super::*;
 
@@ -1836,6 +1854,124 @@ mod tests
               }
           }
         None
+      }
+
+    /// Aspect **tel que le terminal l'affiche** : les deux plans après l'éventuel
+    /// échange de `REVERSED`, plus les modificateurs qui survivent.
+    ///
+    /// `REVERSED` échange `fg` et `bg` au moment du rendu : deux cellules de
+    /// styles différents s'affichent alors à l'identique. Un test qui ne compare
+    /// que `fg`/`bg` croit distinguer des libellés pareils, et laisse passer
+    /// exactement le défaut qu'il cherche. Le gras se compare tel quel : certains
+    /// écrans ne jouent leur repère que par la graisse.
+    fn aspect_affiche(c: &Cell) -> (Color, Color, Modifier)
+      {
+        let (fg, bg) = if c.modifier.contains(Modifier::REVERSED)
+          {
+            (c.bg, c.fg)
+          }
+        else
+          {
+            (c.fg, c.bg)
+          };
+        // `REVERSED` est consommé par l'échange : il ne distingue plus rien.
+        (fg, bg, c.modifier - Modifier::REVERSED)
+      }
+
+    /// Une ligne du rendu, caractère par caractère, **indexée en colonnes**.
+    ///
+    /// `texte()` renvoie une `String` où `find()` donne un indice d'octet, alors
+    /// qu'un `Buffer` s'indexe en colonnes. La bordure `│` pèse trois octets
+    /// pour une seule colonne : confondre les deux revient à viser la mauvaise
+    /// cellule — ici, le champ d'à côté.
+    fn ligne(buf: &Buffer, y: u16) -> Vec<char>
+      {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).and_then(|c| c.symbol().chars().next()).unwrap_or(' '))
+            .collect()
+      }
+
+    /// Colonne du premier caractère de l'ancre, ou `None` si elle est absente.
+    fn colonne(ligne: &[char], ancre: &str) -> Option<u16>
+      {
+        let cible: Vec<char> = ancre.chars().collect();
+        ligne
+            .windows(cible.len())
+            .position(|f| f == cible.as_slice())
+            .map(|i| i as u16)
+      }
+
+    /// Colonne du premier caractère de la valeur d'un champ : le séparateur
+    /// `" : "` et les espaces qui suivent le libellé sont sautés sur place,
+    /// jamais comptés en dur — un libellé reformaté ne décale pas le test.
+    fn colonne_valeur(ligne: &[char], fin_ancre: u16) -> Option<u16>
+      {
+        (fin_ancre..ligne.len() as u16).find(|x| !matches!(ligne[*x as usize], ' ' | ':'))
+      }
+
+    /// Aspect de la cellule visée par une ancre.
+    ///
+    /// `saute = Some(0)` observe le libellé lui-même ; `saute = None` observe la
+    /// valeur qui le suit, à une colonne déduite du rendu. L'ancre est le
+    /// libellé **exactement tel qu'il est écrit**, séparateur compris quand le
+    /// formulaire le place avant le contenu : c'est ce qui empêche de confondre
+    /// un libellé avec la valeur affichée sur une autre ligne.
+    fn aspect_cible(
+        buf: &Buffer,
+        ancre: &str,
+        saute: Option<usize>,
+      ) -> Option<(Color, Color, Modifier)>
+      {
+        for y in 0..buf.area.height
+          {
+            let l = ligne(buf, y);
+            // `continue`, pas `?` : l'ancre peut être ailleurs dans l'écran, et
+            // seul le champ qui la contient doit être observé.
+            let cible = match colonne(&l, ancre)
+              {
+                None => continue,
+                Some(x) => match saute
+                  {
+                    Some(d) => Some(x + d as u16),
+                    None => colonne_valeur(&l, x + ancre.chars().count() as u16),
+                  },
+              };
+            let Some(cx) = cible else
+              {
+                continue;
+              };
+            return Some(aspect_affiche(buf.cell((cx, y))?));
+          }
+        None
+      }
+
+    /// Chaque champ doit se distinguer de tous les autres : c'est la seule
+    /// information qui dit où l'on se trouve.
+    fn assert_champs_differencies(
+        buf: &Buffer,
+        ancres: &[&str],
+        saute: Option<usize>,
+        actif: usize,
+        quoi: &str,
+      )
+      {
+        let reels: Vec<(Color, Color, Modifier)> = ancres
+            .iter()
+            .map(|a| {
+                aspect_cible(buf, a, saute)
+                    .unwrap_or_else(|| panic!("{quoi} : « {a} » absent du rendu"))
+            })
+            .collect();
+        let attendu = reels[actif];
+        for (i, obtenu) in reels.iter().enumerate()
+          {
+            assert!(
+              i == actif || *obtenu != attendu,
+              "{quoi} : le champ {i} et le champ actif {actif} s'affichent pareil \
+               ({:?}) — la navigation devient invisible",
+              attendu
+            );
+          }
       }
 
     /// Rend le formulaire de création dans un terminal de test.
@@ -1955,6 +2091,127 @@ mod tests
         );
       }
 
+/// Le formulaire de création : le libellé actif devait ressortir en noir sur
+    /// cyan. Il était `fg(Noir) + bg(Cyan) + REVERSED`, or `REVERSED` échange les
+    /// deux plans au rendu — le surlignage s'annulait. Ce formulaire est posé sur
+    /// un fond gris, si bien que le champ actif restait vaguement repérable par
+    /// son fond noir : le défaut y était une promesse de style non tenue, pas la
+    /// navigation invisible de l'éditeur. Chaque position est vérifiée.
+    #[test]
+    fn le_champ_actif_du_formulaire_se_voit()
+      {
+        let libelles = [
+          "ID           ",
+          "Nom          ",
+          "Chemin       ",
+          "Description  ",
+          "Statut       ",
+          "Version      ",
+          "Ouvrir ?     ",
+        ];
+        for champ in 0..libelles.len()
+          {
+            let mut state = saisie_en_cours("", 0);
+            state.active_field = champ;
+            let (buf, _) = creation_dans_buffer(&state);
+            assert_champs_differencies(&buf, &libelles, Some(0), champ, "formulaire de création");
+          }
+      }
+
+/// Le défaut réel, dans l'éditeur atteint par `e` : là le popup est sur fond
+    /// noir, et l'inversion rendait le champ actif **exactement** identique aux
+    /// inactifs — cyan sur noir des deux côtés. Aucune indication de position,
+    /// alors que la frappe part dans le bon champ. Les quatre champs y compris,
+    /// « Enregistrer ? ».
+    #[test]
+    fn le_champ_actif_de_l_editeur_se_voit()
+      {
+        let (app, _dir) = app_de_test("editeur-actif");
+        let libelles = ["Version Debug ", "Statut Debug  ", "Description   ", "Enregistrer ? "];
+        for champ in 0..libelles.len()
+          {
+            let mut popup = popup_de_test(&app, crate::Onglet::Projet);
+            popup.projet.active_field = champ;
+            let buf = popup_dans_buffer(&app, &popup, 110, 34);
+            assert_champs_differencies(&buf, &libelles, Some(0), champ, "éditeur");
+          }
+      }
+
+/// L'onglet Coûts met la valeur en valeur plutôt que le libellé : c'est le
+    /// contenu qu'il faut regarder, pas le texte. La mise en valeur porte à la
+    /// fois sur la couleur **et** sur le gras, d'où une comparaison d'aspect
+    /// complet.
+    #[test]
+    fn le_champ_actif_de_l_onglet_couts_se_voit()
+      {
+        let (app, _dir) = app_de_test("couts-actif");
+        // Ancres reproduites exactement, séparateur `" : "` compris : sans lui,
+        // « Tarif manuel  » désignerait aussi la valeur affichée sur la ligne du
+        // champ précédent, et le test observerait la mauvaise cellule.
+        let ancres = [" Mode          : ", " Tarif manuel  : ", " Pays source   : "];
+        for champ in 0..ancres.len()
+          {
+            let mut popup = popup_de_test(&app, crate::Onglet::Couts);
+            popup.couts.active_field = champ;
+            let buf = popup_dans_buffer(&app, &popup, 110, 34);
+            assert_champs_differencies(&buf, &ancres, None, champ, "onglet Coûts");
+          }
+      }
+
+/// L'onglet Paramètres pose un `▸` devant la seule option active. C'est un
+    /// repère textuel, donc plus fort qu'une couleur : le test vérifie qu'il
+    /// désigne bien la position demandée, et lui seul. Cinq options sont
+    /// énumérées, pas quatre.
+    #[test]
+    fn l_option_active_de_l_onglet_parametres_est_marquee()
+      {
+        let (app, _dir) = app_de_test("param-actif");
+        let libelles = [
+          "Tri de la liste",
+          "Colonnes visibles",
+          "Lancement root",
+          "Capture du wrapper",
+          "Pays de la source",
+        ];
+        for (actif, attendu) in libelles.iter().enumerate()
+          {
+            let mut popup = popup_de_test(&app, crate::Onglet::Parametres);
+            popup.parametres.actif = actif;
+            let rendu = texte(&popup_dans_buffer(&app, &popup, 110, 34));
+            // Seules les lignes d'option comptent : la barre d'onglets porte
+            // elle aussi un `▸`, devant l'onglet courant. Compter tous les
+            // `▸` de l'écran échouerait pour une raison sans rapport avec les
+            // options.
+            let marquees: Vec<&str> = rendu
+                .lines()
+                .filter(|l| libelles.iter().any(|x| l.contains(x)) && l.contains('▸'))
+                .collect();
+            assert_eq!(
+              marquees.len(),
+              1,
+              "un seul `▸` doit apparaître, position {actif} :\n{rendu}"
+            );
+            assert!(
+              marquees[0].contains(attendu),
+              "le `▸` doit désigner « {attendu} », il est sur :\n{rendu}"
+            );
+            // Les positions rendent des écrans différents : sinon deux options
+            // seraient indiscernables.
+            let autres: Vec<String> = (0..libelles.len())
+              .filter(|i| *i != actif)
+              .map(|i| {
+                  let mut autre = popup_de_test(&app, crate::Onglet::Parametres);
+                  autre.parametres.actif = i;
+                  texte(&popup_dans_buffer(&app, &autre, 110, 34))
+              })
+              .collect();
+            for rendu_autre in autres
+              {
+                assert_ne!(rendu_autre, rendu, "deux positions rendent le même écran");
+              }
+          }
+      }
+
     // --- Popup unifié -------------------------------------------------
 
     /// Registre minimal avec un projet, chargé sans rescan ni réseau.
@@ -1999,9 +2256,21 @@ mod tests
     /// d'une troncature de colonne.
     fn rendre_popup_en(app: &crate::App, popup: &crate::Popup, largeur: u16, hauteur: u16) -> String
       {
+        texte(&popup_dans_buffer(app, popup, largeur, hauteur))
+      }
+
+    /// Rendu du popup dans un buffer : seul niveau où le style d'une cellule
+    /// reste observable, et où l'on peut raisonner sur ce qui s'affiche.
+    fn popup_dans_buffer(
+        app: &crate::App,
+        popup: &crate::Popup,
+        largeur: u16,
+        hauteur: u16,
+      ) -> Buffer
+      {
         let mut term = Terminal::new(TestBackend::new(largeur, hauteur)).unwrap();
         term.draw(|f| render_popup_unifie(f, f.area(), app, popup)).unwrap();
-        texte(term.backend().buffer())
+        term.backend().buffer().clone()
       }
 
     /// Un projet dont la dernière session a un coût dans une devise convertible.
