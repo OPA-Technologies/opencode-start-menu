@@ -1785,6 +1785,16 @@ fn run_tui(app: App, terminal: &mut Term, mode_initial: InputMode) -> Result<()>
 /// Les réglages du projet (`p`) et les coûts (`c`) portent sur un projet
 /// précis : sans sélection, il n'y a rien à montrer. Les préférences (`s`) sont
 /// globales et restent donc accessibles même quand la liste est vide.
+/// La touche `e` du menu principal : l'éditeur, c'est l'onglet Projet.
+///
+/// `EditingProject` a disparu au profit du popup unifié, et le raccourci a
+/// disparu dans le même commit alors qu'il nommait toujours une intention
+/// réelle : depuis, chercher `e` menait à un menu muet. `e` et `p` ouvrent donc
+/// le même écran, et cette fonction le dit plutôt que de le dupliquer.
+fn ouvrir_editeur(app: &mut App) -> InputMode {
+    ouvrir_popup(app, Onglet::Projet)
+}
+
 fn ouvrir_popup(app: &mut App, onglet: Onglet) -> InputMode {
     let Some(idx) = app.selected_project_idx() else {
         return InputMode::Popup(Popup::sans_projet(onglet, app.web_cache.country.clone()));
@@ -2166,6 +2176,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                     KeyCode::Char('n') => {
                         InputMode::CreatingProject(ProjectCreationState::default())
                     }
+                    KeyCode::Char('e') | KeyCode::Char('E') => ouvrir_editeur(&mut app),
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         ouvrir_popup(&mut app, Onglet::Projet)
                     }
@@ -5028,6 +5039,54 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         let local = String::new();
         // …et la cellule n'affiche que le montant d'origine, déjà « — ».
         assert_eq!(crate::cout_session_double("—", &local), "—");
+      }
+
+    /// La touche `e` du menu principal ouvre l'éditeur, c'est-à-dire l'onglet
+    /// Projet du popup unifié. `EditingProject` et son raccourci ont disparu
+    /// ensemble lors de la refonte : chercher `e` ne faisait plus rien du tout,
+    /// et l'aide contextuelle avait suivi le code au lieu de le rappeler.
+    #[test]
+    fn la_touche_e_ouvre_le_popup_projet() {
+        let dir = temp_dir("editeur");
+        let projet = dir.join("projet");
+        fs::create_dir_all(&projet).unwrap();
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "version_debug": "1.0.0",
+                    "tarif_mode": "manuel"
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let mut app = crate::App::new_light(registre.clone(), SortOrder::Modified);
+        crate::refresh_project_selection(&mut app);
+        app.list_state.select(Some(0));
+
+        match crate::ouvrir_editeur(&mut app) {
+            crate::InputMode::Popup(popup) => {
+                assert_eq!(popup.onglet, crate::Onglet::Projet, "`e` ouvre l'onglet Projet");
+                assert_eq!(popup.projet.project_idx, 0, "`e` vise le projet sélectionné");
+            }
+            _ => panic!("`e` doit ouvrir le popup unifié"),
+        }
+
+        // Sans projet sélectionné, `e` se comporte comme `p` : l'écran
+        // « sans projet » s'affiche plutôt que de ne rien faire.
+        fs::remove_dir_all(&dir).unwrap();
+        let mut vide = crate::App::new_light(registre, SortOrder::Modified);
+        crate::refresh_project_selection(&mut vide);
+        match crate::ouvrir_editeur(&mut vide) {
+            crate::InputMode::Popup(popup) => {
+                assert_eq!(popup.onglet, crate::Onglet::Projet);
+            }
+            _ => panic!("`e` doit ouvrir le popup unifié, même sans projet"),
+        }
       }
 
   }

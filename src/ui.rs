@@ -2320,18 +2320,20 @@ mod tests
         ]
       }
 
-    /// Régression B2 : l'aide annonçait `e Modifier` et `t Valorisation`, deux
-    /// touches qui n'ont jamais été branchées. Un utilisateur qui cherchait
-    /// `e` concluait à un programme cassé.
+    /// Régression B2 : l'aide annonçait `t Valorisation` et `←/→ Changer onglet`,
+    /// deux touches qui n'ont jamais été branchées, pendant que `e Modifier` —
+    /// branchée jusqu'à la refonte du popup unifié, puis supprimée par accident
+    /// avec elle — disparaissait de l'aide au lieu d'être rétablie. Un
+    /// utilisateur qui cherchait `e` concluait à un programme cassé.
     #[test]
     fn la_barre_d_aide_n_annonce_plus_de_touches_inexistantes()
       {
         let rendu = rendre_ecran(&InputMode::Normal, 120, 40);
-        for fantome in ["e Modifier", "t Valorisation"]
-          {
-            assert!(!rendu.contains(fantome), "« {fantome} » n'existe pas dans le code :\n{rendu}");
-          }
-        for reel in ["p", "c", "s", "m", "F1"]
+        assert!(
+          !rendu.contains("t Valorisation"),
+          "« t Valorisation » n'existe pas dans le code :\n{rendu}"
+        );
+        for reel in ["e Modifier", "p", "c", "s", "m", "F1"]
           {
             assert!(rendu.contains(reel), "« {reel} » est une touche réelle, elle doit être annoncée");
           }
@@ -2370,7 +2372,7 @@ mod tests
             let touches: Vec<String> =
               crate::keymap::contextuel(&mode).iter().map(|r| r.touche().to_string()).collect();
             let rendu = rendre_ecran(&mode, 200, 40);
-            for faux in ["e Modifier", "t Valorisation", "←/→ Changer onglet"]
+            for faux in ["t Valorisation", "←/→ Changer onglet"]
               {
                 assert!(
                   !rendu.contains(faux),

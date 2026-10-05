@@ -52,6 +52,7 @@ pub(crate) fn contextuel(mode: &InputMode) -> Vec<Raccourci> {
         InputMode::Normal => vec![
             raccourci("↑/↓", "Naviguer"),
             raccourci("Entrée", "Ouvrir"),
+            raccourci("e", "Modifier"),
             raccourci("p", "Réglages projet"),
             raccourci("c", "Coûts"),
             raccourci("s", "Préférences"),
