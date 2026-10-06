@@ -36,7 +36,7 @@ mod registry;
 mod startup;
 mod ui;
 
-use crate::launch::{run_launch_sequence, LaunchKind};
+use crate::launch::{run_launch_sequence, session_existante, LaunchKind};
 use crate::registry::ProjectEntry;
 use crate::startup::{Progress, Step};
 
@@ -1658,7 +1658,9 @@ fn main() -> Result<()> {
         if let Some(dir) = app.pending_launch.take() {
             let name = app.pending_name.take()
                 .unwrap_or_else(|| dir.display().to_string());
-            run_launch_sequence(LaunchKind::Resume, &name, &dir, app.pending_sudo)?;
+            let kind = kind_pour_repertoire(&dir, &app.opencode_db_path, app.pending_bare);
+            app.pending_bare = false;
+            run_launch_sequence(kind, &name, &dir, app.pending_sudo)?;
             return Ok(());
         }
         if app.filtered.len() <= 1 {
@@ -2107,6 +2109,28 @@ fn appliquer_tri(app: &mut App, popup: &mut Popup)
   }
 
 
+/// Mode de lancement à utiliser pour `dir`.
+///
+/// `--continue` n'est proposé que si une session existe déjà : opencode
+/// refuse de reprendre une session absente et le lancement échoue. Un
+/// premier passage bascule donc sur `LaunchKind::Module` (verrou posé,
+/// aucun résumé), qui démarre proprement dans un répertoire vierge.
+fn kind_pour_repertoire(dir: &Path, db_path: &Path, bare: bool) -> LaunchKind
+  {
+    if bare
+      {
+        LaunchKind::Bare
+      }
+    else if session_existante(db_path, dir)
+      {
+        LaunchKind::Resume
+      }
+    else
+      {
+        LaunchKind::Module
+      }
+  }
+
 fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Result<()> {
     let mut input_mode = mode_initial;
 
@@ -2375,11 +2399,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             terminal.backend_mut().flush()?;
 
             // Résumé + lancement d'opencode
-            let kind = if app.pending_bare {
-                LaunchKind::Bare
-            } else {
-                LaunchKind::Resume
-            };
+            let kind = kind_pour_repertoire(&dir, &app.opencode_db_path, app.pending_bare);
             app.pending_bare = false;
             let launch_err = run_launch_sequence(kind, &name, &dir, sudo).err();
 
@@ -4077,8 +4097,8 @@ fn handle_edit_input(
 mod tests
   {
     use crate::{
-        cout_affiche, normaliser_recherche, sanitize, startup, variant_label, Cli, Progress,
-        SortOrder,
+        cout_affiche, kind_pour_repertoire, normaliser_recherche, sanitize, startup,
+        variant_label, Cli, LaunchKind, Progress, SortOrder,
     };
     use clap::Parser;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4090,6 +4110,47 @@ mod tests
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn le_premier_lancement_evite_la_reprise_de_session() {
+        let dir = temp_dir("sans-session");
+        let db = dir.join("opencode.db");
+        // Base absente : aucun --continue ne doit être tenté, sinon
+        // opencode s'arrête sur « Expected a string starting with ses ».
+        assert_eq!(
+            kind_pour_repertoire(&dir, &db, false),
+            LaunchKind::Module,
+            "sans session, le lancement se fait à blanc"
+        );
+        // L'entrée « Sans projet » garde sa voie, quelle que soit la base.
+        assert_eq!(kind_pour_repertoire(&dir, &db, true), LaunchKind::Bare);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_repertoire_deja_ouvert_reprend_son_session() {
+        let dir = temp_dir("avec-session");
+        let db = dir.join("opencode.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session (id, directory) VALUES ('ses_1', ?1)",
+                [dir.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            kind_pour_repertoire(&dir, &db, false),
+            LaunchKind::Resume,
+            "session existante : le résumé et --continue restent de mise"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
