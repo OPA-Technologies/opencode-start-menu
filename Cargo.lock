@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "opencode-start-menu"
-version = "0.20.19"
+version = "0.20.20"
 dependencies = [
  "anyhow",
  "chrono",
