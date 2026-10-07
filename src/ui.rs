@@ -1146,6 +1146,19 @@ fn render_module_dialog(
     f.render_widget(paragraph, area);
 }
 
+/// Mode d'emploi de chaque réglage de l'onglet Paramètres, sur une ligne.
+///
+/// Ligne affichée sous la liste, elle suit la flèche ↑/↓ : l'aide porte
+/// toujours sur l'option courante, et fait le pont entre le libellé et ce que
+/// ce réglage change réellement — la liste, elle, ne dit que la valeur.
+const AIDE_OPTIONS: [&str; 5] = [
+  "Tri de la liste : par date de modification ou alphabétique",
+  "Colonnes visibles : ←→ choisit la colonne, Entrée l'affiche ou la masque",
+  "Lancement root : lance l'éditeur avec sudo -i quand les droits manquent",
+  "Capture du wrapper : journalise la sortie du lanceur dans le registre",
+  "Pays de la source : code ISO, pour la devise de référence des séries",
+];
+
 /// Contenu de l'onglet Paramètres : préférences globales, hors projet.
 ///
 /// La logique clavier existait déjà (`handle_parametres_input`) mais aucun
@@ -1221,10 +1234,19 @@ fn render_contenu_parametres(f: &mut Frame, area: Rect, app: &App, popup: &crate
         lignes.push(Line::from(spans));
       }
 
-    // Liste des colonnes activées, pour que l'effet du réglage soit visible
-    // sans les ouvrir une par une.
+    // L'aide de l'option courante : la liste ne montre que la valeur de
+    // chaque réglage, cette ligne dit ce qu'il fait. Elle descend avec ↑/↓,
+    // donc aucune des cinq explications n'est reléguée dans la F1.
     lignes.push(Line::from(""));
-    lignes.push(Line::from(Span::styled(" Colonnes affichées dans le détail", libelle)));
+    lignes.push(Line::from(Span::styled(
+      format!(" {}", AIDE_OPTIONS.get(etat.actif).copied().unwrap_or("")),
+      libelle,
+    )));
+
+    // La liste des colonnes activées se prête mal à une suite de `Span` : les
+    // noms n'ont pas la même longueur et les ☑/☐ dansent. Une vraie table,
+    // sans cadre — le popup porte déjà la bordure — aligne les cases par
+    // colonnes, et déplace le jeu uniquement quand on bascule une colonne.
     let colonnes: Vec<String> = crate::registry::TOUTES_COLONNES
       .iter()
       .map(|c| {
@@ -1232,31 +1254,49 @@ fn render_contenu_parametres(f: &mut Frame, area: Rect, app: &App, popup: &crate
         if actif { format!("☑ {c}") } else { format!("☐ {c}") }
       })
       .collect();
-    for ligne in colonnes.chunks(3)
-      {
-        let mut spans: Vec<Span> = Vec::new();
-        for c in ligne
-          {
-            spans.push(Span::raw(format!("{c}   ")));
-          }
-        lignes.push(Line::from(spans));
-      }
+    let rangees: Vec<Row> = colonnes
+      .chunks(3)
+      .map(|groupe| Row::new(groupe.iter().map(|c| Cell::from(c.clone()))))
+      .collect();
 
-    lignes.push(Line::from(""));
-    lignes.push(Line::from(Span::styled(
-      " Entrée basculer  ·  ↑/↓ option  ·  ←→ colonne  ·  Échap fermer ",
-      libelle,
-    )));
-
+    // Pied : les gestes, puis l'éventuel message d'erreur. Dans leur propre
+    // zone, ils gardent les mêmes rangées quelle que soit la taille du popup
+    // et ne cassent plus l'alignement du bloc des colonnes.
+    let mut pied: Vec<Line> = vec![
+      Line::from(""),
+      Line::from(Span::styled(
+        " Entrée basculer  ·  ↑/↓ option  ·  ←→ colonne  ·  Échap fermer ",
+        libelle,
+      )),
+    ];
     if let Some(msg) = etat.message.as_deref()
       {
-        lignes.push(Line::from(Span::styled(
-          msg.to_string(),
-          Style::default().fg(Color::Yellow),
-        )));
+        pied.push(Line::from(Span::styled(msg.to_string(), Style::default().fg(Color::Yellow))));
       }
 
-    f.render_widget(Paragraph::new(lignes).wrap(Wrap { trim: false }), area);
+    let zones = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([
+        Constraint::Length(lignes.len() as u16),
+        Constraint::Length(1 + rangees.len() as u16),
+        Constraint::Min(0),
+      ])
+      .split(area);
+
+    f.render_widget(Paragraph::new(lignes), zones[0]);
+    let sous_zones = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([Constraint::Length(1), Constraint::Min(0)])
+      .split(zones[1]);
+    // Le titre du bloc garde toute la largeur : pris comme tête de tableau, il
+    // serait découpé à la largeur de la première colonne.
+    f.render_widget(
+      Paragraph::new(Line::from(Span::styled(" Colonnes affichées dans le détail", libelle))),
+      sous_zones[0],
+    );
+    let table = Table::new(rangees, [Constraint::Percentage(33); 3]).column_spacing(1);
+    f.render_widget(table, sous_zones[1]);
+    f.render_widget(Paragraph::new(pied), zones[2]);
   }
 
 /// Point d'entrée unique du popup : cadre, barre d'onglets, puis le contenu
@@ -3235,5 +3275,90 @@ mod tests
         assert!(!rendu.contains("Liste des projets"), "on doit avoir défilé vers le bas");
         assert!(rendre_ecran(&aide_detaillee(), 100, 40).contains("Liste des projets"));
       }
+
+    /// L'aide de l'option courante doit changer avec ↑/↓ : sans elle, deux
+    /// options voisines se reconnaîtraient à leur valeur, mais le réglage lui
+    /// même resterait muet pour qui ne connaît pas déjà l'écran.
+    #[test]
+    fn l_aide_des_parametres_suit_l_option_active()
+      {
+        let (app, _dir) = app_de_test("param-aide");
+        let fragments = [
+          "par date de modification",
+          "choisit la colonne",
+          "quand les droits manquent",
+          "journalise la sortie",
+          "code ISO",
+        ];
+        for (actif, attendu) in fragments.iter().enumerate()
+          {
+            let mut popup = popup_de_test(&app, crate::Onglet::Parametres);
+            popup.parametres.actif = actif;
+            let rendu = rendre_popup_en(&app, &popup, 110, 34);
+            assert!(
+              rendu.contains(attendu),
+              "l'aide doit décrire l'option {actif} :\n{rendu}"
+            );
+            for (autre_i, absent) in fragments.iter().enumerate()
+              {
+                if autre_i != actif
+                  {
+                    assert!(
+                      !rendu.contains(absent),
+                      "le mode d'emploi d'une autre option ne doit pas s'afficher :\n{rendu}"
+                    );
+                  }
+              }
+          }
+      }
+
+    /// La grille des colonnes est une vraie table : les ☑/☐ d'une même
+    /// colonne partagent la même abscisse, sinon la liste n'est qu'une suite
+    /// de cases collées qui dansent à chaque bascule.
+    #[test]
+    fn les_cases_des_colonnes_sont_aligees_sur_trois_colonnes()
+      {
+        let (app, _dir) = app_de_test("param-alignement");
+        let popup = popup_de_test(&app, crate::Onglet::Parametres);
+        let buf = popup_dans_buffer(&app, &popup, 110, 34);
+        let rendu = texte(&buf);
+        let titre_y = rang(&buf, "Colonnes affichées dans le détail")
+          .expect("le titre du bloc des colonnes doit s'afficher");
+        let rangees: Vec<Vec<u16>> = (1..=3)
+          .map(|d| {
+              let y = titre_y + d;
+              let ligne = &rendu.lines().collect::<Vec<_>>()[y as usize];
+              ligne
+                .match_indices('☑')
+                .chain(ligne.match_indices('☐'))
+                .map(|(i, _)| i as u16)
+                .collect::<Vec<_>>()
+          })
+          .collect();
+        assert_eq!(rangees.len(), 3, "9 colonnes sur 3 rangées :\n{rendu}");
+        for rangee in &rangees
+          {
+            assert_eq!(
+              rangee.len(),
+              3,
+              "chaque rangée porte exactement trois cases :\n{rendu}"
+            );
+          }
+        let (c0, c1, c2) = (rangees[0][0], rangees[0][1], rangees[0][2]);
+        assert!(
+          c0 < c1 && c1 < c2,
+          "les trois colonnes doivent se suivre :\n{rendu}"
+        );
+        for rangee in &rangees[1..]
+          {
+            assert_eq!(
+              *rangee,
+              [c0, c1, c2],
+              "une case ne doit pas danser hors de sa colonne :\n{rendu}"
+            );
+          }
+      }
+
+    // --- Popup unifié -------------------------------------------------
 
   }
