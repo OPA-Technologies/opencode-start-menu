@@ -793,10 +793,10 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         lines.push(Line::from(""));
       }
 
-    let paragraph = Paragraph::new(lines)
-      .block(block)
-      .style(opaque)
-      .wrap(Wrap { trim: true });
+    // Pas de retour automatique à la ligne : chaque champ occupe exactement une
+    // rangée, ce qui est la condition pour que le curseur et le menu Statut se
+    // posent sur la bonne ligne. Une valeur trop longue est tronquée à droite.
+    let paragraph = Paragraph::new(lines).block(block).style(opaque);
     f.render_widget(paragraph, area);
 
     // Curseur réel : sur la valeur du champ actif.
@@ -984,16 +984,18 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         lines.push(Line::from(""));
       }
 
-    let paragraph = Paragraph::new(lines)
-      .block(block)
-      .style(opaque)
-      .wrap(Wrap { trim: false });
+    // Pas de retour automatique à la ligne : le contenu est rendu sans cadre
+    // (le cadre est celui de `Fenetre`), donc ligne `i` = rangée `area.y + i`.
+    // Une description longue tronque à droite au lieu de pousser les lignes
+    // suivantes — et avec elles le curseur et le menu Statut.
+    let paragraph = Paragraph::new(lines).block(block).style(opaque);
     f.render_widget(paragraph, area);
 
     // Curseur réel : sur la valeur du champ en cours d'édition.
     if state.editing
       {
-        let cursor_y = area.y + 2 + active as u16; // bordure(1) + ligne vide(1) + index champ
+        // Sans bordure : ligne 0 = rangée vide, puis les quatre champs.
+        let cursor_y = area.y + 1 + active as u16;
         // Colonne de début de valeur = libellé réel + « : », puis largeur
         // rendue du préfixe saisi (pas son nombre de caractères).
         let value_x = area.x + labels[active].0.chars().count() as u16 + 3;
@@ -1015,7 +1017,9 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
           }
         let width = items.iter().map(|s| s.chars().count()).max().unwrap_or(8) + 2;
         let px = (area.x + 3).min(area.x.saturating_add(area.width).saturating_sub(width as u16));
-        let py = area.y + 4; // sous la ligne du champ Statut (row = area.y+3)
+        // Superposé à la ligne du champ Statut (rangée `area.y + 2`) : le menu
+        // prend la place de la valeur qu'il remplace.
+        let py = area.y + 2;
         let parea = Rect {
             x: px,
             y: py,
@@ -1820,6 +1824,31 @@ mod tests
         (term.backend().buffer().clone(), (curseur.x, curseur.y))
       }
 
+    /// Rendu du popup unifié dans un buffer, avec la position réelle du
+    /// curseur : c'est le couple qui permet de vérifier que le curseur tombe
+    /// sur la rangée du champ qu'il prétend éditer.
+    fn popup_avec_curseur(
+        app: &crate::App,
+        popup: &crate::Popup,
+        largeur: u16,
+        hauteur: u16,
+      ) -> (Buffer, (u16, u16))
+      {
+        let mut term = Terminal::new(TestBackend::new(largeur, hauteur)).unwrap();
+        term.draw(|f| render_popup_unifie(f, f.area(), app, popup)).unwrap();
+        let curseur = term.get_cursor_position().unwrap();
+        (term.backend().buffer().clone(), (curseur.x, curseur.y))
+      }
+
+    /// Première rangée portant `ancre`, ou `None` si elle est absente.
+    ///
+    /// Recherche par colonnes (via `colonne`), pour les mêmes raisons que
+    /// `ligne` : `find` sur une `String` donne un indice d'octet.
+    fn rang(buf: &Buffer, ancre: &str) -> Option<u16>
+      {
+        (0..buf.area.height).find(|&y| colonne(&ligne(buf, y), ancre).is_some())
+      }
+
     /// Style appliqué à la première cellule portant `cherche`, ou `None` si le
     /// texte est absent du rendu.
     fn style_de(buf: &Buffer, cherche: &str) -> Option<Modifier>
@@ -2020,6 +2049,138 @@ mod tests
         assert_eq!(
             x_un_caractere_large, x_deux_caracteres,
             "le curseur doit suivre les colonnes affichées, pas les caractères"
+        );
+      }
+
+    /// Le curseur de l'éditeur doit tomber sur la rangée du champ affiché.
+    ///
+    /// Le contenu du popup est rendu sans cadre (le cadre est celui de
+    /// `Fenetre`) : ligne `i` = rangée `area.y + i`. Le calcul comptait la
+    /// bordure en plus et posait le curseur une rangée trop bas — sur le champ
+    /// suivant, ou sur le pied quand on éditait le dernier.
+    #[test]
+    fn le_curseur_du_popup_se_pose_sur_la_ligne_du_champ()
+      {
+        let (app, _dir) = app_de_test("curseur-popup");
+        let libelles = ["Version Debug", "Statut Debug", "Description", "Enregistrer ?"];
+        for (champ, libelle) in libelles.iter().enumerate()
+          {
+            let mut popup = popup_de_test(&app, crate::Onglet::Projet);
+            popup.projet.active_field = champ;
+            popup.projet.editing = true;
+            popup.projet.input_buffer = "abc".to_string();
+            popup.projet.input_offset = 3;
+            let (buf, (_, curseur_y)) = popup_avec_curseur(&app, &popup, 110, 34);
+            let attendu = rang(&buf, libelle)
+                .unwrap_or_else(|| panic!("« {libelle} » absent du rendu"));
+            assert_eq!(
+                curseur_y, attendu,
+                "champ {champ} : le curseur doit se poser sur la ligne « {libelle} »"
+            );
+          }
+      }
+
+    /// Un champ ne doit pas changer de rangée quand sa valeur déborde : avec
+    /// un retour automatique, la description longue poussait « Enregistrer ? »
+    /// vers le bas, et le curseur (calculé sur l'index) restait derrière.
+    #[test]
+    fn une_description_longue_ne_deplace_pas_les_lignes_suivantes()
+      {
+        let (mut app, _dir) = app_de_test("desc-longue");
+        app.projects[0].description = "x".repeat(300);
+        let popup = popup_de_test(&app, crate::Onglet::Projet);
+        let buf = popup_dans_buffer(&app, &popup, 110, 34);
+        let description = rang(&buf, "Description").expect("la ligne Description doit être là");
+        let enregistrer = rang(&buf, "Enregistrer ?")
+            .expect("la ligne Enregistrer doit être là");
+        assert_eq!(
+            enregistrer, description + 1,
+            "la description longue ne doit pas décaler la ligne suivante :\n{}",
+            texte(&buf)
+        );
+      }
+
+    /// Le curseur du formulaire de création doit viser la rangée du champ
+    /// affiché, pour les sept entrées y compris la confirmation finale.
+    #[test]
+    fn le_curseur_du_formulaire_se_pose_sur_la_ligne_du_champ()
+      {
+        let libelles = [
+            "ID",
+            "Nom",
+            "Chemin",
+            "Description",
+            "Statut",
+            "Version",
+            "Ouvrir ?",
+        ];
+        for (champ, libelle) in libelles.iter().enumerate()
+          {
+            let mut state = saisie_en_cours("abc", 3);
+            state.active_field = champ;
+            let (buf, (_, curseur_y)) = creation_dans_buffer(&state);
+            let attendu = rang(&buf, libelle)
+                .unwrap_or_else(|| panic!("« {libelle} » absent du rendu"));
+            assert_eq!(
+                curseur_y, attendu,
+                "champ {champ} : le curseur doit se poser sur la ligne « {libelle} »"
+            );
+          }
+      }
+
+    /// Même règle sans retour automatique : un chemin très long est tronqué à
+    /// droite, et la confirmation finale reste à sa place.
+    #[test]
+    fn une_valeur_longue_ne_deplace_pas_la_confirmation()
+      {
+        let mut state = saisie_en_cours("", 0);
+        state.path = "x".repeat(300);
+        let (buf, _) = creation_dans_buffer(&state);
+        let id = rang(&buf, "ID").expect("la ligne ID doit être là");
+        let ouvrir = rang(&buf, "Ouvrir ?").expect("la ligne Ouvrir doit être là");
+        assert_eq!(
+            ouvrir, id + 6,
+            "le chemin long ne doit pas décaler les lignes suivantes :\n{}",
+            texte(&buf)
+        );
+      }
+
+    /// Le menu Statut du popup se superpose à la ligne du champ qu'il édite :
+    /// il prend la place de la valeur qu'il remplace, pas celle des lignes
+    /// d'avant (la Version) ni celles d'après.
+    #[test]
+    fn le_menu_du_statut_du_popup_couvre_sa_ligne()
+      {
+        let (app, _dir) = app_de_test("projet-gamma");
+        let mut popup = popup_de_test(&app, crate::Onglet::Projet);
+        popup.projet.active_field = 1;
+        popup.projet.status_menu_open = true;
+        let buf = popup_dans_buffer(&app, &popup, 110, 34);
+        let version = rang(&buf, "Version Debug").expect("la ligne Version doit rester lisible");
+        let menu = rang(&buf, " Statut ")
+            .expect("le titre du menu Statut doit être là");
+        assert_eq!(
+            menu, version + 1,
+            "le menu doit couvrir exactement la ligne du champ Statut :\n{}",
+            texte(&buf)
+        );
+      }
+
+    /// Le menu du formulaire de création reste sous la ligne du Statut : la
+    /// ligne du champ est à `area.y + 7`, le menu à `area.y + 8`.
+    #[test]
+    fn le_menu_du_statut_du_formulaire_descend_d_une_rangee()
+      {
+        let mut state = saisie_en_cours("", 4);
+        state.status_menu_open = true;
+        let (buf, _) = creation_dans_buffer(&state);
+        let statut = rang(&buf, "Statut").expect("la ligne Statut doit être là");
+        let menu = rang(&buf, " Statut ")
+            .expect("le titre du menu Statut doit être là");
+        assert_eq!(
+            menu, statut + 1,
+            "le menu doit s'ouvrir juste sous la ligne du champ Statut :\n{}",
+            texte(&buf)
         );
       }
 
