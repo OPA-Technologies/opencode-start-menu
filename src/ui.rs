@@ -2590,21 +2590,32 @@ mod tests
       }
 
     /// Régression B2 : l'aide annonçait `t Valorisation` et `←/→ Changer onglet`,
-    /// deux touches qui n'ont jamais été branchées, pendant que `e Modifier` —
-    /// branchée jusqu'à la refonte du popup unifié, puis supprimée par accident
-    /// avec elle — disparaissait de l'aide au lieu d'être rétablie. Un
-    /// utilisateur qui cherchait `e` concluait à un programme cassé.
+    /// deux touches qui n'ont jamais été branchées. Le fléau contraire existe
+    /// aussi : promettre des touches qu'on vient de retirer. `e`, `c` et `s`
+    /// ont été libérés au profit de `b`, et la barre ne doit plus annoncer ni
+    /// les unes ni les libellés qui leur appartenaient.
     #[test]
     fn la_barre_d_aide_n_annonce_plus_de_touches_inexistantes()
       {
         let rendu = rendre_ecran(&InputMode::Normal, 120, 40);
+        let barre = rendu.lines().last().unwrap_or("").to_string();
         assert!(
-          !rendu.contains("t Valorisation"),
+          !barre.contains("t Valorisation"),
           "« t Valorisation » n'existe pas dans le code :\n{rendu}"
         );
-        for reel in ["e Modifier", "p", "c", "s", "m", "F1"]
+        for libere in ["Modifier", "Coûts", "Préférences"]
           {
-            assert!(rendu.contains(reel), "« {reel} » est une touche réelle, elle doit être annoncée");
+            assert!(
+              !barre.contains(libere),
+              "« {libere} » appartient à une touche retirée : {barre}"
+            );
+          }
+        for reel in ["Réglages", "Bump", "Module", "Nouveau", "F1"]
+          {
+            assert!(
+              barre.contains(reel),
+              "« {reel} » est une touche réelle, elle doit être annoncée : {barre}"
+            );
           }
       }
 
@@ -2693,7 +2704,7 @@ mod tests
     fn f1_affiche_les_gestes_de_l_ecran_d_origine()
       {
         let rendu = rendre_ecran(&aide_contextuelle(), 100, 34);
-        for geste in ["Naviguer", "Ouvrir", "Réglages projet", "Coûts"]
+        for geste in ["Naviguer", "Ouvrir", "Réglages", "Bump"]
           {
             assert!(rendu.contains(geste), "« {geste} » manque pour l'écran d'origine :\n{rendu}");
           }

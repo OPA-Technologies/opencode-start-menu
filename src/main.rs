@@ -106,6 +106,10 @@ pub(crate) struct App {
     pending_sudo: bool,
     pending_name: Option<String>,
     pending_bare: bool,
+    /// Index du projet dont un bump de version manuel attend la `o` de
+    /// confirmation. Mémorisé entre deux frappes seulement : toute autre
+    /// touche l'annule, ce qui interdit tout décalage d'index.
+    bump_en_attente: Option<usize>,
     /// Cache des séries de tarifs récupérées de la source web, partagé par
     /// tous les projets (évite un téléchargement par projet).
     pub(crate) web_cache: registry::WebCache,
@@ -297,8 +301,9 @@ pub(crate) enum InputMode {
         modules: Vec<PathBuf>,
         selected: usize,
     },
-    /// Popup unique regroupant les réglages du projet, les coûts et les
-    /// préférences. Les touches `p`, `c` et `s` y mènent.
+    /// Popup unique regroupant le projet, les coûts et les préférences.
+    /// Une seule touche y mène depuis la liste : `p`, sur Paramètres, et
+    /// `Tab`/`⇧Tab` desservent les trois onglets.
     Popup(Popup),
     /// Aide contextuelle (F1) ou liste complète (F10).
     ///
@@ -730,6 +735,7 @@ impl App {
             pending_sudo: false,
             pending_name: None,
             pending_bare: false,
+            bump_en_attente: None,
             web_cache: registry::WebCache::default(),
             prefs: registry::Preferences::default(),
             registry_broken: false,
@@ -779,6 +785,7 @@ impl App {
             pending_sudo: false,
             pending_name: None,
             pending_bare: false,
+            bump_en_attente: None,
             web_cache: registry::WebCache::default(),
             prefs: registry::Preferences::default(),
             registry_broken: false,
@@ -1784,19 +1791,14 @@ fn run_tui(app: App, terminal: &mut Term, mode_initial: InputMode) -> Result<()>
 /// Ouvre le popup unifié sur l'onglet demandé, ou reste sur la liste si aucun
 /// projet n'est sélectionné.
 ///
-/// Les réglages du projet (`p`) et les coûts (`c`) portent sur un projet
-/// précis : sans sélection, il n'y a rien à montrer. Les préférences (`s`) sont
-/// globales et restent donc accessibles même quand la liste est vide.
-/// La touche `e` du menu principal : l'éditeur, c'est l'onglet Projet.
+/// Une seule touche y mène depuis la liste : `p`, qui se pose sur
+/// Paramètres. `Tab` et `⇧Tab` desservent ensuite les trois onglets, ce qui
+/// évite de tenir trois lettres (`e`, `c`, `s`) pour trois entrées du même
+/// écran.
 ///
-/// `EditingProject` a disparu au profit du popup unifié, et le raccourci a
-/// disparu dans le même commit alors qu'il nommait toujours une intention
-/// réelle : depuis, chercher `e` menait à un menu muet. `e` et `p` ouvrent donc
-/// le même écran, et cette fonction le dit plutôt que de le dupliquer.
-fn ouvrir_editeur(app: &mut App) -> InputMode {
-    ouvrir_popup(app, Onglet::Projet)
-}
-
+/// Les réglages du projet et les coûts portent sur un projet précis : sans
+/// sélection, il n'y a rien à montrer. Les préférences sont globales et
+/// restent donc accessibles même quand la liste est vide.
 fn ouvrir_popup(app: &mut App, onglet: Onglet) -> InputMode {
     let Some(idx) = app.selected_project_idx() else {
         return InputMode::Popup(Popup::sans_projet(onglet, app.web_cache.country.clone()));
@@ -1808,6 +1810,95 @@ fn ouvrir_popup(app: &mut App, onglet: Onglet) -> InputMode {
     let country = app.web_cache.country.clone();
     InputMode::Popup(Popup::nouveau(idx, projet, country).avec_onglet(onglet))
 }
+
+/// Demande de bump manuel : annonce rien de plus, n'écrit rien encore.
+///
+/// Le projet est mémorisé par son index : le confirmer immédiatement après
+/// (`o`) garantit qu'aucun rescan n'a pu décaler la sélection entre les
+/// deux frappes, puisqu'une autre touche annule la demande.
+fn demander_bump(app: &mut App)
+  {
+    let Some(idx) = app.selected_project_idx()
+      else
+        {
+          app.push_info("Aucun projet sélectionné".to_string());
+          return;
+        };
+    let nom = app.projects[idx].name.clone();
+    app.bump_en_attente = Some(idx);
+    app.push_info(format!("Bumper « {nom} » ? (o/N)"));
+  }
+
+/// Annulation : plus rien à confirmer, la zone de message redevient vide.
+fn annuler_bump(app: &mut App)
+  {
+    app.bump_en_attente = None;
+    app.status_messages.clear();
+  }
+
+/// Confirmation : incrément du patch, manifeste réécrit, registre persisté.
+fn confirmer_bump(app: &mut App)
+  {
+    let Some(idx) = app.bump_en_attente.take()
+      else
+        {
+          return;
+        };
+    if idx >= app.projects.len()
+      {
+        return;
+      }
+    let resultat = bump_projet(&mut app.projects[idx]);
+    match resultat
+      {
+        Ok((avant, apres)) =>
+          {
+            let nom = app.projects[idx].name.clone();
+            let sauve = registry::save_registry_full(
+              &app.registry_path,
+              &app.projects,
+              &app.web_cache,
+              &app.prefs,
+            );
+            match sauve
+              {
+                Ok(()) => app.push_info(format!("{nom} : {avant} → {apres}")),
+                Err(e) => app.push_error(format!(
+                  "{nom} : {avant} → {apres}, mais registre non écrit ({e})"
+                )),
+              }
+          }
+        Err(e) => app.push_error(format!("Bump impossible : {e}")),
+      }
+  }
+
+/// Incrémente le patch d'un projet et resynchronise le manifeste et le hash.
+///
+/// Même déroulé qu'AutoPatch (`rescan_repertoire`), en un seul geste :
+/// version du registre, `version` élue, manifeste, puis recalcul du hash —
+/// le manifeste étant lui-même hashé, l'ordre décide de la suite : sans ce
+/// recalcul, le rescan suivant prendrait la nouvelle version pour une
+/// modification et rebumperait à son tour.
+fn bump_projet(p: &mut ProjectEntry) -> Result<(String, String)>
+  {
+    let avant = if p.version_debug.is_empty()
+      {
+        "—".to_string()
+      }
+    else
+      {
+        p.version_debug.clone()
+      };
+    let nouvelle = bump_patch(&p.version_debug).unwrap_or_else(|| "0.0.1".to_string());
+    p.version_debug = nouvelle.clone();
+    p.version = nouvelle.clone();
+    // Un édition manuelle suspendait les bumps automatiques : le geste
+    // explicite remet la détection en marche.
+    p.version_manually_edited = false;
+    bump_manifest_version(&p.path, &nouvelle)?;
+    p.source_hash = registry::compute_source_hash(&p.path);
+    Ok((avant, nouvelle))
+  }
 
 /// Index des options de l'onglet Paramètres, dans l'ordre d'affichage.
 const OPTION_TRI: usize = 0;
@@ -2155,6 +2246,33 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                 break;
               }
 
+            // Bump manuel en attente : la touche décide seule, à la manière
+            // du `o/N` du formulaire de création. Une autre touche annule
+            // d'abord la demande, puis reste libre d'agir ailleurs — c'est
+            // ce qui rend l'index mémorisé inattaquable, aucun rescan ne
+            // peut s'intercaler entre les deux frappes.
+            if matches!(input_mode, InputMode::Normal) && app.bump_en_attente.is_some()
+              {
+                match key.code
+                  {
+                    KeyCode::Char('o') | KeyCode::Char('O') =>
+                      {
+                        confirmer_bump(&mut app);
+                        continue;
+                      }
+                    KeyCode::Char('n')
+                    | KeyCode::Char('N')
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('Q')
+                    | KeyCode::Esc =>
+                      {
+                        annuler_bump(&mut app);
+                        continue;
+                      }
+                    _ => annuler_bump(&mut app),
+                  }
+              }
+
             // F1 ouvre l'aide contextuelle, F10 la liste complète. Les deux
             // sont globaux : l'aide doit être atteignable depuis n'importe
             // quel écran. F10 est écarté pendant une saisie, sinon il
@@ -2200,9 +2318,12 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                     KeyCode::Char('n') => {
                         InputMode::CreatingProject(ProjectCreationState::default())
                     }
-                    KeyCode::Char('e') | KeyCode::Char('E') => ouvrir_editeur(&mut app),
                     KeyCode::Char('p') | KeyCode::Char('P') => {
-                        ouvrir_popup(&mut app, Onglet::Projet)
+                        ouvrir_popup(&mut app, Onglet::Parametres)
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        demander_bump(&mut app);
+                        InputMode::Normal
                     }
                     KeyCode::Char('m') => {
                         if let Some(idx) = app.selected_project_idx() {
@@ -2224,12 +2345,6 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                     KeyCode::Char('v') => {
                         app.set_bare_launch();
                         InputMode::Normal
-                    }
-                    KeyCode::Char('c') | KeyCode::Char('C') => {
-                        ouvrir_popup(&mut app, Onglet::Couts)
-                    }
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
-                        ouvrir_popup(&mut app, Onglet::Parametres)
                     }
                     _ => InputMode::Normal,
                 },
@@ -4102,7 +4217,10 @@ mod tests
     };
     use clap::Parser;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -5102,15 +5220,20 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         assert_eq!(crate::cout_session_double("—", &local), "—");
       }
 
-    /// La touche `e` du menu principal ouvre l'éditeur, c'est-à-dire l'onglet
-    /// Projet du popup unifié. `EditingProject` et son raccourci ont disparu
-    /// ensemble lors de la refonte : chercher `e` ne faisait plus rien du tout,
-    /// et l'aide contextuelle avait suivi le code au lieu de le rappeler.
-    #[test]
-    fn la_touche_e_ouvre_le_popup_projet() {
-        let dir = temp_dir("editeur");
+    /// Manifeste et sources : le décor minimal qu'un bump a le droit d'écrire.
+    fn projet_a_bumper(dir: &Path) -> PathBuf {
         let projet = dir.join("projet");
-        fs::create_dir_all(&projet).unwrap();
+        fs::create_dir_all(projet.join("src")).unwrap();
+        fs::write(
+            projet.join("Cargo.toml"),
+            "[package]\nname = \"projet\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(projet.join("src/main.rs"), "fn main() {}\n").unwrap();
+        projet
+    }
+
+    fn app_sur(dir: &Path, projet: &Path) -> crate::App {
         let registre = dir.join("registre.json");
         let json = serde_json::json!({
             "projects": {
@@ -5119,35 +5242,99 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
                     "path": projet.to_str().unwrap(),
                     "version": "1.0.0",
                     "version_debug": "1.0.0",
+                    "description": "",
                     "tarif_mode": "manuel"
                 }
             }
         });
         fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
-
-        let mut app = crate::App::new_light(registre.clone(), SortOrder::Modified);
+        let mut app = crate::App::new_light(registre, SortOrder::Modified);
         crate::refresh_project_selection(&mut app);
         app.list_state.select(Some(0));
+        app
+    }
 
-        match crate::ouvrir_editeur(&mut app) {
-            crate::InputMode::Popup(popup) => {
-                assert_eq!(popup.onglet, crate::Onglet::Projet, "`e` ouvre l'onglet Projet");
-                assert_eq!(popup.projet.project_idx, 0, "`e` vise le projet sélectionné");
-            }
-            _ => panic!("`e` doit ouvrir le popup unifié"),
-        }
+    #[test]
+    fn le_bump_manuel_passe_de_1_0_0_a_1_0_1() {
+        let dir = temp_dir("bump");
+        let projet = projet_a_bumper(&dir);
+        let mut app = app_sur(&dir, &projet);
 
-        // Sans projet sélectionné, `e` se comporte comme `p` : l'écran
-        // « sans projet » s'affiche plutôt que de ne rien faire.
+        crate::demander_bump(&mut app);
+        assert_eq!(app.bump_en_attente, Some(0), "`b` mémorise la sélection");
+        assert!(
+            app.status_messages.join(" ").contains('o'),
+            "la demande annonce la `o` de confirmation"
+        );
+
+        crate::confirmer_bump(&mut app);
+        assert_eq!(app.bump_en_attente, None, "plus rien en attente");
+        assert_eq!(app.projects[0].version_debug, "1.0.1");
+        assert_eq!(app.projects[0].version, "1.0.1");
+        let manifeste = fs::read_to_string(projet.join("Cargo.toml")).unwrap();
+        assert!(
+            manifeste.contains("version = \"1.0.1\""),
+            "Cargo.toml doit être réécrit :\n{manifeste}"
+        );
+        assert!(
+            app.status_messages.join(" ").contains("1.0.1"),
+            "le bilan annonce la version atteinte"
+        );
+
         fs::remove_dir_all(&dir).unwrap();
-        let mut vide = crate::App::new_light(registre, SortOrder::Modified);
-        crate::refresh_project_selection(&mut vide);
-        match crate::ouvrir_editeur(&mut vide) {
-            crate::InputMode::Popup(popup) => {
-                assert_eq!(popup.onglet, crate::Onglet::Projet);
-            }
-            _ => panic!("`e` doit ouvrir le popup unifié, même sans projet"),
-        }
-      }
+    }
+
+    #[test]
+    fn le_bump_resynchronise_le_hash_pour_ne_pas_rebumper() {
+        let dir = temp_dir("bump-hash");
+        let projet = projet_a_bumper(&dir);
+        let mut app = app_sur(&dir, &projet);
+
+        crate::demander_bump(&mut app);
+        crate::confirmer_bump(&mut app);
+        assert_eq!(
+            app.projects[0].source_hash,
+            crate::registry::compute_source_hash(&projet),
+            "hash non resynchronisé : le rescan suivant rebumperait"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn le_bump_annule_ne_rien_ecrit() {
+        let dir = temp_dir("bump-annule");
+        let projet = projet_a_bumper(&dir);
+        let mut app = app_sur(&dir, &projet);
+
+        crate::demander_bump(&mut app);
+        crate::annuler_bump(&mut app);
+        assert_eq!(app.bump_en_attente, None);
+        assert_eq!(app.projects[0].version_debug, "1.0.0");
+        assert!(app.status_messages.is_empty(), "l'annulation vide la zone");
+        let manifeste = fs::read_to_string(projet.join("Cargo.toml")).unwrap();
+        assert!(
+            manifeste.contains("version = \"1.0.0\""),
+            "une annulation ne touche pas au manifeste"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn le_bump_sans_selection_ne_demande_rien() {
+        let dir = temp_dir("bump-vide");
+        let projet = projet_a_bumper(&dir);
+        let mut app = app_sur(&dir, &projet);
+        app.list_state.select(None);
+
+        crate::demander_bump(&mut app);
+        assert_eq!(
+            app.bump_en_attente, None,
+            "sans projet, aucune confirmation ne doit être armée"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
   }
