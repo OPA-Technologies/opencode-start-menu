@@ -2339,6 +2339,50 @@ fn kind_pour_repertoire(dir: &Path, db_path: &Path, bare: bool) -> LaunchKind
       }
   }
 
+/// Mode courant, sous forme de libellé court pour les journaux.
+fn libelle_mode(mode: &InputMode) -> &'static str
+  {
+    match mode
+      {
+        InputMode::Normal => "normal",
+        InputMode::CreatingProject(_) => "creation",
+        InputMode::SelectModule { .. } => "module",
+        InputMode::Popup(_) => "popup",
+        InputMode::Aide { detaillee: true, .. } => "aide-complete",
+        InputMode::Aide { detaillee: false, .. } => "aide",
+      }
+  }
+
+/// Trace des événements, sous `OSC_TRACE_KEYS=1`.
+///
+/// La valeur, si elle n'est pas vide, désigne le fichier ; sinon c'est
+/// `$TMPDIR/opencode-start-menu-touches.log`. Tout ce que crossterm livre au
+/// dispatch y est consigné, événements compris : F10 n'arrivait jamais au
+/// bras `KeyCode::F(10)` alors que l'octet `^[[21~` part bien du terminal, et
+/// un journal vide dira que rien n'est jamais parvenu ici.
+fn tracer_evenement(evenement: &Event, mode: &InputMode)
+  {
+    if env::var_os("OSC_TRACE_KEYS").is_none()
+      {
+        return;
+      }
+    let valeur = env::var("OSC_TRACE_KEYS").unwrap_or_default();
+    let chemin = if valeur.is_empty()
+      {
+        env::temp_dir().join("opencode-start-menu-touches.log")
+      }
+    else
+      {
+        PathBuf::from(valeur)
+      };
+    let horodatage = chrono::Local::now().format("%H:%M:%S%.3f");
+    let ligne = format!("{horodatage} mode={} {evenement:?}\n", libelle_mode(mode));
+    if let Ok(mut fichier) = fs::OpenOptions::new().create(true).append(true).open(chemin)
+      {
+        let _ = fichier.write_all(ligne.as_bytes());
+      }
+  }
+
 fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Result<()> {
     let mut input_mode = mode_initial;
 
@@ -2350,7 +2394,9 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
         };
         terminal.draw(|f| ui::ui(f, &mut app, &input_mode, &creation_state))?;
 
-        if let Event::Key(key) = event::read()? {
+        let evenement = event::read()?;
+        tracer_evenement(&evenement, &input_mode);
+        if let Event::Key(key) = evenement {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
