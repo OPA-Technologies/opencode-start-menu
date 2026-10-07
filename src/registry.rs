@@ -555,16 +555,17 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
             } else {
                 p.source_hash.clone()
             };
-            // Migration des anciens champs uniques status/version vers les variantes
-            // Debug/Release si les nouvelles valeurs sont absentes.
+            // Migration des anciens champs uniques status/version : le champ
+            // unique ne concerne que la variante élue (Debug). La Release ne
+            // lui est JAMAIS empruntée : pour elle, « dernière compilation »
+            // reste la vérité du disque, pas celle du Debug — sans build
+            // release, elle affiche « — ».
             let status_debug =
                 if p.status_debug.is_empty() { p.status.clone() } else { p.status_debug.clone() };
             let version_debug =
                 if p.version_debug.is_empty() { p.version.clone() } else { p.version_debug.clone() };
-            let status_release =
-                if p.status_release.is_empty() { status_debug.clone() } else { p.status_release.clone() };
-            let version_release =
-                if p.version_release.is_empty() { version_debug.clone() } else { p.version_release.clone() };
+            let status_release = p.status_release.clone();
+            let version_release = p.version_release.clone();
             // Migration de la référence unique historique : si les deux
             // références par variante sont absentes (0), le registre étant
             // alors pré-dissociation, l'ancienne référence est attribuée aux
@@ -2556,8 +2557,11 @@ last_compile_debug_secs: 0,
         assert!(!validate_status(""));
     }
 
+    /// Un registre pré-dissociation n'a qu'un seul statut/version, celui du
+    /// Debug. La Release reste vierge : recopier le Debug dessus ferait croire
+    /// à une compilation release qui n'est jamais mesurée.
     #[test]
-    fn load_migrates_legacy_status_version_to_both_variants() {
+    fn load_migrates_legacy_status_version_to_debug_but_not_release() {
         let dir = temp_registry("migrate");
         let path = dir.join("opencode/projects.json");
         load_registry(&path).unwrap();
@@ -2569,8 +2573,14 @@ last_compile_debug_secs: 0,
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].status_debug, "En-cours Beta");
         assert_eq!(loaded[0].version_debug, "2.1.0");
-        assert_eq!(loaded[0].status_release, "En-cours Beta");
-        assert_eq!(loaded[0].version_release, "2.1.0");
+        assert_eq!(loaded[0].status_release, "");
+        assert_eq!(loaded[0].version_release, "");
+
+        // Une relecture ne doit pas non plus regénérer la Release depuis le
+        // Debug : le comportement doit être stable d'un chargement à l'autre.
+        let relu = load_registry(&path).unwrap();
+        assert_eq!(relu[0].status_release, "");
+        assert_eq!(relu[0].version_release, "");
         fs::remove_dir_all(&dir).unwrap();
     }
 

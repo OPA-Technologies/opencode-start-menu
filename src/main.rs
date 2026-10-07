@@ -1785,6 +1785,9 @@ fn main() -> Result<()> {
     }
 
     if cli.version {
+        // Les variantes n'ont pas toutes un build : la Release pas encore
+        // compilée s'affiche « — », pas comme un vide muet.
+        let ou_d = |s: &str| if s.is_empty() { "—".to_string() } else { s.to_string() };
         if let Some(keyword) = cli.keyword.as_deref() {
             let idx = app.matching_indexes(keyword);
             match idx.as_slice() {
@@ -1798,8 +1801,8 @@ fn main() -> Result<()> {
                         sanitize(&p.name),
                         sanitize(&p.version_debug),
                         sanitize(&p.status_debug),
-                        sanitize(&p.version_release),
-                        sanitize(&p.status_release)
+                        sanitize(&ou_d(&p.version_release)),
+                        sanitize(&ou_d(&p.status_release))
                     );
                 }
                 _ => {
@@ -1810,8 +1813,8 @@ fn main() -> Result<()> {
                             sanitize(&p.name),
                             sanitize(&p.version_debug),
                             sanitize(&p.status_debug),
-                            sanitize(&p.version_release),
-                            sanitize(&p.status_release)
+                            sanitize(&ou_d(&p.version_release)),
+                            sanitize(&ou_d(&p.status_release))
                         );
                     }
                 }
@@ -3706,9 +3709,11 @@ fn handle_creation_input(
                         last_session_context_pct: String::new(),
                         status_debug: status.clone(),
                         version_debug: version.clone(),
-                        status_release: status.clone(),
-                        version_release: version.clone(),
-debug_modified: "jamais compilée".to_string(),
+                        // Un projet neuf n'a encore buildé aucune Release : les
+                        // champs restent vides, l'écran affiche « — ».
+                        status_release: String::new(),
+                        version_release: String::new(),
+                        debug_modified: "jamais compilée".to_string(),
                         release_modified: "jamais compilée".to_string(),
                         last_compile_debug_secs: 0,
                         last_compile_release_secs: 0,
@@ -3886,8 +3891,11 @@ fn commit_edit_field(state: &mut ProjectEditState) {
     }
 }
 
-/// Valide l'ensemble des champs et applique les modifications au projet,
-/// en diffusant la variante Debug sur la variante Release (miroir).
+/// Valide l'ensemble des champs et applique les modifications au projet.
+///
+/// Seule la variante Debug est éditée : la Release garde sa version et son
+/// statut de dernière compilation tant que son binaire n'est pas reconstruit
+/// (rattrapage au prochain rescan).
 fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     let Some(p) = app.projects.get_mut(state.project_idx) else {
         return false;
@@ -5432,6 +5440,60 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         });
         fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
         crate::App::new_light(registre, SortOrder::Modified)
+      }
+
+    /// Un projet neuf n'a aucune Release : sans binaire release, version et
+    /// statut restent vides, affichés « — ». Le formulaire ne doit pas
+    /// recopier la variante Debug sur la Release au moment de créer.
+    #[test]
+    fn la_creation_ne_recopie_pas_la_variante_release()
+      {
+        let mut app = app_avec_projet();
+        let mut state = crate::ProjectCreationState::default();
+        let entre = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+        let remplir = |state: &mut crate::ProjectCreationState,
+                       app: &mut crate::App,
+                       valeur: &str| {
+            state.input_buffer = valeur.to_string();
+            state.input_offset = valeur.chars().count();
+            state.premiere_touche = false;
+            let avant = state.active_field;
+            assert!(
+              matches!(
+                crate::handle_creation_input(entre(KeyCode::Enter), state, app),
+                Ok(crate::InputMode::CreatingProject(_))
+              ),
+              "le champ {avant} doit continuer la création"
+            );
+          };
+        let dir = temp_dir("creation-f");
+        for champ in ["projet-f", "Projet F", dir.to_str().unwrap(), "test lot F"]
+          {
+            remplir(&mut state, &mut app, champ);
+          }
+        // Champ statut : Entrée ouvre le menu déroulant, une seconde Entrée
+        // choisit « <Aucun> » (première entrée, curseur 0).
+        remplir(&mut state, &mut app, "");
+        remplir(&mut state, &mut app, "");
+        assert_eq!(state.active_field, 5, "le champ statut doit passer à la version");
+        remplir(&mut state, &mut app, "0.9.0");
+        assert_eq!(state.active_field, 6, "la version validée ouvre la confirmation");
+        let entree = entre(KeyCode::Enter);
+        let mode = crate::handle_creation_input(entree, &mut state, &mut app).unwrap();
+        assert!(
+          matches!(mode, crate::InputMode::Normal),
+          "« o » sur la confirmation clôt le formulaire"
+        );
+
+        let p = app
+          .projects
+          .iter()
+          .find(|p| p.id == "projet-f")
+          .expect("le projet doit être créé");
+        assert_eq!(p.version_debug, "0.9.0");
+        assert_eq!(p.version_release, "", "pas encore de build release : « — » à l'écran");
+        assert_eq!(p.status_release, "");
+        let _ = fs::remove_dir_all(&dir);
       }
 
     /// Un popup sans projet suffit : la navigation d'onglets ne touche qu'à
