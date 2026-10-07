@@ -1345,16 +1345,112 @@ fn render_contenu_couts(
     project: &crate::ProjectEntry,
     couts: &crate::EtatCouts,
 ) {
+    // Trois blocs : le réglage du tarif, la synthèse du travail accompli et
+    // de son coût, puis le détail par session. La synthèse tient en trois
+    // rangées (bordure haute + libellés + valeurs) ; le détail garde le reste,
+    // avec un plancher pour ne jamais disparaître.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Min(7),
+            Constraint::Length(3),
+            Constraint::Min(6),
         ])
         .split(area);
     render_bloc_tarif(f, chunks[0], app, project, couts);
-    render_tableau_couts(f, chunks[1], project, couts.scroll_offset);
+    render_bloc_synthese(f, chunks[1], project);
+    render_tableau_couts(f, chunks[2], project, couts.scroll_offset);
 }
+
+/// Rappel de la signification de « — », affiché seulement quand le coût est
+/// inconnu : sans lui, un utilisateur y lit un zéro ou une session non
+/// lancée.
+const RAPPEL_TIRET: &str = "« — » : le fournisseur ne publie aucun tarif pour ce \
+     modèle, opencode enregistre donc un coût nul malgré les tokens consommés.";
+
+/// Nombre de lignes que prend `texte` rendu avec repli automatique sur
+/// `largeur` colonnes : mot à mot, comme fait `Wrap`.
+///
+/// `Paragraph::line_count` appartient à l'API instable `rendered-line-info`
+/// de ratatui ; le repli d'un texte sans tabulation se compte aussi à la
+/// main. Ce qui compte n'est pas l'exactitude absolue, mais que la place
+/// **réservée** et le **rendu** s'appuient sur le même compte : les deux
+/// restent alors bord à bord quelle que soit la largeur.
+fn lignes_repliees(texte: &str, largeur: u16) -> usize
+  {
+    if largeur == 0
+      {
+        return 1;
+      }
+    let largeur = usize::from(largeur);
+    let mut lignes = 1usize;
+    let mut colonne = 0usize;
+    for mot in texte.split_whitespace()
+      {
+        let longueur = mot.chars().count();
+        if colonne == 0
+          {
+            colonne = longueur;
+          }
+        else if colonne + 1 + longueur <= largeur
+          {
+            colonne += 1 + longueur;
+          }
+        else
+          {
+            lignes += 1;
+            colonne = longueur;
+          }
+      }
+    lignes
+  }
+
+/// Bloc « Synthèse » : le travail accompli et ce qu'il a coûté, en un seul
+/// cadre au-dessus du détail par session.
+///
+/// Rendu dans `area` sans cadre propre : la bordure haute est dessinée ici,
+/// comme pour le tableau des coûts. Une valeur absente retombe sur « — »,
+/// jamais sur un zéro qui laisserait croire à un travail non mesuré.
+fn render_bloc_synthese(f: &mut Frame, area: Rect, project: &crate::ProjectEntry)
+  {
+    let label = Style::default().fg(Color::DarkGray);
+    let cout = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let ou_d = |v: &str| -> String
+      {
+        if v.trim().is_empty() { "—".to_string() } else { sanitize(v) }
+      };
+    let table = Table::new(
+        vec![
+            Row::new(vec![
+                Cell::from("Temps total").style(label),
+                Cell::from("Sessions").style(label),
+                Cell::from("Tokens").style(label),
+                Cell::from("Coût total").style(label),
+            ]),
+            Row::new(vec![
+                Cell::from(ou_d(&project.total_duree)),
+                Cell::from(ou_d(&project.session_count)),
+                Cell::from(ou_d(&project.total_tokens)),
+                Cell::from(ou_d(&project.total_cost)).style(cout),
+            ]),
+        ],
+        [
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ],
+    )
+    .column_spacing(2)
+    .block(
+        Block::default()
+            .title(" Synthèse ")
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().bg(Color::Black)),
+    );
+    f.render_widget(table, area);
+  }
 
 /// Tableau des coûts par session. Borné par la hauteur réellement
 /// disponible : le défilement est calculé sur ce nombre de lignes, pas sur
@@ -1453,9 +1549,27 @@ fn render_tableau_couts(
         ]));
     }
 
-    // Défilement borné par la place réelle : une ligne de titre, puis autant
-    // de lignes de données que la hauteur permet, moins une ligne de pied.
-    let visibles = usize::from(area.height).saturating_sub(2).max(1);
+    // Défilement borné par la place réelle : la rangée de titre du bloc,
+    // l'indicateur de défilement sur la dernière rangée, et — quand il
+    // s'affiche — le rappel de « — », juste au-dessus. Ce rappel pèse deux à
+    // quatre rangées selon la largeur : le compte se fait en lignes rendues,
+    // jamais en constante, sinon la dernière ligne de données passe sous
+    // l'un ou l'autre.
+    let largeur_replis = area.width.saturating_sub(2);
+    // Place laissée au rappel : titre du bloc, ligne d'en-tête, au moins une
+    // ligne de données et l'indicateur doivent survivre.
+    let place_rappel = usize::from(area.height).saturating_sub(4);
+    let lignes_rappel = if cout_inconnu
+      {
+        lignes_repliees(RAPPEL_TIRET, largeur_replis).min(place_rappel)
+      }
+    else
+      {
+        0
+      };
+    let visibles = usize::from(area.height)
+        .saturating_sub(3 + lignes_rappel)
+        .max(1);
     let donnees = rows.len().saturating_sub(1);
     let actual_scroll = op_tui::viewport::borner(scroll_offset, donnees, visibles);
 
@@ -1486,33 +1600,24 @@ fn render_tableau_couts(
             Constraint::Percentage(15),
         ],
     )
-    .header(Row::new(vec![
-            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from("").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]))
     .column_spacing(2)
     .block(block);
 
     f.render_widget(table, area);
 
-    // Rappel de la signification de « — », affiché seulement dans ce cas :
-    // sans lui, un utilisateur y lit un zéro ou une session non lancée.
-    if cout_inconnu {
-        let rappel = Paragraph::new(
-            "« — » : le fournisseur ne publie aucun tarif pour ce modèle, \
-             opencode enregistre donc un coût nul malgré les tokens consommés.",
-        )
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
+    // Rappel de la signification de « — », sur toute la place qu'il lui faut.
+    if lignes_rappel > 0
+      {
+        let hauteur = lignes_rappel as u16;
+        let rappel = Paragraph::new(RAPPEL_TIRET)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
         let rappel_area = Rect {
             x: area.x + 1,
-            y: area.y + area.height.saturating_sub(2),
-            width: area.width.saturating_sub(2),
-            height: 1,
+            y: area.y + area.height.saturating_sub(1 + hauteur),
+            width: largeur_replis,
+            height: hauteur,
         };
         if rappel_area.height > 0 {
             f.render_widget(rappel, rappel_area);
@@ -1752,8 +1857,9 @@ fn render_bloc_tarif(f: &mut Frame, area: Rect, app: &App, project: &crate::Proj
     }
 
     // Limites de la méthode : information indispensable à l'utilisateur pour
-    // ne pas confondre l'estimation avec un coût réellement supporté.
-    lignes.push(Line::from(""));
+    // ne pas confondre l'estimation avec un coût réellement supporté. Pas de
+    // ligne vide devant : chaque rangée gagnée est une de plus affichée, le
+    // titre jaune en gras tient déjà le séparateur.
     lignes.push(Line::from(Span::styled(
         " Avertissement",
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -2674,6 +2780,135 @@ mod tests
         assert!(
             rendu.contains("Estimation, pas un coût"),
             "l'avertissement d'estimation doit être visible :\n{rendu}"
+        );
+      }
+
+    /// Rendu du seul bloc Synthèse : c'est le seul niveau où l'on peut dire
+    /// lesquelles de ses lignes viennent de lui et non de l'en-tête voisin.
+    fn synthese_dans_buffer(projet: &crate::ProjectEntry) -> Buffer
+      {
+        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        term.draw(|f| render_bloc_synthese(f, f.area(), projet)).unwrap();
+        term.backend().buffer().clone()
+      }
+
+    /// Le travail accompli et ce qu'il a coûté doivent se lire en un coup
+    /// d'œil, au-dessus du détail : temps total, sessions, tokens, coût.
+    #[test]
+    fn la_synthese_monte_le_travail_et_le_cout()
+      {
+        let (mut app, _dir) = app_de_test("synthese-travail");
+        app.projects[0].total_duree = "12 h 05 min".to_string();
+        app.projects[0].session_count = "3".to_string();
+        app.projects[0].total_tokens = "1 234 567".to_string();
+        app.projects[0].total_cost = "4,20 €".to_string();
+        let projet = app.projects[0].clone();
+        let rendu = texte(&synthese_dans_buffer(&projet));
+        for attendu in
+          [
+            "Synthèse",
+            "Temps total",
+            "Sessions",
+            "Tokens",
+            "Coût total",
+            "12 h 05 min",
+            "1 234 567",
+            "4,20 €",
+          ]
+        {
+          assert!(
+            rendu.contains(attendu),
+            "« {attendu} » manque dans la synthèse :\n{rendu}"
+          );
+        }
+
+        // Mesures absentes : « — », jamais un zéro qui laisserait croire à
+        // une session menée sans temps ni tokens.
+        let mut vide = projet;
+        vide.total_duree.clear();
+        vide.session_count.clear();
+        vide.total_tokens.clear();
+        vide.total_cost.clear();
+        let rendu = texte(&synthese_dans_buffer(&vide));
+        assert!(
+          rendu.contains("—"),
+          "une mesure absente doit retomber sur « — » :\n{rendu}"
+        );
+        assert!(
+          !rendu.contains('0'),
+          "aucun zéro ne doit se substituer à une mesure absente :\n{rendu}"
+        );
+      }
+
+    /// Le rappel de « — » prenait une seule rangée : la fin du texte — celle
+    /// qui dit que les tokens ont bien été consommés — disparaissait en
+    /// dessous d'une centaine de colonnes. Il doit tenir sur toute sa hauteur.
+    #[test]
+    fn le_rappel_du_tiret_tient_sur_toutes_ses_lignes()
+      {
+        let (mut app, _dir) = app_de_test("rappel-complet");
+        app.projects[0].total_cost = "—".to_string();
+        app.projects[0].last_session_cost = "—".to_string();
+        app.projects[0].total_tokens = "1 234 567".to_string();
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup_en(&app, &popup, 80, 24);
+        assert!(
+          rendu.contains("malgré les tokens consommés."),
+          "le rappel doit être rendu en entier :\n{rendu}"
+        );
+      }
+
+    /// Le rappel et l'indicateur de défilement occupent des rangées **prévues**
+    /// : la ligne de données qui suit les en-têtes ne doit être recouverte ni
+    /// par l'un ni par l'autre.
+    #[test]
+    fn le_rappel_ne_couvre_pas_la_donnee_du_tableau()
+      {
+        let (mut app, _dir) = app_de_test("rappel-ligne");
+        // Coût de la session non communiqué — c'est ce qui déclenche le
+        // rappel —, mais total valorisé : le tableau a bien deux lignes de
+        // données, la dernière étant la ligne TOTAL.
+        app.projects[0].total_cost = "4,20 €".to_string();
+        app.projects[0].last_session_cost = "—".to_string();
+        app.projects[0].session_count = "3".to_string();
+        app.projects[0].total_tokens = "1 234 567".to_string();
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let buf = popup_dans_buffer(&app, &popup, 80, 24);
+        let entetes = rang(&buf, "Date/Heure")
+            .expect("les en-têtes du tableau doivent être là");
+        let rappel = rang(&buf, "« — »").expect("le rappel doit être affiché");
+        let indicateur = rang(&buf, "▲").expect("l'indicateur doit être affiché");
+        assert!(
+          rappel >= entetes + 2,
+          "la ligne de données doit tenir entre l'en-tête et le rappel :\n{}",
+          texte(&buf)
+        );
+        assert!(
+          indicateur > rappel,
+          "l'indicateur doit rester sous le rappel :\n{}",
+          texte(&buf)
+        );
+        // La ligne TOTAL n'est rendue que si la place la garde au-dessus du
+        // rappel ; elle peut être hors champ, scrollable, mais jamais dedans.
+        if let Some(total) = rang(&buf, "TOTAL")
+          {
+            assert!(
+              total < rappel,
+              "la ligne TOTAL ne doit jamais tomber sous le rappel :\n{}",
+              texte(&buf)
+            );
+          }
+
+        // Défilé jusqu'au bout : la ligne TOTAL, dernière des données, doit
+        // s'afficher. Elle n'a le droit ni de passer sous le rappel — où son
+        // texte serait effacé au profit de celui-ci — ni sous l'indicateur.
+        let mut fin = popup_de_test(&app, crate::Onglet::Couts);
+        fin.couts.scroll_offset = usize::MAX;
+        let buf = popup_dans_buffer(&app, &fin, 80, 24);
+        assert!(
+          rang(&buf, "TOTAL").is_some(),
+          "défilé en fin, la ligne TOTAL doit rester affichable :\n{}",
+          texte(&buf)
         );
       }
 
