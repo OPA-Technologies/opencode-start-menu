@@ -241,7 +241,7 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Projets ")
+                .title(if app.vue_archives { " Archives " } else { " Projets " })
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )

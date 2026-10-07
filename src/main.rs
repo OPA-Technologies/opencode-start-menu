@@ -97,6 +97,17 @@ pub(crate) struct App {
     pub(crate) filtered: Vec<usize>,
     pub(crate) list_state: ListState,
     pub(crate) show_new: bool,
+    /// Vue courante : la liste normale ou celle des projets archivés.
+    ///
+    /// L'archivage déplace le dossier dans [`App::archive_root`] ; c'est ce
+    /// chemin, et non un champ du registre, qui dit qu'un projet y est.
+    pub(crate) vue_archives: bool,
+    /// Répertoire des archives, hors de `~/projets` : les projets déplacés
+    /// dedans ne doivent plus être réindexés à chaque rescan.
+    pub(crate) archive_root: PathBuf,
+    /// Répertoire des projets actifs, mémorisé pour savoir où ramener un
+    /// projet archivé quand plus aucun actif ne reste pour le dire.
+    pub(crate) projets_root: PathBuf,
     mode: LaunchMode,
     pub(crate) status_messages: Vec<String>,
     registry_path: PathBuf,
@@ -726,6 +737,13 @@ impl App {
             filtered: Vec::new(),
             list_state: ListState::default(),
             show_new: true,
+            vue_archives: false,
+            archive_root: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("archives-projets"),
+            projets_root: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("projets"),
             mode: LaunchMode::Normal,
             status_messages: Vec::new(),
             registry_path,
@@ -776,6 +794,13 @@ impl App {
             filtered: Vec::new(),
             list_state: ListState::default(),
             show_new: true,
+            vue_archives: false,
+            archive_root: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("archives-projets"),
+            projets_root: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("projets"),
             mode: LaunchMode::Normal,
             status_messages: Vec::new(),
             registry_path,
@@ -914,6 +939,98 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Le projet à cet index a-t-il été déplacé dans les archives ?
+    ///
+    /// C'est son chemin qui le dit : l'archivage déplace le dossier, et
+    /// aucun champ du registre ne double cette vérité.
+    pub(crate) fn est_archive(&self, idx: usize) -> bool {
+        self.projects[idx].path.starts_with(&self.archive_root)
+    }
+
+    /// Destination libre dans `racine`.
+    ///
+    /// Deux projets homonymes peuvent coexister (l'un actif, l'autre déjà
+    /// archivé) : le second atterrit à côté du premier plutôt que de faire
+    /// échouer tout le geste.
+    fn destination_unique(racine: &Path, nom: &str) -> PathBuf {
+        let base = racine.join(nom);
+        if !base.exists() {
+            return base;
+        }
+        let mut n = 1u32;
+        loop {
+            let candidate = racine.join(format!("{nom}-{n}"));
+            if !candidate.exists() {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Déplace le projet sélectionné dans `archive_root` : récupérable, et
+    /// sorti de `~/projets` donc invisible pour le rescan.
+    pub(crate) fn archiver_selection(&mut self) -> Result<String> {
+        let idx = self
+            .selected_project_idx()
+            .ok_or_else(|| anyhow::anyhow!("Aucun projet sélectionné"))?;
+        let nom = nom_de_dossier(&self.projects[idx]);
+        let source = self.projects[idx].path.clone();
+        let cible = Self::destination_unique(&self.archive_root, &nom);
+        fs::create_dir_all(&self.archive_root)?;
+        fs::rename(&source, &cible)?;
+        self.projects[idx].path = cible.clone();
+        self.sauver_et_refiltrer()?;
+        Ok(format!("« {nom} » archivé → {}", cible.display()))
+    }
+
+    /// Ramène un projet archivé dans la racine des projets actifs.
+    pub(crate) fn restaurer_selection(&mut self) -> Result<String> {
+        let idx = self
+            .selected_project_idx()
+            .ok_or_else(|| anyhow::anyhow!("Aucun projet archivé sélectionné"))?;
+        if !self.est_archive(idx) {
+            return Err(anyhow::anyhow!("Ce projet n'est pas archivé"));
+        }
+        let nom = nom_de_dossier(&self.projects[idx]);
+        // La racine se déduit des projets encore actifs ; si tous dorment
+        // aux archives, c'est celle retenue au dernier rescan qui tranche —
+        // jamais le répertoire personnel, qui n'a rien à y faire ici.
+        let racine = projects_root_actifs(&self.projects, &self.archive_root)
+            .unwrap_or_else(|| self.projets_root.clone());
+        let source = self.projects[idx].path.clone();
+        let cible = Self::destination_unique(&racine, &nom);
+        fs::create_dir_all(&racine)?;
+        fs::rename(&source, &cible)?;
+        self.projects[idx].path = cible.clone();
+        self.sauver_et_refiltrer()?;
+        Ok(format!("« {nom} » restauré → {}", cible.display()))
+    }
+
+    /// Bascule entre la liste des projets et celle des archives.
+    pub(crate) fn basculer_vue_archives(&mut self) {
+        self.vue_archives = !self.vue_archives;
+        // Créer un projet depuis les archives n'a aucun sens : la ligne
+        // « Nouveau projet » n'y est pas offerte.
+        self.show_new = !self.vue_archives;
+        refresh_project_selection(self);
+    }
+
+    /// Persiste le registre puis recalcule la liste à jour.
+    ///
+    /// Un déplacement de dossier non persisté réapparaîtrait à l'ancien emplacement
+    /// au prochain démarrage, le disque disant « plus rien ici » : le rescan
+    /// effacerait alors l'entrée.
+    fn sauver_et_refiltrer(&mut self) -> Result<()> {
+        registry::save_registry_full(
+            &self.registry_path,
+            &self.projects,
+            &self.web_cache,
+            &self.prefs,
+        )?;
+        refresh_project_selection(self);
+        Ok(())
     }
 
     fn confirm_selection(&mut self) -> Option<InputMode> {
@@ -2325,6 +2442,24 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         demander_bump(&mut app);
                         InputMode::Normal
                     }
+                    // `a` archive dans la liste, restaure dans les archives :
+                    // un seul geste, sa direction donnée par la vue.
+                    KeyCode::Char('a') => {
+                        let resultat = if app.vue_archives {
+                            app.restaurer_selection()
+                        } else {
+                            app.archiver_selection()
+                        };
+                        match resultat {
+                            Ok(msg) => app.push_info(msg),
+                            Err(e) => app.push_error(format!("{e}")),
+                        }
+                        InputMode::Normal
+                    }
+                    KeyCode::Char('A') => {
+                        app.basculer_vue_archives();
+                        InputMode::Normal
+                    }
                     KeyCode::Char('m') => {
                         if let Some(idx) = app.selected_project_idx() {
                             let modules = modules::list_modules(&app.projects[idx].path);
@@ -2601,8 +2736,11 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
         written = true;
       }
     progress.begin(Step::RescanIndex);
-    if let Some(root) = projects_root(&app.projects)
+    if let Some(root) = projects_root(&app.projects, &app.archive_root)
       {
+        // Mémorisé pour la restauration : si un jour tous les projets sont
+        // archivés, plus rien ne dira plus où les ramener.
+        app.projets_root = root.clone();
         match registry::reindex_from_disk(&root, &mut app.projects)
           {
             Ok(n) => added = n,
@@ -3097,34 +3235,66 @@ fn finalize_project_list(app: &mut App) {
     refresh_project_selection(app);
 }
 
+/// Nom de dossier d'un projet, pour construire la destination d'un
+/// déplacement. Le nom affiché peut avoir été renommé dans le menu sans que
+/// le dossier le soit : c'est le dossier qui doit partir, pas l'affichage.
+fn nom_de_dossier(p: &ProjectEntry) -> String {
+    p.path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| p.name.clone())
+}
+
 /// Recalcule le filtrage et la sélection sans retrier.
 ///
 /// `rescan_repertoire` trie déjà la liste ; le startup n'a plus qu'à
 /// réinitialiser la sélection. Retrier ici reparcourrait `target/` de tous les
 /// projets une seconde fois pour un résultat identique, puisque rien n'a
 /// modifié les dates de modification.
+///
+/// Le filtrage distingue aussi les deux vues : un projet archivé vit dans
+/// `archive_root` et n'apparaît plus qu'entre les murs de `A`.
 fn refresh_project_selection(app: &mut App) {
-    app.filtered = (0..app.projects.len()).collect();
-    if !app.projects.is_empty() {
-        app.list_state.select(Some(initial_selection_index(app.sort_order, app.projects.len())));
+    app.filtered = (0..app.projects.len())
+        .filter(|&i| app.est_archive(i) == app.vue_archives)
+        .collect();
+    if app.filtered.is_empty() {
+        app.list_state.select(None);
+        return;
     }
+    // La sélection initiale vise un index de `projects` : il faut la
+    // reporter sur la position occupée dans la liste réellement affichée.
+    let voulu = initial_selection_index(app.sort_order, app.projects.len());
+    let position = app
+        .filtered
+        .iter()
+        .position(|&i| i == voulu)
+        .unwrap_or(0);
+    app.list_state.select(Some(position));
 }
 
-fn projects_root(projects: &[ProjectEntry]) -> Option<PathBuf> {
-    if projects.is_empty() {
-        return dirs::home_dir().map(|h| h.join("projets"));
-    }
+fn projects_root(projects: &[ProjectEntry], archive_root: &Path) -> Option<PathBuf> {
+    projects_root_actifs(projects, archive_root)
+        .or_else(|| dirs::home_dir().map(|h| h.join("projets")))
+}
+
+/// Racine retenue à partir des projets encore actifs, sans repli de
+/// confort : `None` quand il n'en reste plus qu'aux archives. C'est ce
+/// `None` qui, à la restauration, rend la parole au dernier rescan mémorisé
+/// plutôt qu'au répertoire personnel.
+fn projects_root_actifs(projects: &[ProjectEntry], archive_root: &Path) -> Option<PathBuf> {
+    // Les archives ne doivent pas entrer dans le décompte : leur nombre
+    // ferait basculer la racine vers `archive_root`, et le rescan y
+    // réindexerait alors de « nouveaux » projets ceux qui y dorment.
+    let actifs = projects.iter().filter(|p| !p.path.starts_with(archive_root));
     let mut counts = std::collections::HashMap::<PathBuf, usize>::new();
-    for p in projects {
+    for p in actifs {
         if let Some(parent) = p.path.parent() {
             *counts.entry(parent.to_path_buf()).or_insert(0) += 1;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|&(_, c)| c)
-        .map(|(dir, _)| dir)
-        .or_else(|| dirs::home_dir().map(|h| h.join("projets")))
+    counts.into_iter().max_by_key(|&(_, c)| c).map(|(dir, _)| dir)
 }
 
 // Liste du menu déroulant statut en création : « aucun » + éligibles + « nouveau ».
@@ -5332,6 +5502,177 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         assert_eq!(
             app.bump_en_attente, None,
             "sans projet, aucune confirmation ne doit être armée"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Un projet unique dans `dir/projets`, avec les deux racines dirigées
+    /// vers le temporaire : aucun test ne doit toucher au vrai `~/projets`.
+    fn decor_archive(dir: &Path) -> (crate::App, PathBuf) {
+        let racine = dir.join("projets");
+        let projet = racine.join("foo");
+        fs::create_dir_all(projet.join("src")).unwrap();
+        fs::write(
+            projet.join("Cargo.toml"),
+            "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(projet.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "foo": {
+                    "name": "foo",
+                    "path": projet.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "description": "",
+                    "tarif_mode": "manuel"
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = crate::App::new_light(registre, SortOrder::Name);
+        app.archive_root = dir.join("archives-projets");
+        app.projets_root = racine.clone();
+        crate::refresh_project_selection(&mut app);
+        app.list_state.select(Some(0));
+        (app, racine)
+    }
+
+    #[test]
+    fn l_archivage_sort_le_dossier_de_la_racine_des_projets() {
+        let dir = temp_dir("archiver");
+        let (mut app, racine) = decor_archive(&dir);
+
+        let message = app.archiver_selection().expect("archivage possible");
+        assert!(message.contains("archivé"), "bilan explicite : {message}");
+        assert!(
+            !racine.join("foo").exists(),
+            "le dossier doit quitter la racine des projets"
+        );
+        assert!(
+            dir.join("archives-projets/foo").exists(),
+            "le dossier doit atterrir dans l'archive"
+        );
+        assert!(app.est_archive(0), "le chemin dit désormais l'archive");
+        assert!(
+            app.filtered.is_empty(),
+            "un archivé disparaît de la liste normale"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn la_vue_archives_ne_montre_que_les_archives() {
+        let dir = temp_dir("vue-archives");
+        let (mut app, _racine) = decor_archive(&dir);
+        app.archiver_selection().expect("archivage possible");
+
+        app.basculer_vue_archives();
+        assert_eq!(app.filtered, vec![0], "l'archivé réapparaît dedans");
+        assert!(!app.show_new, "pas de création depuis les archives");
+        assert_eq!(
+            app.list_state.selected(),
+            Some(0),
+            "la vue d'archives se sélectionne toute seule"
+        );
+
+        app.basculer_vue_archives();
+        assert!(
+            app.filtered.is_empty(),
+            "la liste normale ne revoit pas l'archivé"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn la_restoration_ramene_le_dossier_dans_la_racine() {
+        let dir = temp_dir("restaurer");
+        let (mut app, racine) = decor_archive(&dir);
+        app.archiver_selection().expect("archivage possible");
+        app.basculer_vue_archives();
+
+        let message = app.restaurer_selection().expect("restauration possible");
+        assert!(message.contains("restauré"), "bilan explicite : {message}");
+        assert!(
+            racine.join("foo").exists(),
+            "le dossier revient là où il vivait"
+        );
+        assert!(!app.est_archive(0));
+        assert!(
+            !dir.join("archives-projets/foo").exists(),
+            "l'archive se vide bien"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Les archives ne doivent jamais emporter la racine : leur nombre ferait
+    /// basculer le rescan vers `archive_root`, qui réindexerait alors comme
+    /// « trouvés » les projets qui y dorment.
+    #[test]
+    fn la_racine_des_projets_ignore_les_archives() {
+        let dir = temp_dir("racine-archives");
+        let (mut app, racine) = decor_archive(&dir);
+        // Deux projets actifs en plus, pour que l'archive soit en minorité
+        // même si le décompte ne l'excluait pas.
+        for nom in ["beta", "gamma"] {
+            let p = racine.join(nom);
+            fs::create_dir_all(&p).unwrap();
+            app.projects.push(crate::registry::ProjectEntry {
+                id: nom.to_string(),
+                name: nom.to_string(),
+                path: p,
+                description: String::new(),
+                status: String::new(),
+                version: String::new(),
+                token: String::new(),
+                used_pct: String::new(),
+                spent: String::new(),
+                last_model: String::new(),
+                modified: String::new(),
+                total_tokens: String::new(),
+                total_cost: String::new(),
+                session_count: String::new(),
+                last_session_tokens: String::new(),
+                last_session_cost: String::new(),
+                last_session_cost_local: String::new(),
+                last_agent: String::new(),
+                last_time_created: String::new(),
+                last_session_context_pct: String::new(),
+                last_duree: String::new(),
+                total_duree: String::new(),
+                last_valorisation: String::new(),
+                total_valorisation: String::new(),
+                tarif_resume: String::new(),
+                status_debug: String::new(),
+                version_debug: String::new(),
+                status_release: String::new(),
+                version_release: String::new(),
+                debug_modified: String::new(),
+                release_modified: String::new(),
+                last_compile_debug_secs: 0,
+                last_compile_release_secs: 0,
+                version_manually_edited: false,
+                source_hash: String::new(),
+                tarif_mode: "manuel".to_string(),
+                tarif_manual: 0.0,
+                tarif_web_series: Vec::new(),
+                tarif_web_fetched_ms: 0,
+                tarif_web_secteur: false,
+                tarif_web_pays: String::new(),
+            });
+        }
+        app.archiver_selection().expect("archivage possible");
+
+        let trouve = crate::projects_root(&app.projects, &app.archive_root)
+            .expect("une racine doit rester");
+        assert_eq!(
+            trouve, racine,
+            "les archives ne doivent pas peser dans le décompte"
         );
 
         fs::remove_dir_all(&dir).unwrap();
