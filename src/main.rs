@@ -343,7 +343,9 @@ pub(crate) struct ProjectCreationState {
     pub(crate) input_buffer: String,
     pub(crate) input_offset: usize,
     pub(crate) confirm_status: bool,
-    pub(crate) rewrite_mode: bool,
+    /// Le champ vient d'être ouvert : `Suppr` le vide d'un coup, et la
+    /// Version repart de zéro à la première frappe.
+    pub(crate) premiere_touche: bool,
     pub(crate) known_statuses: Vec<String>,
     pub(crate) status_menu_open: bool,
     pub(crate) status_filter: String,
@@ -363,7 +365,9 @@ pub(crate) struct ProjectEditState {
     pub(crate) pending_status: String,
     pub(crate) pending_description: String,
     pub(crate) error: Option<String>,
-    pub(crate) rewrite_mode: bool,
+    /// Le champ vient d'être ouvert : `Suppr` le vide d'un coup, et la
+    /// Version repart de zéro à la première frappe.
+    pub(crate) premiere_touche: bool,
     pub(crate) status_menu_open: bool,
     pub(crate) status_filter: String,
     pub(crate) status_cursor: usize,
@@ -383,7 +387,7 @@ impl Default for ProjectEditState
             pending_status: String::new(),
             pending_description: String::new(),
             error: None,
-            rewrite_mode: true,
+            premiere_touche: true,
             status_menu_open: false,
             status_filter: String::new(),
             status_cursor: 0,
@@ -405,7 +409,7 @@ impl ProjectEditState
             pending_status: project.status_debug.clone(),
             pending_description: project.description.clone(),
             error: None,
-            rewrite_mode: true,
+            premiere_touche: true,
             status_menu_open: false,
             status_filter: String::new(),
             status_cursor: 0,
@@ -425,36 +429,83 @@ fn variant_label(version: &str, status: &str) -> String {
     }
 }
 
-// --- Édition de texte insensible aux octets UTF-8 : l'offset est un index
-// --- de caractères, converti en octets uniquement pour insert/remove.
+// --- Édition de texte : les gestes standards viennent de `op-tui::edit`,
+// --- l'application ne fait que traduire les touches du terminal.
 
-
-
-fn insert_char_at(s: &mut String, c: char, char_idx: usize)
+/// Traduit une frappe en geste d'édition standard, ou `None` quand la touche
+/// n'appartient pas à un champ (Entrée, Échap, `↑`/`↓`, raccourcis) : le
+/// gestionnaire garde alors sa sémantique propre.
+fn touche_edition(key: event::KeyEvent) -> Option<op_tui::edit::Touche>
   {
-    let byte = op_tui::field::octet_pour_caractere(s, char_idx);
-    if byte > s.len() {
-        return;
-    }
-    if !s.is_char_boundary(byte) && byte < s.len() {
-        return;
-    }
-    s.insert(byte, c);
+    use op_tui::edit::Touche;
+    let controle = key.modifiers.contains(event::KeyModifiers::CONTROL);
+    let alternate = key.modifiers.contains(event::KeyModifiers::ALT);
+    match key.code
+      {
+        KeyCode::Left if controle => Some(Touche::MotGauche),
+        KeyCode::Right if controle => Some(Touche::MotDroite),
+        KeyCode::Left => Some(Touche::Gauche),
+        KeyCode::Right => Some(Touche::Droite),
+        KeyCode::Home => Some(Touche::Debut),
+        KeyCode::End => Some(Touche::Fin),
+        KeyCode::PageUp => Some(Touche::PageHaut),
+        KeyCode::PageDown => Some(Touche::PageBas),
+        KeyCode::Backspace if !controle => Some(Touche::Retour),
+        KeyCode::Delete if !controle => Some(Touche::Supprimer),
+        KeyCode::Char(c) if !controle && !alternate => Some(Touche::Caractere(c)),
+        _ => None,
+      }
   }
 
-fn delete_char_at(s: &mut String, char_idx: usize)
+/// Applique un geste d'édition au couple `(tampon, curseur)` du champ courant.
+///
+/// Deux particularités tiennent à la façon dont le champ a été ouvert :
+/// - `Suppr`, en toute première touche, vide le champ d'un coup : c'est le
+///   remplacement de la valeur affichée, à la place d'une sélection ;
+/// - sur un champ à masque — la Version, `x.y.z` — la première frappe part
+///   de zéro, pour que la saisie guidée reste lisible.
+///
+/// Les saisies déjà ouvertes sur une valeur (tarif, code pays) passent
+/// `premiere_touche = false` : elles n'ont rien à remplacer.
+fn appliquer_edition(
+  tampon: &mut String,
+  curseur: &mut usize,
+  premiere_touche: bool,
+  touche: op_tui::edit::Touche,
+  masque: bool,
+  )
   {
-    let byte = op_tui::field::octet_pour_caractere(s, char_idx);
-    if byte >= s.len() || s.is_empty() {
-        return;
-    }
-    if byte == s.len() {
-        return;
-    }
-    if !s.is_char_boundary(byte) {
-        return;
-    }
-    s.remove(byte);
+    use op_tui::edit::Touche;
+    if premiere_touche
+      {
+        if touche == Touche::Supprimer
+          {
+            tampon.clear();
+            *curseur = 0;
+            return;
+          }
+        if masque && matches!(touche, Touche::Caractere(_))
+          {
+            tampon.clear();
+            *curseur = 0;
+          }
+      }
+    match touche
+      {
+        Touche::Caractere(c) if masque =>
+          {
+            let resultat = version_mask_insert(tampon.as_str(), *curseur, c);
+            if let Some((s, off)) = resultat
+              {
+                *tampon = s;
+                *curseur = off;
+              }
+          }
+        autre =>
+          {
+            op_tui::edit::gerer(tampon, curseur, autre);
+          }
+      }
   }
 
 /// Saisie par masque de la version (x.y.z) : chiffres uniquement, point
@@ -1829,7 +1880,7 @@ fn main() -> Result<()> {
           name: nom.to_string(),
           // Le nom est le champ 1 : c'est lui que le curseur doit viser.
           active_field: if nom.is_empty() { 0 } else { 1 },
-          rewrite_mode: true,
+          premiere_touche: true,
           ..ProjectCreationState::default()
         };
         load_creation_field(&mut state);
@@ -2171,10 +2222,20 @@ fn edition_pays(key: event::KeyEvent, app: &mut App, popup: &mut Popup)
             popup.couts.country = code.clone();
             enregistrer_parametres(app, popup, &format!("Pays source : {code}"));
           }
-        KeyCode::Backspace =>
+        KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
+        | KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown =>
           {
-            popup.parametres.tampon.pop();
-            popup.parametres.curseur = popup.parametres.tampon.chars().count();
+            // Curseur et suppressions : les mêmes gestes que partout ailleurs.
+            if let Some(touche) = touche_edition(key)
+              {
+                appliquer_edition(
+                  &mut popup.parametres.tampon,
+                  &mut popup.parametres.curseur,
+                  false,
+                  touche,
+                  false,
+                );
+              }
           }
         KeyCode::Char(c) =>
           {
@@ -2189,9 +2250,17 @@ fn edition_pays(key: event::KeyEvent, app: &mut App, popup: &mut Popup)
                 popup.parametres.message = Some("Lettres uniquement (ex. FRA)".to_string());
                 return;
               }
-            popup.parametres.tampon.push(c.to_ascii_uppercase());
-            popup.parametres.curseur = popup.parametres.tampon.chars().count();
-            popup.parametres.message = None;
+            if let Some(op_tui::edit::Touche::Caractere(c2)) = touche_edition(key)
+              {
+                appliquer_edition(
+                  &mut popup.parametres.tampon,
+                  &mut popup.parametres.curseur,
+                  false,
+                  op_tui::edit::Touche::Caractere(c2.to_ascii_uppercase()),
+                  false,
+                );
+                popup.parametres.message = None;
+              }
           }
         _ => {}
       }
@@ -2740,7 +2809,7 @@ fn load_creation_field(state: &mut ProjectCreationState)
         _ => String::new(),
       };
     state.input_offset = state.input_buffer.chars().count();
-    state.rewrite_mode = true;
+    state.premiere_touche = true;
   }
 
 fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
@@ -3416,45 +3485,36 @@ fn handle_creation_input(
             load_creation_field(state);
             return Ok(InputMode::CreatingProject(state.clone()));
           }
-        KeyCode::Left | KeyCode::Right =>
+        KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+        | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Backspace
+        | KeyCode::Delete =>
           {
+            // Le menu déroulant garde son propre jeu de touches : seul le
+            // filtre y change, la navigation se fait aux flèches.
             if state.status_menu_open
               {
-                return Ok(InputMode::CreatingProject(state.clone()));
-              }
-            let count = state.input_buffer.chars().count();
-            if key.code == KeyCode::Left
-              {
-                if state.input_offset > 0
+                if key.code == KeyCode::Backspace
                   {
-                    state.input_offset -= 1;
-                  }
-              }
-            else if state.input_offset < count
-              {
-                state.input_offset += 1;
-              }
-            state.rewrite_mode = false;
-            return Ok(InputMode::CreatingProject(state.clone()));
-          }
-        KeyCode::Backspace =>
-          {
-            if state.status_menu_open
-              {
-                state.status_filter.pop();
-                let items = status_menu_creation_items(&state.status_filter);
-                if state.status_cursor >= items.len()
-                  {
-                    state.status_cursor = items.len().saturating_sub(1);
+                    state.status_filter.pop();
+                    let items = status_menu_creation_items(&state.status_filter);
+                    if state.status_cursor >= items.len()
+                      {
+                        state.status_cursor = items.len().saturating_sub(1);
+                      }
                   }
                 return Ok(InputMode::CreatingProject(state.clone()));
               }
-            if state.input_offset > 0
+            if let Some(touche) = touche_edition(key)
               {
-                let idx = state.input_offset - 1;
-                delete_char_at(&mut state.input_buffer, idx);
-                state.input_offset = idx;
-                state.rewrite_mode = false;
+                let masque = state.active_field == 5;
+                appliquer_edition(
+                  &mut state.input_buffer,
+                  &mut state.input_offset,
+                  state.premiere_touche,
+                  touche,
+                  masque,
+                );
+                state.premiere_touche = false;
               }
             return Ok(InputMode::CreatingProject(state.clone()));
           }
@@ -3708,10 +3768,10 @@ debug_modified: "jamais compilée".to_string(),
                       {
                         state.status = None;
                         state.input_buffer.clear();
+                        state.input_offset = 0;
                         state.confirm_status = false;
                         state.status_free_text = true;
                         state.active_field = 4;
-                        state.rewrite_mode = true;
                       }
                     _ =>
                       {}
@@ -3737,50 +3797,22 @@ debug_modified: "jamais compilée".to_string(),
                     state.status_filter.clear();
                     state.status_filter.push(c);
                     state.status_cursor = 0;
-                    state.rewrite_mode = false;
                   }
                 return Ok(InputMode::CreatingProject(state.clone()));
               }
-            // Champ Version : saisie guidée par le masque x.y.z.
-            if state.active_field == 5
+            // Édition du champ courant : le masque x.y.z de la Version est
+            // appliqué par `appliquer_edition`, qui le signale par `masque`.
+            if let Some(touche) = touche_edition(key)
               {
-                if state.rewrite_mode && state.input_offset >= state.input_buffer.chars().count()
-                  {
-                    let old = std::mem::take(&mut state.input_buffer);
-                    state.input_offset = 0;
-                    if let Some((s, off)) = version_mask_insert("", 0, c)
-                      {
-                        state.input_buffer = s;
-                        state.input_offset = off;
-                        state.rewrite_mode = false;
-                      }
-                    else
-                      {
-                        state.input_buffer = old;
-                      }
-                  }
-                else
-                  {
-                    state.rewrite_mode = false;
-                    if let Some((s, off)) =
-                      version_mask_insert(&state.input_buffer, state.input_offset, c)
-                      {
-                        state.input_buffer = s;
-                        state.input_offset = off;
-                      }
-                  }
-                return Ok(InputMode::CreatingProject(state.clone()));
-              }
-            if state.rewrite_mode && state.input_offset >= state.input_buffer.chars().count()
-              {
-                state.input_buffer = c.to_string();
-                state.input_offset = 1;
-                state.rewrite_mode = false;
-              }
-            else
-              {
-                insert_char_at(&mut state.input_buffer, c, state.input_offset);
-                state.input_offset += 1;
+                let masque = state.active_field == 5;
+                appliquer_edition(
+                  &mut state.input_buffer,
+                  &mut state.input_offset,
+                  state.premiere_touche,
+                  touche,
+                  masque,
+                );
+                state.premiere_touche = false;
               }
             return Ok(InputMode::CreatingProject(state.clone()));
           }
@@ -3801,7 +3833,7 @@ fn load_edit_field(state: &mut ProjectEditState)
         _ => String::new(),
       };
     state.input_offset = state.input_buffer.chars().count();
-    state.rewrite_mode = true;
+    state.premiere_touche = true;
   }
 
 /// Applique aux champs du projet la validation d'un champ en cours d'édition.
@@ -3947,29 +3979,6 @@ fn handle_tariff_input(
         match key.code
           {
             KeyCode::Esc => return Ok(popup!(false, String::new(), 0, message)),
-            KeyCode::Left =>
-              {
-                input_offset = input_offset.saturating_sub(1);
-                return Ok(popup!(true, input_buffer, input_offset, message));
-              }
-            KeyCode::Right =>
-              {
-                if input_offset < input_buffer.chars().count()
-                  {
-                    input_offset += 1;
-                  }
-                return Ok(popup!(true, input_buffer, input_offset, message));
-              }
-            KeyCode::Backspace =>
-              {
-                if input_offset > 0
-                  {
-                    let idx = input_offset - 1;
-                    delete_char_at(&mut input_buffer, idx);
-                    input_offset = idx;
-                  }
-                return Ok(popup!(true, input_buffer, input_offset, message));
-              }
             KeyCode::Char(c) =>
               {
                 // Le tarif manuel n'accepte que les chiffres, le point et la
@@ -3981,24 +3990,39 @@ fn handle_tariff_input(
                     _ => false,
                   };
                 if accepte
+                  && let Some(op_tui::edit::Touche::Caractere(c2)) = touche_edition(key)
                   {
-                    let pos = input_offset.min(input_buffer.chars().count());
                     let c2 = if active_field == 2
                       {
-                        c.to_ascii_uppercase()
+                        c2.to_ascii_uppercase()
                       }
                     else
                       {
-                        c
+                        c2
                       };
-                    insert_char_at(&mut input_buffer, c2, pos);
-                    input_offset = (pos + 1).min(input_buffer.chars().count());
+                    appliquer_edition(
+                      &mut input_buffer,
+                      &mut input_offset,
+                      false,
+                      op_tui::edit::Touche::Caractere(c2),
+                      false,
+                    );
                     message = None;
                   }
                 return Ok(popup!(true, input_buffer, input_offset, message));
               }
             KeyCode::Enter => {}
-            _ => return Ok(popup!(true, input_buffer, input_offset, message)),
+            // Curseur et suppressions : les mêmes gestes que partout ailleurs.
+            // Ces saisies s'ouvrent sur une valeur déjà en place, mais rien à
+            // remplacer d'un seul coup : la première touche est normale.
+            _ =>
+              {
+                if let Some(touche) = touche_edition(key)
+                  {
+                    appliquer_edition(&mut input_buffer, &mut input_offset, false, touche, false);
+                  }
+                return Ok(popup!(true, input_buffer, input_offset, message));
+              }
           }
         // Validation (Entrée)
         match active_field
@@ -4209,90 +4233,33 @@ fn handle_edit_input(
                 state.editing = false;
                 return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
-            KeyCode::Left =>
-              {
-                if state.input_offset > 0
-                  {
-                    state.input_offset -= 1;
-                  }
-                state.rewrite_mode = false;
-                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
-              }
-            KeyCode::Right =>
-              {
-                if state.input_offset < state.input_buffer.chars().count()
-                  {
-                    state.input_offset += 1;
-                  }
-                state.rewrite_mode = false;
-                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
-              }
-            KeyCode::Backspace =>
-              {
-                if state.input_offset > 0
-                  {
-                    let idx = state.input_offset - 1;
-                    delete_char_at(&mut state.input_buffer, idx);
-                    state.input_offset = idx;
-                    state.rewrite_mode = false;
-                  }
-                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
-              }
             KeyCode::Enter =>
               {
                 commit_edit_field(state);
                 return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
-            KeyCode::Char(c) =>
-              {
-                // Champ Version : saisie guidée par le masque x.y.z.
-                if state.active_field == 0
-                  {
-                    if state.rewrite_mode
-                      && state.input_offset >= state.input_buffer.chars().count()
-                      {
-                        let old = std::mem::take(&mut state.input_buffer);
-                        state.input_offset = 0;
-                        if let Some((s, off)) = version_mask_insert("", 0, c)
-                          {
-                            state.input_buffer = s;
-                            state.input_offset = off;
-                            state.rewrite_mode = false;
-                          }
-                        else
-                          {
-                            state.input_buffer = old;
-                          }
-                      }
-                    else
-                      {
-                        state.rewrite_mode = false;
-                        if let Some((s, off)) =
-                          version_mask_insert(&state.input_buffer, state.input_offset, c)
-                          {
-                            state.input_buffer = s;
-                            state.input_offset = off;
-                          }
-                      }
-                  }
-                else if state.rewrite_mode
-                  && state.input_offset >= state.input_buffer.chars().count()
-                  {
-                    state.input_buffer = c.to_string();
-                    state.input_offset = 1.min(state.input_buffer.chars().count());
-                    state.rewrite_mode = false;
-                  }
-                else
-                  {
-                    let pos = state.input_offset.min(state.input_buffer.chars().count());
-                    insert_char_at(&mut state.input_buffer, c, pos);
-                    state.input_offset = (pos + 1).min(state.input_buffer.chars().count());
-                  }
-                state.error = None;
-                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
-              }
+            // Tout le reste relève du champ en cours : le composant d'édition
+            // porte les gestes, le masque x.y.z protège la Version.
             _ =>
-              {}
+              {
+                if let Some(touche) = touche_edition(key)
+                  {
+                    let masque = state.active_field == 0;
+                    appliquer_edition(
+                      &mut state.input_buffer,
+                      &mut state.input_offset,
+                      state.premiere_touche,
+                      touche,
+                      masque,
+                    );
+                    state.premiere_touche = false;
+                    if matches!(touche, op_tui::edit::Touche::Caractere(_))
+                      {
+                        state.error = None;
+                      }
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
+                  }
+              }
           }
       }
     else
@@ -4741,30 +4708,291 @@ mod tests
     }
 
 
+    // --- Édition de champ : le composant `op-tui::edit` porte les gestes ---
+
+    /// Les touches du terminal se traduisent en gestes de champ, et rien
+    /// d'autre : une touche d'application (Entrée, `↑`, `Ctrl`+lettre) ne doit
+    /// jamais devenir une frappe.
     #[test]
-    fn insert_char_at_respects_utf8_boundaries()
+    fn les_touches_du_champ_se_traduisent_en_gestes()
       {
-        let mut s = "café".to_string();
-        super::insert_char_at(&mut s, 'x', 3);
-        assert_eq!(s, "cafxé");
-        super::insert_char_at(&mut s, '!', 0);
-        assert_eq!(s, "!cafxé");
+        use op_tui::edit::Touche;
+        let frappe = |code, mods| super::touche_edition(KeyEvent::new(code, mods));
+        assert_eq!(frappe(KeyCode::Left, KeyModifiers::NONE), Some(Touche::Gauche));
+        assert_eq!(frappe(KeyCode::Right, KeyModifiers::NONE), Some(Touche::Droite));
+        assert_eq!(frappe(KeyCode::Left, KeyModifiers::CONTROL), Some(Touche::MotGauche));
+        assert_eq!(frappe(KeyCode::Right, KeyModifiers::CONTROL), Some(Touche::MotDroite));
+        assert_eq!(frappe(KeyCode::Home, KeyModifiers::NONE), Some(Touche::Debut));
+        assert_eq!(frappe(KeyCode::End, KeyModifiers::NONE), Some(Touche::Fin));
+        assert_eq!(frappe(KeyCode::PageDown, KeyModifiers::NONE), Some(Touche::PageBas));
+        assert_eq!(frappe(KeyCode::Backspace, KeyModifiers::NONE), Some(Touche::Retour));
+        assert_eq!(frappe(KeyCode::Delete, KeyModifiers::NONE), Some(Touche::Supprimer));
+        assert_eq!(
+          frappe(KeyCode::Char('é'), KeyModifiers::NONE),
+          Some(Touche::Caractere('é'))
+        );
+        assert_eq!(frappe(KeyCode::Enter, KeyModifiers::NONE), None, "Entrée valide");
+        assert_eq!(frappe(KeyCode::Up, KeyModifiers::NONE), None, "la navigation reste au gestionnaire");
+        assert_eq!(frappe(KeyCode::Char('s'), KeyModifiers::CONTROL), None, "le raccourci ne frappe pas");
       }
 
+    /// La première frappe continue le texte ouvert : l'ancien écrasement du
+    /// champ entier a disparu, et les suppressions marchent tout de suite.
     #[test]
-    fn delete_char_at_respects_utf8_boundaries()
+    fn la_frappe_continue_le_champ_ouvert()
       {
-        let mut s = "café".to_string();
-        super::delete_char_at(&mut s, 3);
-        assert_eq!(s, "caf");
-        super::delete_char_at(&mut s, 0);
-        assert_eq!(s, "af");
-        let mut s2 = "En-cours Testé".to_string();
-        for _ in 0..5
+        use op_tui::edit::Touche;
+        let mut tampon = "description existante".to_string();
+        let mut curseur = tampon.chars().count();
+        super::appliquer_edition(&mut tampon, &mut curseur, true, Touche::Caractere('!'), false);
+        assert_eq!(tampon, "description existante!");
+        assert_eq!(curseur, 22, "à la fin du texte inséré");
+        super::appliquer_edition(&mut tampon, &mut curseur, false, Touche::Retour, false);
+        assert_eq!(tampon, "description existante", "le retour arrière agit immédiatement");
+        assert_eq!(curseur, 21);
+      }
+
+    /// `Suppr`, en toute première touche, vide le champ d'un coup : c'est le
+    /// remplacement de la valeur affichée, à défaut de sélection. Ensuite il
+    /// redevient une simple suppression.
+    #[test]
+    fn suppr_en_premiere_touche_vide_le_champ()
+      {
+        use op_tui::edit::Touche;
+        let mut tampon = "ancienne description".to_string();
+        let mut curseur = tampon.chars().count();
+        super::appliquer_edition(&mut tampon, &mut curseur, true, Touche::Supprimer, false);
+        assert_eq!(tampon, "", "le champ est vidé d'un seul geste");
+        assert_eq!(curseur, 0);
+        tampon = "abc".to_string();
+        curseur = 3;
+        super::appliquer_edition(&mut tampon, &mut curseur, false, Touche::Supprimer, false);
+        assert_eq!(tampon, "abc", "rien sous le curseur : rien à supprimer");
+      }
+
+    /// La Version se saisit par masque : la première frappe repart de zéro,
+    /// le point s'insère seul, et les lettres restent dehors.
+    #[test]
+    fn la_version_se_re_saisit_par_masque()
+      {
+        use op_tui::edit::Touche;
+        let mut tampon = "0.20.21".to_string();
+        let mut curseur = tampon.chars().count();
+        let mut premiere = true;
+        for c in "0.21.0".chars()
           {
-            super::delete_char_at(&mut s2, 0);
+            super::appliquer_edition(&mut tampon, &mut curseur, premiere, Touche::Caractere(c), true);
+            premiere = false;
           }
-        assert_eq!(s2, "urs Testé");
+        assert_eq!(tampon, "0.21.0");
+        assert_eq!(curseur, 6);
+        super::appliquer_edition(&mut tampon, &mut curseur, false, Touche::Caractere('x'), true);
+        assert_eq!(tampon, "0.21.0", "le masque refuse les lettres");
+      }
+
+    /// Ouvrir le champ Version d'un projet et frapper doit conduire à la
+    /// nouvelle version, pas à un mélange des deux.
+    #[test]
+    fn le_champ_version_du_popup_s_edite_au_clavier()
+      {
+        let mut app = app_avec_projet();
+        let popup = crate::Popup::nouveau(
+          0,
+          super::ProjectEditState::from_project(&app.projects[0], 0),
+          "FRA".to_string(),
+        );
+        // Entrée ouvre le champ : la valeur courante devient le tampon.
+        let ouvert = frappe_dans_le_champ(&mut app, &popup, &[KeyCode::Enter]);
+        assert!(ouvert.editing, "le champ est en saisie");
+        assert_eq!(ouvert.input_buffer, "1.0.0", "le tampon est pré-rempli");
+        assert_eq!(ouvert.input_offset, 5, "curseur en fin");
+        // Même ouverture, puis `Suppr` qui vide et la frappe de la suite.
+        let etat = frappe_dans_le_champ(
+          &mut app,
+          &popup,
+          &[
+            KeyCode::Enter,
+            KeyCode::Delete,
+            KeyCode::Char('1'),
+            KeyCode::Char('.'),
+            KeyCode::Char('0'),
+            KeyCode::Char('.'),
+            KeyCode::Char('1'),
+          ],
+        );
+        assert_eq!(etat.input_buffer, "1.0.1", "la nouvelle version tient seule");
+        assert_eq!(etat.input_offset, 5);
+      }
+
+    /// La Description est du texte libre : ouvrir le champ ne prépare pas un
+    /// écrasement, la frappe s'ajoute au texte déjà présent.
+    #[test]
+    fn la_description_du_popup_s_edite_sans_ecrasement()
+      {
+        let mut app = app_avec_projet();
+        let popup = crate::Popup::nouveau(
+          0,
+          super::ProjectEditState::from_project(&app.projects[0], 0),
+          "FRA".to_string(),
+        );
+        let mut ouvert = popup.projet.clone();
+        ouvert.active_field = 2;
+        ouvert.pending_description = "texte existant".to_string();
+        let base = popup.avec_projet(ouvert);
+        let etat = frappe_dans_le_champ(&mut app, &base, &[KeyCode::Enter, KeyCode::Char('!')]);
+        assert!(etat.editing, "Entrée ouvre le champ");
+        assert_eq!(
+          etat.input_buffer, "texte existant!",
+          "la frappe continue le texte ouvert"
+        );
+        assert_eq!(etat.input_offset, 15, "curseur derrière la frappe");
+        // Un champ vide se remplit pareil, sans écrasement particulier.
+        let mut vide = popup.projet.clone();
+        vide.active_field = 2;
+        let base = popup.avec_projet(vide);
+        let etat = frappe_dans_le_champ(
+          &mut app,
+          &base,
+          &[KeyCode::Enter, KeyCode::Char('!'), KeyCode::Char('!')],
+        );
+        assert_eq!(etat.input_buffer, "!!");
+      }
+
+    /// Le raccourci des flèches latérales : `→` au milieu du texte écrit à
+    /// gauche du curseur, comme dans tout éditeur.
+    #[test]
+    fn le_curseur_du_popup_sert_a_inserer()
+      {
+        let mut app = app_avec_projet();
+        let popup = crate::Popup::nouveau(
+          0,
+          super::ProjectEditState::from_project(&app.projects[0], 0),
+          "FRA".to_string(),
+        );
+        let mut ouvert = popup.projet.clone();
+        ouvert.active_field = 2;
+        ouvert.pending_description = "abcd".to_string();
+        let base = popup.avec_projet(ouvert);
+        let etat = frappe_dans_le_champ(
+          &mut app,
+          &base,
+          &[KeyCode::Enter, KeyCode::Left, KeyCode::Left, KeyCode::Char('X')],
+        );
+        assert_eq!(etat.input_buffer, "abXcd", "insertion à la position du curseur");
+        assert_eq!(etat.input_offset, 3);
+      }
+
+    /// Appelé par les tests d'édition : frappe chaque touche dans l'état du
+    /// popup, et rend l'état qui en ressort.
+    fn frappe_dans_le_champ(
+      app: &mut crate::App,
+      popup: &crate::Popup,
+      touches: &[KeyCode],
+    ) -> super::ProjectEditState
+      {
+        let mut courant = popup.clone();
+        for code in touches
+          {
+            let mut etat = courant.projet.clone();
+            let touche = KeyEvent::new(*code, KeyModifiers::NONE);
+            match super::handle_edit_input(touche, &mut etat, app, &courant)
+              {
+                Ok(crate::InputMode::Popup(p)) => courant = p,
+                _ => panic!("{code:?} doit rester dans le popup"),
+              }
+          }
+        courant.projet
+      }
+
+    /// La saisie du code pays reprend les mêmes gestes : suppression au
+    /// curseur, puis frappe à la position courante.
+    #[test]
+    fn la_saisie_du_pays_edite_au_curseur()
+      {
+        let mut app = app_avec_projet();
+        let mut popup = popup_navigation().avec_onglet(crate::Onglet::Parametres);
+        popup.parametres.edition = true;
+        popup.parametres.tampon = "FRA".to_string();
+        popup.parametres.curseur = 3;
+        super::edition_pays(
+          KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+          &mut app,
+          &mut popup,
+        );
+        assert_eq!(popup.parametres.tampon, "FR");
+        assert_eq!(popup.parametres.curseur, 2);
+        super::edition_pays(
+          KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+          &mut app,
+          &mut popup,
+        );
+        assert_eq!(popup.parametres.curseur, 1);
+        super::edition_pays(
+          KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+          &mut app,
+          &mut popup,
+        );
+        assert_eq!(popup.parametres.tampon, "FAR", "la frappe s'insère au curseur, en majuscule");
+        assert_eq!(popup.parametres.curseur, 2);
+      }
+
+    /// La saisie tarifaire garde ses règles (chiffres, virgule) tout en
+    /// prenant le curseur standard.
+    #[test]
+    fn la_saisie_tarifaire_s_edite_au_curseur()
+      {
+        let mut app = app_avec_projet();
+        let popup = popup_navigation().avec_onglet(crate::Onglet::Couts);
+        let ouvrir = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let mode = super::handle_tariff_input(
+          ouvrir,
+          &mut app,
+          &popup,
+          0,
+          1,
+          false,
+          String::new(),
+          0,
+          "FRA".to_string(),
+          None,
+          false,
+        )
+        .unwrap();
+        let mut courant = match mode
+          {
+            crate::InputMode::Popup(p) => p,
+            _ => panic!("l'entrée doit ouvrir la saisie"),
+          };
+        assert!(courant.couts.editing, "champ tarifaire en saisie");
+        assert_eq!(courant.couts.input_buffer, "0", "tarif actuel pré-rempli");
+        assert_eq!(courant.couts.input_offset, 1, "curseur en fin");
+        assert_eq!(courant.couts.active_field, 1, "champ tarifaire");
+
+        // Effacement puis frappe de la nouvelle valeur.
+        for code in [KeyCode::Backspace, KeyCode::Char('4'), KeyCode::Char('2')]
+          {
+            let touche = KeyEvent::new(code, KeyModifiers::NONE);
+            let resultat = super::handle_tariff_input(
+              touche,
+              &mut app,
+              &courant,
+              0,
+              courant.couts.active_field,
+              courant.couts.editing,
+              courant.couts.input_buffer.clone(),
+              courant.couts.input_offset,
+              courant.couts.country.clone(),
+              courant.couts.message.clone(),
+              false,
+            )
+            .unwrap();
+            match resultat
+              {
+                crate::InputMode::Popup(p) => courant = p,
+                _ => panic!("{code:?} doit rester dans l'onglet Coûts"),
+              }
+          }
+        assert_eq!(courant.couts.input_buffer, "42", "chiffres saisis au curseur");
       }
 
     #[test]
@@ -5725,3 +5953,4 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
     }
 
   }
+

@@ -734,22 +734,12 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
       ];
     for (i, (lbl, val)) in fields.iter().enumerate()
       {
-        // Le champ actif prêt à être écrasé (rewrite) est surligné en jaune,
-        // sauf les placeholders (« (vide) », « (aucun) »).
-        let value_style = if i == active
-          && state.rewrite_mode
-          && !val.starts_with('(')
-          {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-          }
-        else
-          {
-            Style::default()
-          };
+        // La valeur reste au style par défaut : ce qui désigne le champ, c'est
+        // son libellé, et le curseur réel posé plus bas.
         lines.push(Line::from(vec![
             Span::styled(*lbl, lbl_style(i)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
-            Span::styled(val.clone(), value_style),
+            Span::styled(val.clone(), Style::default()),
           ]));
       }
 
@@ -792,7 +782,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         }
       else
         {
-          "Échap pour annuler  ·  ↑/↓ pour changer de champ"
+          "Échap annuler · ↑/↓ champ · ←/→ curseur · Ctrl+←/→ mots"
         }
     )
     .centered());
@@ -944,22 +934,12 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
     let mut lines = vec![Line::from("")];
     for i in 0..4
       {
-        // Le champ actif prêt à être écrasé (rewrite) est surligné en jaune.
-        let value_style = if state.editing
-          && i == active
-          && state.rewrite_mode
-          && !state.input_buffer.is_empty()
-          {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-          }
-        else
-          {
-            Style::default()
-          };
+        // La valeur reste au style par défaut : le champ actif se lit au
+        // libellé surligné, et la saisie en cours à la valeur affichée.
         lines.push(Line::from(vec![
             Span::styled(labels[i].0, lbl_style(i)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&vals[i], value_style),
+            Span::styled(&vals[i], Style::default()),
           ]));
       }
     if let Some(err) = &state.error
@@ -980,7 +960,7 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         }
       else if state.editing
         {
-          "←/→ curseur · Frappe saisie · Entrée valider le champ · Échap annuler"
+          "←/→ curseur · Ctrl+←/→ mots · Frappe saisie · Entrée valider · Échap"
         }
       else if active == 3
         {
