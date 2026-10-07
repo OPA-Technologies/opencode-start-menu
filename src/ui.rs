@@ -928,19 +928,42 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         current_value(state, 0),
         current_value(state, 1),
         current_value(state, 2),
-        current_value(state, 3),
       ];
 
     let mut lines = vec![Line::from("")];
     for i in 0..4
       {
-        // La valeur reste au style par défaut : le champ actif se lit au
-        // libellé surligné, et la saisie en cours à la valeur affichée.
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(labels[i].0, lbl_style(i)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&vals[i], Style::default()),
-          ]));
+          ];
+        if i == crate::EDIT_CONFIRM_FIELD
+          {
+            // « Enregistrer ? » n'est pas un texte : c'est un choix
+            // explicite. Le surlignage porte sur la réponse qu'Entrée
+            // exécutera, `[Non]` étant le défaut.
+            let choix = |oui: bool| -> Style
+              {
+                if oui == state.choix_oui
+                  {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                  }
+                else
+                  {
+                    Style::default().fg(Color::DarkGray)
+                  }
+              };
+            spans.push(Span::styled("[Oui]", choix(true)));
+            spans.push(Span::styled(" / ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("[Non]", choix(false)));
+          }
+        else
+          {
+            // La valeur reste au style par défaut : le champ actif se lit au
+            // libellé surligné, et la saisie en cours à la valeur affichée.
+            spans.push(Span::styled(&vals[i], Style::default()));
+          }
+        lines.push(Line::from(spans));
       }
     if let Some(err) = &state.error
       {
@@ -962,9 +985,9 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         {
           "←/→ curseur · Ctrl+←/→ mots · Frappe saisie · Entrée valider · Échap"
         }
-      else if active == 3
+      else if active == crate::EDIT_CONFIRM_FIELD
         {
-          "o = Enregistrer · N = Annuler · Échap annuler"
+          "←/→ choisir · o Oui · n Non · Entrée valider · Échap annuler"
         }
       else
         {
@@ -2276,6 +2299,59 @@ mod tests
             let buf = popup_dans_buffer(&app, &popup, 110, 34);
             assert_champs_differencies(&buf, &libelles, Some(0), champ, "éditeur");
           }
+      }
+
+    /// « Enregistrer ? » n'est pas un texte à saisir : c'est un choix
+    /// explicite, les deux réponses affichées côte à côte.
+    #[test]
+    fn la_confirmation_affiche_ses_deux_reponses()
+      {
+        let (app, _dir) = app_de_test("confirmation-deux");
+        let popup = popup_de_test(&app, crate::Onglet::Projet);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("[Oui]"), "le choix [Oui] doit être affiché :\n{rendu}");
+        assert!(rendu.contains("[Non]"), "le choix [Non] doit être affiché :\n{rendu}");
+      }
+
+    /// Le surlignage désigne la réponse qu'Entrée exécutera : il doit basculer
+    /// avec le choix, sinon il ne dirait rien de la prochaine action. Le
+    /// défaut est `[Non]`.
+    #[test]
+    fn le_surlignage_de_la_confirmation_suit_le_choix()
+      {
+        let (app, _dir) = app_de_test("confirmation-surligne");
+        let mut popup = popup_de_test(&app, crate::Onglet::Projet);
+        let aspect = |buf: &Buffer, ancre: &str| -> (Color, Modifier)
+          {
+            let (fg, _, modifier) = aspect_cible(buf, ancre, Some(0))
+                .unwrap_or_else(|| panic!("« {ancre} » doit être affiché"));
+            (fg, modifier)
+          };
+
+        let buf = popup_dans_buffer(&app, &popup, 110, 34);
+        let (fg_non, mod_non) = aspect(&buf, "[Non]");
+        let (fg_oui, mod_oui) = aspect(&buf, "[Oui]");
+        assert!(
+          mod_non.contains(Modifier::BOLD) && fg_non == Color::Yellow,
+          "par défaut, [Non] doit être le choix surligné (gras jaune)"
+        );
+        assert!(
+          !mod_oui.contains(Modifier::BOLD) && fg_oui == Color::DarkGray,
+          "[Oui] doit rester en retrait tant qu'il n'est pas choisi"
+        );
+
+        popup.projet.choix_oui = true;
+        let buf = popup_dans_buffer(&app, &popup, 110, 34);
+        let (fg_non, mod_non) = aspect(&buf, "[Non]");
+        let (fg_oui, mod_oui) = aspect(&buf, "[Oui]");
+        assert!(
+          mod_oui.contains(Modifier::BOLD) && fg_oui == Color::Yellow,
+          "choisi, [Oui] doit prendre le surlignage"
+        );
+        assert!(
+          !mod_non.contains(Modifier::BOLD) && fg_non == Color::DarkGray,
+          "et [Non] doit le rendre"
+        );
       }
 
 /// L'onglet Coûts met la valeur en valeur plutôt que le libellé : c'est le

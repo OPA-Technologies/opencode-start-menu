@@ -368,10 +368,14 @@ pub(crate) struct ProjectEditState {
     /// Le champ vient d'être ouvert : `Suppr` le vide d'un coup, et la
     /// Version repart de zéro à la première frappe.
     pub(crate) premiere_touche: bool,
+    /// Choix surligné sur « Enregistrer ? » : `true` = `[Oui]`, `false` =
+    /// `[Non]`. Le défaut est `[Non]` : la frappe accidentelle d'Entrée ne
+    /// doit pas enregistrer.
+    pub(crate) choix_oui: bool,
     pub(crate) status_menu_open: bool,
     pub(crate) status_filter: String,
     pub(crate) status_cursor: usize,
-}
+  }
 
 impl Default for ProjectEditState
   {
@@ -388,6 +392,7 @@ impl Default for ProjectEditState
             pending_description: String::new(),
             error: None,
             premiere_touche: true,
+            choix_oui: false,
             status_menu_open: false,
             status_filter: String::new(),
             status_cursor: 0,
@@ -410,6 +415,7 @@ impl ProjectEditState
             pending_description: project.description.clone(),
             error: None,
             premiere_touche: true,
+            choix_oui: false,
             status_menu_open: false,
             status_filter: String::new(),
             status_cursor: 0,
@@ -4309,6 +4315,14 @@ fn handle_edit_input(
                   }
                 return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
+            // Sur « Enregistrer ? », les flèches horizontales choisissent la
+            // réponse : ← vise `[Oui]`, → vise `[Non]`. C'est le choix
+            // surligné qu'Entrée exécutera.
+            KeyCode::Left | KeyCode::Right if state.active_field == EDIT_CONFIRM_FIELD =>
+              {
+                state.choix_oui = key.code == KeyCode::Left;
+                return Ok(InputMode::Popup(base.avec_projet(state.clone())));
+              }
             KeyCode::Enter =>
               {
                 if state.status_menu_open
@@ -4339,6 +4353,13 @@ fn handle_edit_input(
                     state.editing = true;
                     load_edit_field(state);
                   }
+                else if !state.choix_oui
+                  {
+                    // Choix surligné `[Non]` : fermer sans rien écrire, à
+                    // l'instar d'Échap. C'est le défaut, pour qu'une Entrée
+                    // posée au hasard ne dépose jamais de variante.
+                    return Ok(InputMode::Normal);
+                  }
                 else if apply_edit(app, state)
                   {
                     registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
@@ -4364,15 +4385,13 @@ fn handle_edit_input(
                   }
                 return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
+            // `o` et `n` désignent la réponse à valider, sans l'exécuter :
+            // le surlignage montre ce qu'Entrée fera.
             KeyCode::Char('o') | KeyCode::Char('O') =>
               {
-                if state.active_field == EDIT_CONFIRM_FIELD && apply_edit(app, state)
+                if state.active_field == EDIT_CONFIRM_FIELD
                   {
-                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
-                    app.push_info(
-                      "Projet mis à jour : variante Debug enregistrée".to_string(),
-                    );
-                    return Ok(InputMode::Normal);
+                    state.choix_oui = true;
                   }
                 return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
@@ -4380,7 +4399,7 @@ fn handle_edit_input(
               {
                 if state.active_field == EDIT_CONFIRM_FIELD
                   {
-                    return Ok(InputMode::Normal);
+                    state.choix_oui = false;
                   }
                 return Ok(InputMode::Popup(base.avec_projet(state.clone())));
               }
@@ -4902,6 +4921,107 @@ mod tests
               }
           }
         courant.projet
+      }
+
+    /// Appelé par les tests de confirmation : frappe chaque touche et rend le
+    /// mode final. La confirmation a le droit de fermer le popup — c'est
+    /// justement ce que ces tests vérifient, d'où ce rendu différent de
+    /// `frappe_dans_le_champ`.
+    fn frappe_de_confirmation(
+      app: &mut crate::App,
+      popup: &crate::Popup,
+      touches: &[KeyCode],
+    ) -> crate::InputMode
+      {
+        let mut courant = popup.clone();
+        for code in touches
+          {
+            let mut etat = courant.projet.clone();
+            let touche = KeyEvent::new(*code, KeyModifiers::NONE);
+            match super::handle_edit_input(touche, &mut etat, app, &courant).unwrap()
+              {
+                crate::InputMode::Popup(p) => courant = p,
+                autre => return autre,
+              }
+          }
+        crate::InputMode::Popup(courant)
+      }
+
+    /// Un popup posé sur le champ de confirmation, avec un projet valide.
+    fn popup_confirmation(app: &crate::App) -> crate::Popup
+      {
+        let mut projet = super::ProjectEditState::from_project(&app.projects[0], 0);
+        projet.active_field = super::EDIT_CONFIRM_FIELD;
+        crate::Popup::nouveau(0, projet, "FRA".to_string())
+      }
+
+    /// Le défaut `[Non]` protège : une Entrée posée sur la confirmation sans
+    /// avoir choisi doit fermer sans rien déposer.
+    #[test]
+    fn la_confirmation_par_defaut_ne_enregistre_pas()
+      {
+        let mut app = app_avec_projet();
+        let mut popup = popup_confirmation(&app);
+        popup.projet.pending_description = "modifie".to_string();
+        let mode = frappe_de_confirmation(&mut app, &popup, &[KeyCode::Enter]);
+        assert!(
+          matches!(mode, crate::InputMode::Normal),
+          "[Non] + Entrée doit fermer le popup"
+        );
+        assert_eq!(
+          app.projects[0].description, "",
+          "aucune variante ne doit être déposée sans choix [Oui]"
+        );
+      }
+
+    /// Le choix `[Oui]` est le seul qui dépose la variante.
+    #[test]
+    fn la_confirmation_par_oui_enregistre()
+      {
+        let mut app = app_avec_projet();
+        let mut popup = popup_confirmation(&app);
+        popup.projet.pending_description = "modifie".to_string();
+        popup.projet.choix_oui = true;
+        let mode = frappe_de_confirmation(&mut app, &popup, &[KeyCode::Enter]);
+        assert!(
+          matches!(mode, crate::InputMode::Normal),
+          "[Oui] + Entrée enregistre puis ferme"
+        );
+        assert_eq!(app.projects[0].description, "modifie");
+      }
+
+    /// `o` et `n` désignent la réponse : ils ne l'exécutent pas, sinon le
+    /// surlignage serait un décor et Entrée n'aurait plus rien à valider.
+    #[test]
+    fn o_et_n_designent_la_reponse_de_la_confirmation()
+      {
+        let mut app = app_avec_projet();
+        let popup = popup_confirmation(&app);
+        let etat = frappe_dans_le_champ(&mut app, &popup, &[KeyCode::Char('o')]);
+        assert!(etat.choix_oui, "o doit designer [Oui]");
+        let etat = frappe_dans_le_champ(
+          &mut app,
+          &popup,
+          &[KeyCode::Char('o'), KeyCode::Char('n')],
+        );
+        assert!(!etat.choix_oui, "n doit designer [Non]");
+        assert_eq!(
+          app.projects[0].description, "",
+          "désigner une réponse ne doit rien enregistrer"
+        );
+      }
+
+    /// Sur la confirmation, `←` vise `[Oui]` et `→` vise `[Non]` : les mêmes
+    /// flèches que partout ailleurs, appliquées au choix affiché.
+    #[test]
+    fn les_fleches_horizontales_choisissent_la_reponse()
+      {
+        let mut app = app_avec_projet();
+        let popup = popup_confirmation(&app);
+        let etat = frappe_dans_le_champ(&mut app, &popup, &[KeyCode::Left]);
+        assert!(etat.choix_oui, "← doit designer [Oui]");
+        let etat = frappe_dans_le_champ(&mut app, &popup, &[KeyCode::Right]);
+        assert!(!etat.choix_oui, "→ doit designer [Non]");
       }
 
     /// La saisie du code pays reprend les mêmes gestes : suppression au
