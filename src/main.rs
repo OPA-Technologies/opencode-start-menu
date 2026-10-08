@@ -850,6 +850,17 @@ impl App {
         progress.begin(Step::Finalize);
         refresh_project_selection(&mut app);
         progress.done();
+        // Complément « git » : reconstruit la trace comptable des sessions
+        // antérieures à la comptabilisation par constat. Une session déjà
+        // tracée n'est jamais réécrite, ce qui rend l'opération idempotente.
+        if let Ok(n) = apport::reconstruire_historique_git(
+          &app.opencode_db_path,
+          &app.projects,
+          &apport::chemin_apports(&app.registry_path),
+        ) && n > 0
+        {
+            app.push_info(format!("Historique : {n} sessions reconstruites par git"));
+        }
         // Bandeau de démarrage : rappel de l'état de la comptabilité.
         if let Ok(apports) = apport::charger_apports(&apport::chemin_apports(&app.registry_path))
             && let Some(bandeau) = apport::bandeau_debut(&apports)
