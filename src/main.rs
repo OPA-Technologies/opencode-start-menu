@@ -306,6 +306,10 @@ fn id_a_l_index(app: &App, projet_idx: usize) -> Option<String> {
 #[derive(Clone)]
 pub(crate) enum InputMode {
     Normal,
+    /// Choix du type de la nouvelle entrée : « Projet » ou « Bibliothèque ».
+    ChoixNouveau {
+        selected: usize,
+    },
     CreatingProject(ProjectCreationState),
     SelectModule {
         project_idx: usize,
@@ -352,6 +356,9 @@ pub(crate) struct ProjectCreationState {
     pub(crate) status_cursor: usize,
     // Saisie libre d'un nouveau statut (entrée « + Nouveau statut » du menu).
     pub(crate) status_free_text: bool,
+    /// La création porte une bibliothèque (« Nouvelle bibliothèque ») : le
+    /// dossier par défaut tombe sous la racine des bibliothèques.
+    pub(crate) bibliotheque: bool,
 }
 
 #[derive(Clone)]
@@ -831,6 +838,9 @@ impl App {
         if let Err(e) = rescan_repertoire(&mut app, progress) {
             app.push_error(format!("Rescan au démarrage échoué : {e}"));
         }
+        // Les entrées vivant sous la racine des bibliothèques sont des
+        // bibliothèques de droit, même si la mention n'a jamais été écrite.
+        registry::deriver_bibliotheques(&mut app.projects, &app.prefs.lib_root_resolu());
         // Auto-sync projet menu : aligner version_debug sur CARGO_PKG_VERSION.
         progress.begin(Step::SyncVersion);
         let _ = sync_menu_project_version(&mut app);
@@ -876,6 +886,7 @@ impl App {
             Ok(projects) => app.projects = projects,
             Err(e) => eprintln!("Registre illisible : {e}"),
         }
+        registry::deriver_bibliotheques(&mut app.projects, &app.prefs.lib_root_resolu());
         sort_projects(&mut app.projects, sort_order);
         app
     }
@@ -1095,7 +1106,7 @@ impl App {
             self.set_bare_launch();
             None
         } else if self.is_new_selected() {
-            Some(InputMode::CreatingProject(ProjectCreationState::default()))
+            Some(InputMode::ChoixNouveau { selected: 0 })
         } else if let Some(idx) = self.selected_project_idx() {
             self.launch(idx);
             None
@@ -2423,6 +2434,7 @@ fn libelle_mode(mode: &InputMode) -> &'static str
     match mode
       {
         InputMode::Normal => "normal",
+        InputMode::ChoixNouveau { .. } => "choix-nouveau",
         InputMode::CreatingProject(_) => "creation",
         InputMode::SelectModule { .. } => "module",
         InputMode::Popup(_) => "popup",
@@ -2556,8 +2568,8 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                             InputMode::Normal
                         }
                     }
-                    KeyCode::Char('n') => {
-                        InputMode::CreatingProject(ProjectCreationState::default())
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        InputMode::ChoixNouveau { selected: 0 }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         ouvrir_popup(&mut app, Onglet::Parametres)
@@ -2652,6 +2664,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         selected,
                     },
                 },
+                InputMode::ChoixNouveau { selected } => gerer_choix_nouveau(key.code, selected),
                 InputMode::CreatingProject(mut state) => {
                     match handle_creation_input(key, &mut state, &mut app) {
                         Ok(mode) => mode,
@@ -2865,11 +2878,12 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
         // Mémorisé pour la restauration : si un jour tous les projets sont
         // archivés, plus rien ne dira plus où les ramener.
         app.projets_root = root.clone();
-        match registry::reindex_from_disk(&root, &mut app.projects)
+        match registry::reindex_from_disk(&root, &app.prefs.lib_root_resolu(), &mut app.projects)
           {
             Ok(n) => added = n,
             Err(e) => alertes.push(format!("Indexation impossible : {e}")),
           }
+        registry::deriver_bibliotheques(&mut app.projects, &app.prefs.lib_root_resolu());
       }
     progress.begin(Step::RescanUsage);
     let usage = registry::load_usage(&app.opencode_db_path);
@@ -3430,6 +3444,35 @@ pub(crate) fn status_menu_creation_items(filter: &str) -> Vec<&'static str>
     items
   }
 
+fn gerer_choix_nouveau(code: KeyCode, selected: usize) -> InputMode {
+    match code {
+        // ↑/↓ parcourent Projet / Bibliothèque ; pas de boucle : les bornes
+        // sont nettes et suffisent pour deux entrées.
+        KeyCode::Up | KeyCode::Char('k') if selected > 0 => {
+            InputMode::ChoixNouveau { selected: selected - 1 }
+        }
+        KeyCode::Down | KeyCode::Char('j') if selected < 1 => {
+            InputMode::ChoixNouveau { selected: selected + 1 }
+        }
+        KeyCode::Enter => InputMode::CreatingProject(ProjectCreationState {
+            bibliotheque: selected == 1,
+            ..Default::default()
+        }),
+        KeyCode::Esc => InputMode::Normal,
+        // Désignation directe, sans navigation.
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            InputMode::CreatingProject(ProjectCreationState::default())
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            InputMode::CreatingProject(ProjectCreationState {
+                bibliotheque: true,
+                ..Default::default()
+            })
+        }
+        _ => InputMode::ChoixNouveau { selected },
+    }
+}
+
 fn handle_creation_input(
   key: event::KeyEvent,
   state: &mut ProjectCreationState,
@@ -3577,7 +3620,14 @@ fn handle_creation_input(
                       {
                         return Ok(InputMode::Normal);
                       }
-                    state.id = id;
+                    state.id = id.clone();
+                    // Une bibliothèque tombe sous la racine dédiée : le champ
+                    // Chemin s'en prédéclare, éditable comme un projet.
+                    if state.bibliotheque && state.path.is_empty()
+                      {
+                        state.path =
+                          format!("{}/{}", app.prefs.lib_root.trim_end_matches('/'), state.id);
+                      }
                     state.active_field = 1;
                     load_creation_field(state);
                   }
@@ -3650,10 +3700,17 @@ fn handle_creation_input(
                   {
                     let dir = if state.path.is_empty()
                       {
-                        dirs::home_dir()
-                          .unwrap_or_else(|| PathBuf::from("."))
-                          .join("projets")
-                          .join(&state.id)
+                        if state.bibliotheque
+                          {
+                            app.prefs.lib_root_resolu().join(&state.id)
+                          }
+                        else
+                          {
+                            dirs::home_dir()
+                              .unwrap_or_else(|| PathBuf::from("."))
+                              .join("projets")
+                              .join(&state.id)
+                          }
                       }
                     else
                       {
@@ -3730,6 +3787,7 @@ fn handle_creation_input(
                         last_valorisation: String::new(),
                         total_valorisation: String::new(),
                         tarif_resume: String::new(),
+                        est_bibliotheque: state.bibliotheque,
                     });
                     registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
                     finalize_project_list(app);
@@ -4670,6 +4728,7 @@ mod tests
             last_valorisation: String::new(),
             total_valorisation: String::new(),
             tarif_resume: String::new(),
+            est_bibliotheque: false,
         }
     }
 
@@ -5496,6 +5555,136 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         let _ = fs::remove_dir_all(&dir);
       }
 
+    /// Le mode « Nouveau » ouvre d'abord le choix Projet / Bibliothèque :
+    /// mouvement borné, désignation directe p/b, Entrée valide le type.
+    #[test]
+    fn le_choix_du_type_parcourt_projet_et_bibliotheque()
+      {
+        assert!(
+          matches!(
+            crate::gerer_choix_nouveau(KeyCode::Down, 0),
+            crate::InputMode::ChoixNouveau { selected: 1 }
+          ),
+          "la flèche bas désigne la bibliothèque"
+        );
+        assert!(
+          matches!(
+            crate::gerer_choix_nouveau(KeyCode::Up, 0),
+            crate::InputMode::ChoixNouveau { selected: 0 }
+          ),
+          "pas de boucle sur la première entrée"
+        );
+        assert!(
+          matches!(
+            crate::gerer_choix_nouveau(KeyCode::Down, 1),
+            crate::InputMode::ChoixNouveau { selected: 1 }
+          ),
+          "pas de boucle sur la dernière entrée"
+        );
+        match crate::gerer_choix_nouveau(KeyCode::Enter, 1)
+          {
+            crate::InputMode::CreatingProject(s) =>
+              assert!(s.bibliotheque, "la bibliothèque cochée est validée"),
+            _ => panic!("Entrée doit valider le choix"),
+          }
+        match crate::gerer_choix_nouveau(KeyCode::Enter, 0)
+          {
+            crate::InputMode::CreatingProject(s) =>
+              assert!(!s.bibliotheque, "le projet reste le défaut"),
+            _ => panic!("Entrée doit valider le choix"),
+          }
+        assert!(
+          matches!(crate::gerer_choix_nouveau(KeyCode::Esc, 0), crate::InputMode::Normal),
+          "Échap referme le choix sans créer"
+        );
+        match crate::gerer_choix_nouveau(KeyCode::Char('b'), 0)
+          {
+            crate::InputMode::CreatingProject(s) =>
+              assert!(s.bibliotheque, "p désigne directement la bibliothèque"),
+            _ => panic!("la touche b doit ouvrir la création bibliothèque"),
+          }
+        match crate::gerer_choix_nouveau(KeyCode::Char('p'), 1)
+          {
+            crate::InputMode::CreatingProject(s) =>
+              assert!(!s.bibliotheque, "n désigne directement le projet"),
+            _ => panic!("la touche p doit ouvrir la création projet"),
+          }
+      }
+
+    /// La création « bibliothèque » prédéclare le Chemin sous la racine des
+    /// bibliothèques dès la saisie de l'identifiant.
+    #[test]
+    fn une_bibliotheque_prefixe_le_chemin_par_defaut()
+      {
+        let mut app = app_avec_projet();
+        let libs = temp_dir("prefixe-chemin-lib").join("Libs");
+        app.prefs.lib_root = libs.to_string_lossy().to_string();
+        let mut state =
+          crate::ProjectCreationState { bibliotheque: true, ..Default::default() };
+        state.input_buffer = "ma-lib".to_string();
+        let mode = crate::handle_creation_input(
+          KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+          &mut state,
+          &mut app,
+        )
+        .unwrap();
+        assert!(matches!(mode, crate::InputMode::CreatingProject(_)));
+        assert_eq!(state.id, "ma-lib");
+        assert_eq!(state.path, libs.join("ma-lib").to_string_lossy());
+        let _ = fs::remove_dir_all(libs.parent().unwrap());
+      }
+
+    /// Une bibliothèque créée porte son drapeau et atterrit sous la racine des
+    /// bibliothèques, pas sous celle des projets.
+    #[test]
+    fn une_bibliotheque_creee_est_marquee_et_rangee_sous_la_racine()
+      {
+        let mut app = app_avec_projet();
+        let libs = temp_dir("creation-racine-lib").join("Libs");
+        app.prefs.lib_root = libs.to_string_lossy().to_string();
+        let mut state =
+          crate::ProjectCreationState { bibliotheque: true, ..Default::default() };
+        let entre = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+        let remplir = |state: &mut crate::ProjectCreationState,
+                       app: &mut crate::App,
+                       valeur: &str| {
+          state.input_buffer = valeur.to_string();
+          state.input_offset = valeur.chars().count();
+          state.premiere_touche = false;
+          let avant = state.active_field;
+          assert!(
+            matches!(
+              crate::handle_creation_input(entre(KeyCode::Enter), state, app),
+              Ok(crate::InputMode::CreatingProject(_))
+            ),
+            "le champ {avant} doit continuer la création"
+          );
+        };
+        remplir(&mut state, &mut app, "ma-lib");
+        remplir(&mut state, &mut app, "Ma Lib");
+        assert_eq!(
+          state.path, libs.join("ma-lib").to_string_lossy(),
+          "le Chemin est prédéclaré sous la racine des bibliothèques"
+        );
+        remplir(&mut state, &mut app, &libs.join("ma-lib").to_string_lossy());
+        remplir(&mut state, &mut app, "ma description");
+        remplir(&mut state, &mut app, "");
+        remplir(&mut state, &mut app, "");
+        remplir(&mut state, &mut app, "0.1.0");
+        let mode =
+          crate::handle_creation_input(entre(KeyCode::Enter), &mut state, &mut app).unwrap();
+        assert!(matches!(mode, crate::InputMode::Normal), "la confirmation clôt le formulaire");
+        let p = app
+          .projects
+          .iter()
+          .find(|p| p.id == "ma-lib")
+          .expect("la bibliothèque doit être créée");
+        assert!(p.est_bibliotheque, "le drapeau est enregistré");
+        assert_eq!(p.path, libs.join("ma-lib"));
+        assert!(p.path.exists(), "le dossier existe sous la racine des bibliothèques");
+        let _ = fs::remove_dir_all(libs.parent().unwrap());
+      }
+
     /// Un popup sans projet suffit : la navigation d'onglets ne touche qu'à
     /// l'onglet actif et à l'état de saisie.
     fn popup_navigation() -> crate::Popup
@@ -6120,6 +6309,7 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
                 tarif_web_fetched_ms: 0,
                 tarif_web_secteur: false,
                 tarif_web_pays: String::new(),
+                est_bibliotheque: false,
             });
         }
         app.archiver_selection().expect("archivage possible");

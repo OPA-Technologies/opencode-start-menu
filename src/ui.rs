@@ -98,6 +98,11 @@ pub(crate) fn ui(
         render_creation_dialog(f, size, creation_state);
     }
 
+    // Choix du type de la nouvelle entrée : Projet ou Bibliothèque.
+    if let InputMode::ChoixNouveau { selected } = input_mode {
+        render_choix_nouveau_dialog(f, size, *selected);
+    }
+
     // Popup unifié : cadre, barre d'onglets et contenu de l'onglet actif.
     if let InputMode::Popup(popup) = input_mode {
         render_popup_unifie(f, size, app, popup);
@@ -205,10 +210,17 @@ fn render_project_list(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(
+            let mut spans = vec![Span::styled(
                 format!("  > {}", sanitize(&p.name)),
                 style,
-            )))
+            )];
+            if p.est_bibliotheque {
+                spans.push(Span::styled(
+                    "  Bibliothèque",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -424,11 +436,23 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         ])
     };
 
+    let est_bibliotheque = app
+        .selected_project_idx()
+        .is_some_and(|idx| app.projects[idx].est_bibliotheque);
+
     let text: Vec<Line> = vec![
         // Groupe 1
         Line::from(vec![
             Span::styled("Nom          : ", Style::default().fg(Color::DarkGray)),
             Span::raw(sanitize(&name)),
+            if est_bibliotheque {
+                Span::styled(
+                    "  ·  Bibliothèque",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
         ]),
         Line::from(vec![
             Span::styled("ID           : ", Style::default().fg(Color::DarkGray)),
@@ -620,7 +644,7 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
     let largeur = size.width.min(84).max(24.min(size.width));
     // La fenêtre ne cherche plus à contenir la liste : `F10` en a plus qu'un
     // écran, et une aide tronquée sans défilement est une aide incomplète.
-    let hauteur = size.height.saturating_sub(4).max(9.min(size.height)).min(40);
+    let hauteur = size.height.saturating_sub(4).max(9.min(size.height)).min(48);
     let Some(area) = op_tui::layout::popup_rect(size, largeur, hauteur) else {
         return;
     };
@@ -666,6 +690,56 @@ fn render_aide(f: &mut Frame, size: Rect, input_mode: &InputMode)
 
 use op_tui::field::{colonne_curseur, valeur_affiche, VIDE};
 
+fn render_choix_nouveau_dialog(f: &mut Frame, size: Rect, selected: usize)
+  {
+    let Some(area) = op_tui::layout::popup_rect(size, 60, 8) else {
+        return;
+    };
+    f.render_widget(Clear, area);
+    let opaque = Style::default().bg(THEME_GRIS.fond);
+
+    let block = Block::default()
+      .title(" Nouveau ")
+      .borders(Borders::ALL)
+      .border_style(Style::default().fg(Color::Cyan))
+      .style(opaque);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let options = ["Projet", "Bibliothèque"];
+    let surligne = Style::default()
+      .bg(Color::White)
+      .fg(Color::Black)
+      .add_modifier(Modifier::BOLD);
+    let mut lignes: Vec<Line> = options
+      .iter()
+      .enumerate()
+      .map(|(i, opt)| {
+        Line::from(Span::styled(format!("  > {opt}"), if i == selected { surligne } else { Style::default() }))
+      })
+      .collect();
+    lignes.push(Line::from(""));
+    lignes.push(Line::from(vec![
+      Span::styled("Un projet garde son dossier sous la racine des projets ;", Style::default().fg(Color::DarkGray)),
+    ]));
+    lignes.push(Line::from(vec![
+      Span::styled("une bibliothèque de code tombe sous la racine des bibliothèques.", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let zones = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([Constraint::Min(0), Constraint::Length(1)])
+      .split(inner);
+    f.render_widget(Paragraph::new(lignes), zones[0]);
+    f.render_widget(
+      Paragraph::new(Line::from(Span::styled(
+        "↑/↓ choisir · Entrée valider · Échap annuler",
+        Style::default().fg(Color::DarkGray),
+      ))).alignment(Alignment::Center),
+      zones[1],
+    );
+  }
+
 fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationState)
   {
     let dialog_width = size.width.min(76);
@@ -679,7 +753,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
     let opaque = Style::default().bg(THEME_GRIS.fond);
 
     let block = Block::default()
-      .title(" Nouveau projet ")
+      .title(if state.bibliotheque { " Nouvelle bibliothèque " } else { " Nouveau projet " })
       .borders(Borders::ALL)
       .border_style(Style::default().fg(Color::Cyan))
       .style(opaque);
@@ -2573,6 +2647,86 @@ mod tests
                 assert_ne!(rendu_autre, rendu, "deux positions rendent le même écran");
               }
           }
+      }
+
+    // --- Bibliothèques (lot G1) ----------------------------------------
+
+    /// Le choix du type de la nouvelle entrée montre les deux possibilités et
+    /// leur geste de validation.
+    #[test]
+    fn le_choix_du_type_montre_projet_et_bibliotheque()
+      {
+        let rendu = rendre_ecran(&crate::InputMode::ChoixNouveau { selected: 0 }, 110, 34);
+        assert!(rendu.contains("Projet"), "le projet doit être proposé :\n{rendu}");
+        assert!(rendu.contains("Bibliothèque"), "la bibliothèque doit être proposée :\n{rendu}");
+        assert!(
+          rendu.contains("↑/↓ choisir · Entrée valider · Échap annuler"),
+          "le pied du choix doit annoncer les gestes :\n{rendu}"
+        );
+      }
+
+    /// Le formulaire de création change de titre selon le type choisi.
+    #[test]
+    fn le_titre_du_formulaire_annonce_le_type_choisi()
+      {
+        let (buf, _) = creation_dans_buffer(&ProjectCreationState {
+          bibliotheque: true,
+          ..Default::default()
+        });
+        assert!(
+          texte(&buf).contains(" Nouvelle bibliothèque "),
+          "le formulaire bibliothèque doit le dire :\n{}",
+          texte(&buf)
+        );
+        let (buf, _) = creation_dans_buffer(&ProjectCreationState::default());
+        assert!(
+          texte(&buf).contains(" Nouveau projet "),
+          "le formulaire projet doit le dire :\n{}",
+          texte(&buf)
+        );
+      }
+
+    /// Une entrée marquée bibliothèque porte un badge dans la liste et dans le
+    /// panneau Détails.
+    #[test]
+    fn la_liste_et_les_details_marquent_une_bibliotheque()
+      {
+        let dir =
+          std::env::temp_dir().join(format!("op-ui-badge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let projet = dir.join("monlib");
+        std::fs::create_dir_all(&projet).unwrap();
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "monlib": {
+                    "name": "monlib",
+                    "path": projet.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "version_debug": "1.0.0",
+                    "description": "",
+                    "tarif_mode": "manuel",
+                    "est_bibliotheque": true
+                }
+            }
+        });
+        std::fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = crate::App::new_light(registre.clone(), crate::SortOrder::Modified);
+        app.filtered = (0..app.projects.len()).collect();
+        app.list_state.select(Some(0));
+        let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        term.draw(|f| {
+          super::ui(f, &mut app, &crate::InputMode::Normal, &ProjectCreationState::default())
+        })
+        .unwrap();
+        let rendu = texte(term.backend().buffer());
+        assert!(rendu.contains("Bibliothèque"), "le badge doit apparaître :\n{rendu}");
+        assert!(
+          rendu.contains(" ·  Bibliothèque"),
+          "les Détails doivent porter le badge :\n{rendu}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
       }
 
     // --- Popup unifié -------------------------------------------------

@@ -61,6 +61,11 @@ pub(crate) fn contextuel(mode: &InputMode) -> Vec<Raccourci> {
             raccourci("r", "Rafraîchir"),
             raccourci("F1", "Aide"),
         ],
+        InputMode::ChoixNouveau { .. } => vec![
+            raccourci("↑/↓", "Projet / Bibliothèque"),
+            raccourci("Entrée", "Valider"),
+            raccourci("Échap", "Annuler"),
+        ],
         InputMode::SelectModule { .. } => vec![
             raccourci("↑/↓", "Choisir un module"),
             raccourci("Entrée", "Ouvrir"),
@@ -181,7 +186,7 @@ pub(crate) fn complet() -> Vec<(Cow<'static, str>, Vec<Raccourci>)> {
                 raccourci("b", "Bumper la version"),
                 raccourci("a", "Archiver le projet"),
                 raccourci("A", "Vue des archives (a y restaure)"),
-                raccourci("n", "Nouveau projet"),
+                raccourci("n", "Nouveau (projet / bibliothèque)"),
                 raccourci("r", "Rafraîchir les données"),
                 raccourci("q ou Échap", "Quitter"),
             ],
@@ -195,7 +200,16 @@ pub(crate) fn complet() -> Vec<(Cow<'static, str>, Vec<Raccourci>)> {
             ],
         ),
         (
-            Cow::Borrowed("Nouveau projet"),
+            Cow::Borrowed("Choix du type (Nouveau)"),
+            vec![
+                raccourci("↑/↓ ou j/k", "Projet / Bibliothèque"),
+                raccourci("p ou b", "Choisir directement"),
+                raccourci("Entrée", "Valider"),
+                raccourci("Échap", "Annuler"),
+            ],
+        ),
+        (
+            Cow::Borrowed("Nouveau projet / bibliothèque"),
             vec![
                 raccourci("↑/↓", "Changer de champ"),
                 raccourci("←/→", "Déplacer le curseur"),

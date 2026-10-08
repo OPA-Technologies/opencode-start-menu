@@ -302,6 +302,11 @@ pub(crate) struct Project {
     total_valorisation: String,
     #[serde(default)]
     tarif_resume: String,
+    /// Mention explicite « bibliothèque » : une entrée vivant sous la racine
+    /// des bibliothèques l'est de droit, mais la mention permet d'honorer un
+    /// projet hors de cette racine.
+    #[serde(default)]
+    est_bibliotheque: bool,
 }
 
 fn default_true() -> bool {
@@ -365,6 +370,15 @@ fn defaut_oui() -> bool {
   true
 }
 
+/// Racine par défaut des bibliothèques de code réutilisable.
+///
+/// Stockée avec `~` pour suivre le changement de dossier personnel, comme
+/// les chemins de projets.
+fn defaut_lib_root() -> String
+  {
+    "~/projets/Libs".to_string()
+  }
+
 /// Ordre de tri mémorisé. Voluntaryment distinct de `SortOrder` (côté clap) :
 /// celui-ci dépend de la ligne de commande, celui-là du registre.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -400,16 +414,25 @@ pub(crate) struct Preferences {
   /// capture fait perdre des données.
   #[serde(default = "defaut_oui")]
   pub(crate) capture: bool,
+  /// Racine des bibliothèques de code réutilisable. Résolue (dégradation du
+  /// `~`) par `lib_root_resolu`.
+  #[serde(default = "defaut_lib_root")]
+  pub(crate) lib_root: String,
 }
 
 impl Default for Preferences {
   fn default() -> Self
     {
-      Self { tri: Tri::default(), colonnes: colonnes_par_defaut(), launch_root: false, capture: true }
+      Self { tri: Tri::default(), colonnes: colonnes_par_defaut(), launch_root: false, capture: true, lib_root: defaut_lib_root() }
     }
 }
 
 impl Preferences {
+  /// Dossier racine effectif des bibliothèques.
+  pub(crate) fn lib_root_resolu(&self) -> PathBuf
+    {
+      PathBuf::from(shellexpand::tilde(&self.lib_root).to_string())
+    }
   /// Le libellé est-il visible ?
   ///
   /// Une liste vide est interprétée comme « aucune colonne », pas comme « tout » :
@@ -477,6 +500,8 @@ pub(crate) struct ProjectEntry {
     /// d'origine : l'onglet Coûts en déduit la devise en cherchant son
     /// symbole dans cette chaîne.
     pub(crate) last_session_cost_local: String,
+    /// L'entrée est une bibliothèque de code réutilisable.
+    pub(crate) est_bibliotheque: bool,
     pub(crate) last_agent: String,
     pub(crate) last_time_created: String,
     pub(crate) last_session_context_pct: String,
@@ -618,12 +643,30 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 tarif_web_fetched_ms: p.tarif_web_fetched_ms,
                 tarif_web_secteur: p.tarif_web_secteur,
                 tarif_web_pays: p.tarif_web_pays.clone(),
+                est_bibliotheque: p.est_bibliotheque,
             }
         })
         .collect::<Vec<ProjectEntry>>();
 
     Ok(projects)
 }
+
+/// Marque comme bibliothèques les entrées dont le chemin tombe sous la racine
+/// des bibliothèques, sans jamais retirer la mention explicite.
+///
+/// La mention est cumulative : un projet déclaré bibliothèque par l'utilisateur
+/// le reste même s'il est déplacé hors de la racine, et un projet déplacé sous
+/// la racine devient bibliothèque dès le chargement.
+pub(crate) fn deriver_bibliotheques(projects: &mut [ProjectEntry], lib_root: &Path)
+  {
+    for p in projects
+      {
+        if p.path.strip_prefix(lib_root).is_ok()
+          {
+            p.est_bibliotheque = true;
+          }
+      }
+  }
 
 /// Indique si toutes les colonnes demandées existent déjà dans `table`.
 ///
@@ -1759,6 +1802,7 @@ pub(crate) fn save_registry_full(
                 last_valorisation: p.last_valorisation.clone(),
                 total_valorisation: p.total_valorisation.clone(),
                 tarif_resume: p.tarif_resume.clone(),
+                est_bibliotheque: p.est_bibliotheque,
             },
         );
     }
@@ -1793,40 +1837,36 @@ fn contains_casefold(name: &str, list: &[&str]) -> bool {
 
 const EXCLUDED_DIRS: &[&str] = &["jdk-21"];
 
-pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -> Result<usize> {
+pub(crate) fn reindex_from_disk(
+    root: &Path,
+    lib_root: &Path,
+    projects: &mut Vec<ProjectEntry>,
+) -> Result<usize> {
     if !root.is_dir() {
         return Ok(0);
     }
     let mut added = 0usize;
     let known: HashSet<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
-    let mut dirs = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            dirs.push(path);
-        }
-    }
-    dirs.sort();
-    for dir in dirs {
-        if known.contains(&dir) || is_excluded(&dir) {
-            continue;
+    let mut ajouter_entree = |dir: &Path, est_lib: bool| {
+        if known.contains(dir) || is_excluded(dir) {
+            return;
         }
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         if name.is_empty() {
-            continue;
+            return;
         }
-        let modified = last_modified(&dir).unwrap_or_else(|| "—".to_string());
+        let modified = last_modified(dir).unwrap_or_else(|| "—".to_string());
         let debug_modified =
-            variant_modified(&dir, "debug").unwrap_or_else(|| "jamais compilée".to_string());
+            variant_modified(dir, "debug").unwrap_or_else(|| "jamais compilée".to_string());
         let release_modified =
-            variant_modified(&dir, "release").unwrap_or_else(|| "jamais compilée".to_string());
+            variant_modified(dir, "release").unwrap_or_else(|| "jamais compilée".to_string());
         projects.push(ProjectEntry {
             id: name.clone(),
             name,
-            path: dir.clone(),
+            path: dir.to_path_buf(),
             description: String::new(),
             status: String::new(),
             version: String::new(),
@@ -1842,31 +1882,65 @@ pub(crate) fn reindex_from_disk(root: &Path, projects: &mut Vec<ProjectEntry>) -
             last_session_cost: String::new(),
             last_session_cost_local: String::new(),
             last_agent: String::new(),
-                last_time_created: String::new(),
-                last_session_context_pct: String::new(),
-                last_duree: String::new(),
-                total_duree: String::new(),
-                last_valorisation: String::new(),
-                total_valorisation: String::new(),
-                tarif_resume: String::new(),
-                status_debug: String::new(),
-                version_debug: String::new(),
-                status_release: String::new(),
-                version_release: String::new(),
-                debug_modified,
-                release_modified,
-                last_compile_debug_secs: 0,
-                last_compile_release_secs: 0,
-                version_manually_edited: false,
-                source_hash: String::new(),
-                tarif_mode: default_tarif_mode(),
+            last_time_created: String::new(),
+            last_session_context_pct: String::new(),
+            last_duree: String::new(),
+            total_duree: String::new(),
+            last_valorisation: String::new(),
+            total_valorisation: String::new(),
+            tarif_resume: String::new(),
+            status_debug: String::new(),
+            version_debug: String::new(),
+            status_release: String::new(),
+            version_release: String::new(),
+            debug_modified,
+            release_modified,
+            last_compile_debug_secs: 0,
+            last_compile_release_secs: 0,
+            version_manually_edited: false,
+            source_hash: String::new(),
+            tarif_mode: default_tarif_mode(),
             tarif_manual: 0.0,
             tarif_web_series: Vec::new(),
             tarif_web_fetched_ms: 0,
             tarif_web_secteur: false,
             tarif_web_pays: String::new(),
+            est_bibliotheque: est_lib,
         });
         added += 1;
+    };
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    for dir in &dirs {
+        // La racine des bibliothèques est un conteneur, pas un projet : elle ne
+        // doit jamais apparaître dans la liste comme ses propres filles.
+        if dir != lib_root {
+            ajouter_entree(dir, false);
+        }
+    }
+    // Les bibliothèques vivent une cascade plus bas, sous `lib_root` : les
+    // découvrir demande de balayer cette racine, pas seulement la racine des
+    // projets. Balayage réservé au cas où `lib_root` relève bien de la racine
+    // indexée : un registre partiel (temp de test, racine archiée) ne doit
+    // pas ramasser les bibliothèques d'une autre racine.
+    if lib_root.is_dir() && lib_root.strip_prefix(root).is_ok() {
+        let mut libs = Vec::new();
+        for entry in fs::read_dir(lib_root)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                libs.push(path);
+            }
+        }
+        libs.sort();
+        for dir in &libs {
+            ajouter_entree(dir, true);
+        }
     }
     Ok(added)
 }
@@ -2394,6 +2468,7 @@ mod tests
                 last_valorisation: String::new(),
                 total_valorisation: String::new(),
                 tarif_resume: String::new(),
+                est_bibliotheque: false,
             }],
         )
         .unwrap();
@@ -2462,11 +2537,117 @@ last_compile_debug_secs: 0,
                 last_valorisation: String::new(),
                 total_valorisation: String::new(),
                 tarif_resume: String::new(),
+                est_bibliotheque: false,
             }],
             )
             .unwrap();
             assert_0600(&path);
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Entrée minimale de test : seul le chemin compte pour la dérivation.
+    fn entree_chemin(path: PathBuf) -> ProjectEntry {
+        ProjectEntry {
+            id: String::new(),
+            name: String::new(),
+            path,
+            description: String::new(),
+            status: String::new(),
+            version: String::new(),
+            token: String::new(),
+            used_pct: String::new(),
+            spent: String::new(),
+            last_model: String::new(),
+            modified: String::new(),
+            total_tokens: String::new(),
+            total_cost: String::new(),
+            session_count: String::new(),
+            last_session_tokens: String::new(),
+            last_session_cost: String::new(),
+            last_session_cost_local: String::new(),
+            last_agent: String::new(),
+            last_time_created: String::new(),
+            last_session_context_pct: String::new(),
+            status_debug: String::new(),
+            version_debug: String::new(),
+            status_release: String::new(),
+            version_release: String::new(),
+            debug_modified: String::new(),
+            release_modified: String::new(),
+            last_compile_debug_secs: 0,
+            last_compile_release_secs: 0,
+            version_manually_edited: false,
+            source_hash: String::new(),
+            tarif_mode: default_tarif_mode(),
+            tarif_manual: 0.0,
+            tarif_web_series: Vec::new(),
+            tarif_web_fetched_ms: 0,
+            tarif_web_secteur: false,
+            tarif_web_pays: String::new(),
+            last_duree: String::new(),
+            total_duree: String::new(),
+            last_valorisation: String::new(),
+            total_valorisation: String::new(),
+            tarif_resume: String::new(),
+            est_bibliotheque: false,
+        }
+    }
+
+    /// L'entrée devient une bibliothèque dès que son chemin tombe sous la
+    /// racine des bibliothèques, qu'elle ait été déclarée ou non.
+    #[test]
+    fn la_derivation_des_bibliotheques_suit_la_racine() {
+        let dir = temp_registry("deriv-libs");
+        let libs = dir.join("Libs");
+        let mut projets = vec![
+            entree_chemin(libs.join("monlib")),
+            entree_chemin(dir.join("monapp")),
+        ];
+        super::deriver_bibliotheques(&mut projets, &libs);
+        assert!(projets[0].est_bibliotheque, "sous la racine : bibliothèque");
+        assert!(!projets[1].est_bibliotheque, "hors racine : projet ordinaire");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Une bibliothèque déclarée hors de la racine le reste : la dérivation
+    /// ajoute, elle ne retire jamais.
+    #[test]
+    fn la_mention_explicite_dune_bibliotheque_survit_hors_racine() {
+        let dir = temp_registry("mention-lib");
+        let libs = dir.join("Libs");
+        let mut p = entree_chemin(dir.join("maison"));
+        p.est_bibliotheque = true;
+        super::deriver_bibliotheques(std::slice::from_mut(&mut p), &libs);
+        assert!(p.est_bibliotheque, "la mention explicite ne se perd pas");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Le conteneur des bibliothèques n'est jamais un projet, mais ses filles
+    /// le sont — et marquées comme bibliothèques.
+    #[test]
+    fn reindex_marque_les_bibliotheques_sans_depouiller_leur_conteneur() {
+        let dir = temp_registry("reindex-libs");
+        let root = dir.join("projets");
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::create_dir_all(root.join("Libs").join("monlib")).unwrap();
+        let mut projets = Vec::new();
+        let ajoutes = super::reindex_from_disk(&root, &root.join("Libs"), &mut projets).unwrap();
+        assert_eq!(ajoutes, 2, "le projet et la bibliothèque, pas le conteneur");
+        let lib = projets
+            .iter()
+            .find(|p| p.path == root.join("Libs").join("monlib"))
+            .expect("la bibliothèque découverte");
+        assert!(lib.est_bibliotheque, "sous la racine des bibliothèques");
+        let app = projets
+            .iter()
+            .find(|p| p.path == root.join("app"))
+            .expect("le projet découvert");
+        assert!(!app.est_bibliotheque, "hors de la racine des bibliothèques");
+        assert!(
+            !projets.iter().any(|p| p.path == root.join("Libs")),
+            "le conteneur n'apparaît pas comme projet"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3117,6 +3298,7 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             last_valorisation: String::new(),
             total_valorisation: String::new(),
             tarif_resume: String::new(),
+            est_bibliotheque: false,
         }
     }
 
