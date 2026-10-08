@@ -1459,20 +1459,44 @@ fn render_contenu_couts(
     project: &crate::ProjectEntry,
     couts: &crate::EtatCouts,
 ) {
+    // Note comptable sous la synthèse : pour une bibliothèque, les apports
+    // reçus des projets ; pour un projet, les crédits versés aux
+    // bibliothèques (affichés à part, jamais additionnés au coût du projet
+    // qui les couvre déjà).
+    let apports = crate::apport::charger_apports(&crate::apport::chemin_apports(&app.registry_path))
+        .unwrap_or_default();
+    let note_synthese = if project.est_bibliotheque {
+        format!(
+            "Apports reçus des projets : {} (non additionnés au coût total)",
+            crate::format_currency(
+                crate::apport::somme_credits_lib(&apports, &project.id),
+                crate::LOCAL_CURRENCY
+            )
+        )
+    } else {
+        let verses = crate::apport::somme_credits_emis(&apports, &project.id);
+        format!(
+            "Dont bibliothèques (non additionnés) : {} portés au crédit des bibliothèques touchées",
+            crate::format_currency(verses, crate::LOCAL_CURRENCY)
+        )
+    };
+    let hauteur_note = lignes_repliees(&note_synthese, area.width.saturating_sub(2));
+
     // Trois blocs : le réglage du tarif, la synthèse du travail accompli et
-    // de son coût, puis le détail par session. La synthèse tient en trois
-    // rangées (bordure haute + libellés + valeurs) ; le détail garde le reste,
-    // avec un plancher pour ne jamais disparaître.
+    // de son coût (plus la note comptable), puis le détail par session. La
+    // synthèse tient en trois rangées (bordure haute + libellés + valeurs) ;
+    // la note lui emboîte le pas. Le détail garde le reste, avec un plancher
+    // pour ne jamais disparaître.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(7),
-            Constraint::Length(3),
+            Constraint::Length(3 + u16::try_from(hauteur_note).unwrap_or(1)),
             Constraint::Min(6),
         ])
         .split(area);
     render_bloc_tarif(f, chunks[0], app, project, couts);
-    render_bloc_synthese(f, chunks[1], project);
+    render_bloc_synthese(f, chunks[1], project, Some(&note_synthese));
     render_tableau_couts(f, chunks[2], project, couts.scroll_offset);
 }
 
@@ -1525,8 +1549,15 @@ fn lignes_repliees(texte: &str, largeur: u16) -> usize
 /// Rendu dans `area` sans cadre propre : la bordure haute est dessinée ici,
 /// comme pour le tableau des coûts. Une valeur absente retombe sur « — »,
 /// jamais sur un zéro qui laisserait croire à un travail non mesuré.
-fn render_bloc_synthese(f: &mut Frame, area: Rect, project: &crate::ProjectEntry)
-  {
+///
+/// `note` est une ligne rappelant la comptabilité des bibliothèques (apports
+/// reçus ou crédits versés), rendue sous le tableau, dans le même bloc.
+fn render_bloc_synthese(
+    f: &mut Frame,
+    area: Rect,
+    project: &crate::ProjectEntry,
+    note: Option<&str>,
+) {
     let label = Style::default().fg(Color::DarkGray);
     let cout = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
     let ou_d = |v: &str| -> String
@@ -1564,6 +1595,20 @@ fn render_bloc_synthese(f: &mut Frame, area: Rect, project: &crate::ProjectEntry
             .style(Style::default().bg(Color::Black)),
     );
     f.render_widget(table, area);
+    if let Some(note) = note
+      {
+        // La note descend sans cadre, sous le tableau : la bordure haute du
+        // bloc la contient encore visuellement.
+        let zone = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(sanitize(note))
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            zone[1],
+        );
+      }
   }
 
 /// Tableau des coûts par session. Borné par la hauteur réellement
@@ -2977,12 +3022,41 @@ mod tests
         );
       }
 
+    /// La note comptable d'un projet rappelle que les crédits versés aux
+    /// bibliothèques ne s'additionnent pas au coût du projet.
+    #[test]
+    fn la_synthese_d_un_projet_rappelle_les_bibliotheques_non_additionnees()
+      {
+        let (app, _dir) = app_de_test("note-projet");
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(
+            rendu.contains("Dont bibliothèques (non additionnés)"),
+            "la note doit rappeler le non-addition :\n{rendu}"
+        );
+      }
+
+    /// Pour une bibliothèque, la synthèse affiche les apports reçus des
+    /// projets, distincts de son propre coût.
+    #[test]
+    fn la_synthese_d_une_bibliotheque_affiche_les_apports_recus()
+      {
+        let (mut app, _dir) = app_de_test("note-lib");
+        app.projects[0].est_bibliotheque = true;
+        let popup = popup_de_test(&app, crate::Onglet::Couts);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(
+            rendu.contains("Apports reçus des projets"),
+            "la note des apports reçus doit apparaître :\n{rendu}"
+        );
+      }
+
     /// Rendu du seul bloc Synthèse : c'est le seul niveau où l'on peut dire
     /// lesquelles de ses lignes viennent de lui et non de l'en-tête voisin.
     fn synthese_dans_buffer(projet: &crate::ProjectEntry) -> Buffer
       {
         let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
-        term.draw(|f| render_bloc_synthese(f, f.area(), projet)).unwrap();
+        term.draw(|f| render_bloc_synthese(f, f.area(), projet, None)).unwrap();
         term.backend().buffer().clone()
       }
 

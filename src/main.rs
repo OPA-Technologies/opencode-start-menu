@@ -850,6 +850,12 @@ impl App {
         progress.begin(Step::Finalize);
         refresh_project_selection(&mut app);
         progress.done();
+        // Bandeau de démarrage : rappel de l'état de la comptabilité.
+        if let Ok(apports) = apport::charger_apports(&apport::chemin_apports(&app.registry_path))
+            && let Some(bandeau) = apport::bandeau_debut(&apports)
+        {
+            app.push_info(bandeau);
+        }
         app
     }
 

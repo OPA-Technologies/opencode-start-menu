@@ -98,6 +98,51 @@ pub(crate) fn chemin_apports(registre: &Path) -> PathBuf
     registre.with_file_name("apports.json")
   }
 
+/// Somme des crédits reçus par une bibliothèque : le cumul des parts `p_L`
+/// portées à son crédit par les sessions de tous les projets.
+pub(crate) fn somme_credits_lib(apports: &[ApportSession], lib_id: &str) -> f64
+  {
+    apports
+      .iter()
+      .flat_map(|a| a.credit_lib.get(lib_id))
+      .sum()
+  }
+
+/// Crédits émis par les sessions d'un projet : ce que ses sessions ont
+/// versé au crédit des bibliothèques touchées. Affiché en note, car ces
+/// montants ne s'additionnent pas au coût du projet (qui les couvre déjà).
+pub(crate) fn somme_credits_emis(apports: &[ApportSession], projet_id: &str) -> f64
+  {
+    apports
+      .iter()
+      .filter(|a| a.projet_id.as_deref() == Some(projet_id))
+      .flat_map(|a| a.credit_lib.values())
+      .sum()
+  }
+
+/// Bandeau de démarrage : rappel concis de l'état de la comptabilité.
+pub(crate) fn bandeau_debut(apports: &[ApportSession]) -> Option<String>
+  {
+    let constates = apports.iter().filter(|a| a.source == "constat").count();
+    let credits: f64 = apports
+      .iter()
+      .flat_map(|a| a.credit_lib.values())
+      .sum();
+    if constates == 0 && credits <= 0.0
+      {
+        return None;
+      }
+    let mut msg = format!("Comptabilité : {constates} sessions constatées");
+    if credits > 0.0
+      {
+        msg.push_str(&format!(
+          ", {} de crédits bibliothèques (non additionnés)",
+          crate::format_currency(credits, crate::LOCAL_CURRENCY)
+        ));
+      }
+    Some(msg)
+  }
+
 fn maintenant_ms() -> i64
   {
     std::time::SystemTime::now()
@@ -399,6 +444,7 @@ pub(crate) fn constater_retour(
 #[cfg(test)]
 mod tests
   {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -629,5 +675,55 @@ mod tests
         let e = classer_repertoire(&[], &chantier, false);
         assert_eq!(e.classe(), ClasseDeSession::Orphelin);
         let _ = std::fs::remove_dir_all(&chantier);
+    }
+
+    #[test]
+    fn les_credits_recus_et_emis_se_somment_par_lib_et_par_projet() {
+        let apport = crate::apport::ApportSession {
+          session_id: "ses_a".to_string(),
+          repertoire: "/tmp/a".to_string(),
+          classe: "Projet".to_string(),
+          projet_id: Some("alpha".to_string()),
+          lib_id: None,
+          depart_ms: 0,
+          fin_ms: 0,
+          duree_ms: 0,
+          modele: String::new(),
+          cout_local: 12.0,
+          deltas: BTreeMap::new(),
+          total_brut: 0,
+          part_lib: BTreeMap::from([("op-lib".to_string(), 0.5)]),
+          credit_lib: BTreeMap::from([("op-lib".to_string(), 6.0)]),
+          source: "constat".to_string(),
+        };
+        assert_eq!(super::somme_credits_lib(std::slice::from_ref(&apport), "op-lib"), 6.0);
+        assert_eq!(super::somme_credits_lib(std::slice::from_ref(&apport), "autre"), 0.0);
+        assert_eq!(super::somme_credits_emis(std::slice::from_ref(&apport), "alpha"), 6.0);
+        assert_eq!(super::somme_credits_emis(std::slice::from_ref(&apport), "gamma"), 0.0);
+    }
+
+    #[test]
+    fn le_bandeau_ne_s_affiche_qu_avec_du_materiel() {
+        assert!(super::bandeau_debut(&[]).is_none());
+        let apport = crate::apport::ApportSession {
+          session_id: "ses_b".to_string(),
+          repertoire: "/tmp/b".to_string(),
+          classe: "Projet".to_string(),
+          projet_id: Some("alpha".to_string()),
+          lib_id: None,
+          depart_ms: 0,
+          fin_ms: 0,
+          duree_ms: 0,
+          modele: String::new(),
+          cout_local: 12.0,
+          deltas: BTreeMap::new(),
+          total_brut: 1,
+          part_lib: BTreeMap::from([("op-lib".to_string(), 0.5)]),
+          credit_lib: BTreeMap::from([("op-lib".to_string(), 6.0)]),
+          source: "constat".to_string(),
+        };
+        let bandeau = super::bandeau_debut(&[apport]).unwrap();
+        assert!(bandeau.contains("1 sessions constatées"));
+        assert!(bandeau.contains("6,00"));
     }
   }
