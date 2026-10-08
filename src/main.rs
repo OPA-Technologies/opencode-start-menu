@@ -27,7 +27,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod apport;
 mod compta;
+mod constat;
 mod keymap;
 mod launch;
 mod lock;
@@ -1860,9 +1862,20 @@ fn main() -> Result<()> {
                 &compta::chemin_table(&app.registry_path),
                 &compta::classer_repertoire(&app.projects, &dir, app.pending_bare),
             );
+            // Constat de départ de la comptabilisation (best-effort).
+            apport::demarrer(&app.registry_path, &app.projects, &dir);
             let kind = kind_pour_repertoire(&dir, &app.opencode_db_path, app.pending_bare);
             app.pending_bare = false;
             run_launch_sequence(kind, &name, &dir, app.pending_sudo)?;
+            // Constat de fin : la session passée est auditée (best-effort).
+            apport::constater_retour(
+                &app.registry_path,
+                &app.opencode_db_path,
+                &app.projects,
+                &dir,
+                false,
+            )
+            .ok();
             return Ok(());
         }
         if app.filtered.len() <= 1 {
@@ -2791,6 +2804,8 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                 &compta::classer_repertoire(&app.projects, &dir, bare),
             );
             app.pending_bare = false;
+            // Constat de départ de la comptabilisation (best-effort).
+            apport::demarrer(&app.registry_path, &app.projects, &dir);
 
             // Suspend TUI menu
             disable_raw_mode()?;
@@ -2821,8 +2836,26 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             // Rescan après toute session, y compris terminée par Ctrl+C (code de
             // sortie non nul) : une compilation a pu avoir lieu. Le message
             // d'échec est posté après, le rescan remplaçant les messages.
-            if let Err(e) = rescan_repertoire(&mut app, &mut Progress::noop()) {
-                app.push_error(format!("Rescan post-session échoué : {e}"));
+            let rescan_err = if let Err(e) = rescan_repertoire(&mut app, &mut Progress::noop()) {
+                Some(format!("Rescan post-session échoué : {e}"))
+            } else {
+                None
+            };
+            // Constat de fin : la session passée est auditée (best-effort).
+            if let Some(resume) = apport::constater_retour(
+                &app.registry_path,
+                &app.opencode_db_path,
+                &app.projects,
+                &dir,
+                bare,
+            )
+            .ok()
+            .flatten()
+              {
+                app.push_info(resume);
+              }
+            if let Some(e) = rescan_err {
+                app.push_error(e);
             }
             if let Some(e) = launch_err {
                 app.push_error(format!("Échec du lancement : {e}"));
