@@ -27,6 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod compta;
 mod keymap;
 mod launch;
 mod lock;
@@ -1853,6 +1854,12 @@ fn main() -> Result<()> {
         if let Some(dir) = app.pending_launch.take() {
             let name = app.pending_name.take()
                 .unwrap_or_else(|| dir.display().to_string());
+            // Comptabilité : la classe de la session est figée au lancement,
+            // le projet est déjà dans `app.projects` (filtre par mot-clé).
+            compta::enregistrer_lancement(
+                &compta::chemin_table(&app.registry_path),
+                &compta::classer_repertoire(&app.projects, &dir, app.pending_bare),
+            );
             let kind = kind_pour_repertoire(&dir, &app.opencode_db_path, app.pending_bare);
             app.pending_bare = false;
             run_launch_sequence(kind, &name, &dir, app.pending_sudo)?;
@@ -2775,6 +2782,16 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             let name = app.pending_name.take()
                 .unwrap_or_else(|| dir.display().to_string());
 
+            // Comptabilité : figer la classe de la session dès maintenant.
+            // `app.projects` est à jour : la création recente sa propre
+            // entrée avant de poser `pending_launch`.
+            let bare = app.pending_bare;
+            compta::enregistrer_lancement(
+                &compta::chemin_table(&app.registry_path),
+                &compta::classer_repertoire(&app.projects, &dir, bare),
+            );
+            app.pending_bare = false;
+
             // Suspend TUI menu
             disable_raw_mode()?;
             execute!(
@@ -2786,8 +2803,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             terminal.backend_mut().flush()?;
 
             // Résumé + lancement d'opencode
-            let kind = kind_pour_repertoire(&dir, &app.opencode_db_path, app.pending_bare);
-            app.pending_bare = false;
+            let kind = kind_pour_repertoire(&dir, &app.opencode_db_path, bare);
             let launch_err = run_launch_sequence(kind, &name, &dir, sudo).err();
 
             // Reprendre le TUI menu
