@@ -1342,14 +1342,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "op-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ratatui",
 ]
 
 [[package]]
 name = "opencode-start-menu"
-version = "0.20.20"
+version = "0.50.1"
 dependencies = [
  "anyhow",
  "chrono",
