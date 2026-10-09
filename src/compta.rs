@@ -290,6 +290,8 @@ mod tests
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
             version_manually_edited: false,
             source_hash: String::new(),
             tarif_mode: "web".to_string(),

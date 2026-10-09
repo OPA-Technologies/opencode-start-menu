@@ -209,6 +209,24 @@ fn default_tarif_mode() -> String {
     "web".to_string()
   }
 
+/// Cliché des métadonnées d'une variante, posé uniquement par un build validé
+/// (popup de détection, rattrapage, reconstruction documentée).
+///
+/// C'est la preuve « vérité du disque » : tant que le binaire n'a pas été
+/// recompilé (mtime égal à `compile_secs`, version compilée égale à `version`),
+/// les métadonnées de la variante ne doivent pas bouger. Une fiche présente et
+/// cohérente immunise le registre contre toute écriture manuelle non marquée ;
+/// une fiche absente laisse la sonde `lire_version_compilee` trancher.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub(crate) struct SnapshotCompile {
+    /// Version compilée du binaire au moment du build validé.
+    pub(crate) version: String,
+    /// Statut affiché par le binaire (`env!("CARGO_PKG_VERSION")`-age du menu).
+    pub(crate) statut: String,
+    /// Vérité du disque : horodatage (epoch secondes) du binaire mis en build.
+    pub(crate) compile_secs: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct Project {
     name: String,
@@ -266,6 +284,12 @@ pub(crate) struct Project {
     // modifications de code sans dépendre du mtime de target/debug.
     #[serde(default)]
     source_hash: String,
+    // Snapshots de build validé par variante (voir SnapshotCompile). Absents
+    // dans les anciens registres : le champ est alors migré par défaut.
+    #[serde(default)]
+    debug_snapshot: Option<SnapshotCompile>,
+    #[serde(default)]
+    release_snapshot: Option<SnapshotCompile>,
     #[serde(default = "default_true")]
     active: bool,
     // --- Valorisation du temps passé ------------------------------------
@@ -526,6 +550,12 @@ pub(crate) struct ProjectEntry {
     /// variante (mtimes de target/debug et target/release). 0 = jamais.
     pub(crate) last_compile_debug_secs: u64,
     pub(crate) last_compile_release_secs: u64,
+    /// Snapshots des métadonnées par variante, posés uniquement par un build
+    /// validé (popup de détection, rattrapage, reconstruction documentée).
+    /// La variante Release ne suit jamais le Debug : sans build release validé
+    /// elle reste « 0.20.24 — Beta-Release », l'unique vérité du disque.
+    pub(crate) debug_snapshot: Option<SnapshotCompile>,
+    pub(crate) release_snapshot: Option<SnapshotCompile>,
     /// Marque si la version a été éditée manuellement dans le menu
     /// (pour éviter le bump AutoPatch au prochain rescan).
     pub(crate) version_manually_edited: bool,
@@ -635,6 +665,8 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 release_modified,
                 last_compile_debug_secs: last_debug_secs,
                 last_compile_release_secs: last_release_secs,
+                debug_snapshot: p.debug_snapshot.clone(),
+                release_snapshot: p.release_snapshot.clone(),
                 version_manually_edited: p.version_manually_edited,
                 source_hash,
                 tarif_mode: p.tarif_mode,
@@ -1721,14 +1753,89 @@ fn ecrire_registry_atomique(path: &Path, registry: &Registry) -> Result<()> {
     Ok(())
 }
 
+// --- Garde « vérité du disque » ------------------------------------------
+//
+// Le registre est un fichier partagé entre versions, et rien ne l'empêche
+// d'être édité à la main. La garde protège les métadonnées (statuts, versions,
+// références de compilation, snapshots) : toute modification non déclarée par
+// [`accepter_modification`] est restaurée à son ancienne valeur à l'écriture,
+// et l'alerte est renvoyée par [`save_registry_full`].
+//
+// Une mutation est légitime quand elle est portée par un chemin documenté du
+// menu (bump AutoPatch, rattrapage de build, édition utilisateur, synchroni-
+// sation du projet menu, restauration de cohérence au chargement). Toute autre
+// mutation — bug ou édition manuelle du fichier — dérive des métadonnées et
+// doit être neutralisée.
+static METADONNEES_ACCEPTEES: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Déclare une modification de métadonnées comme intentionnelle.
+///
+/// La clé suit le format `"<id du projet>:<champ>"` (ex. `"menu:version_debug"`).
+/// Elle est consommée par la prochaine écriture de [`save_registry_full`].
+pub(crate) fn accepter_modification(clef: String) {
+    if let Ok(mut acceptees) = METADONNEES_ACCEPTEES.lock() {
+        acceptees.insert(clef);
+    }
+}
+
+/// Application de la garde à un projet à écrire : compare chaque champ protégé
+/// (statuts, versions, références de compilation, snapshots) à sa valeur
+/// persistée et restaure toute modification non déclarée.
+fn garder_metadonnees(
+    id: &str,
+    ancien: Option<&Project>,
+    nouveau: &mut Project,
+    acceptees: &HashSet<String>,
+    alertes: &mut Vec<String>,
+  )
+  {
+    let Some(ancien) = ancien
+      else
+      {
+        // Projet nouveau (création, résurrection) : la fiche est générée par
+        // le menu, aucune comparaison à une quelconque valeur antérieure.
+        return;
+      };
+    macro_rules! aligner {
+      ($champ:ident) => {
+        if ancien.$champ != nouveau.$champ
+          {
+            let clef = format!("{id}:{}", stringify!($champ));
+            if !acceptees.contains(&clef)
+              {
+                nouveau.$champ = ancien.$champ.clone();
+                alertes.push(format!(
+                  "Métadonnée « {clef} » restaurée (modification non déclarée)"
+                ));
+              }
+          }
+      };
+    }
+    aligner!(status);
+    aligner!(version);
+    aligner!(status_debug);
+    aligner!(version_debug);
+    aligner!(status_release);
+    aligner!(version_release);
+    aligner!(last_compile_debug_secs);
+    aligner!(last_compile_release_secs);
+    aligner!(debug_snapshot);
+    aligner!(release_snapshot);
+  }
+
 /// Variante conservant le cache web global et les préférences lors de
 /// l'écriture du registre.
+///
+/// Retourne la liste des alertes de la garde : toute métadonnée non déclarée
+/// via [`accepter_modification`] a été restaurée à sa valeur persistée et
+/// mérite d'être signalée à l'utilisateur.
 pub(crate) fn save_registry_full(
     path: &Path,
     projects: &[ProjectEntry],
     web: &WebCache,
     prefs: &Preferences,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     ensure_regular(path)?;
     // Un registre illisible est mis de côté avant d'être remplacé.
     let existant_lisible = match fs::read_to_string(path)
@@ -1748,63 +1855,88 @@ pub(crate) fn save_registry_full(
         Err(_) => None,
       };
     let inconnu = existant_lisible
-        .map(|r| r.champs_inconnus)
+        .as_ref()
+        .map(|r| r.champs_inconnus.clone())
         .unwrap_or_default();
+    // « Copie avant » de la garde : l'état persistant de chaque projet sert de
+    // référence, seule une modification déclarée peut s'en écarter.
+    let existants = existant_lisible
+        .map(|r| r.projects)
+        .unwrap_or_default();
+    // Les déclarations sont consommées par cette écriture — mais seulement
+    // celles portant sur un projet réellement écrit ici : une écriture d'un
+    // autre registre (autre test, autre instance) ne doit pas voler une
+    // déclaration d'un projet qui ne lui correspond pas.
+    let ids: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+    let mut restantes: HashSet<String> = HashSet::new();
+    let mut acceptees: HashSet<String> = HashSet::new();
+    {
+      let mut garde = METADONNEES_ACCEPTEES
+          .lock()
+          .unwrap_or_else(|e| e.into_inner());
+      for clef in garde.drain() {
+        let id = clef.split(':').next().unwrap_or("");
+        if ids.contains(id) { acceptees.insert(clef); } else { restantes.insert(clef); }
+      }
+      *garde = restantes;
+    }
+    let mut alertes: Vec<String> = Vec::new();
     let mut map = HashMap::new();
     for p in projects {
-        map.insert(
-            p.id.clone(),
-            Project {
-                name: p.name.clone(),
-                path: p.path.to_string_lossy().to_string(),
-                description: p.description.clone(),
-                status: p.status.clone(),
-                version: p.version.clone(),
-                token: p.token.clone(),
-                used_pct: p.used_pct.clone(),
-                spent: p.spent.clone(),
-                last_model: p.last_model.clone(),
-                total_tokens: p.total_tokens.clone(),
-                total_cost: p.total_cost.clone(),
-                session_count: p.session_count.clone(),
-                last_session_tokens: p.last_session_tokens.clone(),
-                last_session_cost: p.last_session_cost.clone(),
-                last_session_cost_local: p.last_session_cost_local.clone(),
-                last_agent: p.last_agent.clone(),
-                last_time_created: p.last_time_created.clone(),
-                status_debug: p.status_debug.clone(),
-                version_debug: p.version_debug.clone(),
-                status_release: p.status_release.clone(),
-                version_release: p.version_release.clone(),
-                last_compile_debug_secs: p.last_compile_debug_secs,
-                last_compile_release_secs: p.last_compile_release_secs,
-                // Ancien champ : remis à zéro après migration (géré par default).
-                last_compile_secs: 0,
-                version_manually_edited: p.version_manually_edited,
-                source_hash: p.source_hash.clone(),
-                active: true,
-                tarif_mode: p.tarif_mode.clone(),
-                // Dernier rempart contre la corruption du registre : une valeur
-                // non finie y serait sérialisée en `null` et rendrait le fichier
-                // illisible au rechargement, sans le moindre message d'erreur.
-                tarif_manual: if tarif_valide(p.tarif_manual) {
-                    p.tarif_manual
-                } else {
-                    0.0
-                },
-                tarif_web_series: p.tarif_web_series.clone(),
-                tarif_web_fetched_ms: p.tarif_web_fetched_ms,
-                tarif_web_secteur: p.tarif_web_secteur,
-                tarif_web_pays: p.tarif_web_pays.clone(),
-                last_session_context_pct: p.last_session_context_pct.clone(),
-                last_duree: p.last_duree.clone(),
-                total_duree: p.total_duree.clone(),
-                last_valorisation: p.last_valorisation.clone(),
-                total_valorisation: p.total_valorisation.clone(),
-                tarif_resume: p.tarif_resume.clone(),
-                est_bibliotheque: p.est_bibliotheque,
+        let mut projet = Project {
+            name: p.name.clone(),
+            path: p.path.to_string_lossy().to_string(),
+            description: p.description.clone(),
+            status: p.status.clone(),
+            version: p.version.clone(),
+            token: p.token.clone(),
+            used_pct: p.used_pct.clone(),
+            spent: p.spent.clone(),
+            last_model: p.last_model.clone(),
+            total_tokens: p.total_tokens.clone(),
+            total_cost: p.total_cost.clone(),
+            session_count: p.session_count.clone(),
+            last_session_tokens: p.last_session_tokens.clone(),
+            last_session_cost: p.last_session_cost.clone(),
+            last_session_cost_local: p.last_session_cost_local.clone(),
+            last_agent: p.last_agent.clone(),
+            last_time_created: p.last_time_created.clone(),
+            status_debug: p.status_debug.clone(),
+            version_debug: p.version_debug.clone(),
+            status_release: p.status_release.clone(),
+            version_release: p.version_release.clone(),
+            last_compile_debug_secs: p.last_compile_debug_secs,
+            last_compile_release_secs: p.last_compile_release_secs,
+            debug_snapshot: p.debug_snapshot.clone(),
+            release_snapshot: p.release_snapshot.clone(),
+            // Ancien champ : remis à zéro après migration (géré par default).
+            last_compile_secs: 0,
+            version_manually_edited: p.version_manually_edited,
+            source_hash: p.source_hash.clone(),
+            active: true,
+            tarif_mode: p.tarif_mode.clone(),
+            // Dernier rempart contre la corruption du registre : une valeur
+            // non finie y serait sérialisée en `null` et rendrait le fichier
+            // illisible au rechargement, sans le moindre message d'erreur.
+            tarif_manual: if tarif_valide(p.tarif_manual) {
+                p.tarif_manual
+            } else {
+                0.0
             },
-        );
+            tarif_web_series: p.tarif_web_series.clone(),
+            tarif_web_fetched_ms: p.tarif_web_fetched_ms,
+            tarif_web_secteur: p.tarif_web_secteur,
+            tarif_web_pays: p.tarif_web_pays.clone(),
+            last_session_context_pct: p.last_session_context_pct.clone(),
+            last_duree: p.last_duree.clone(),
+            total_duree: p.total_duree.clone(),
+            last_valorisation: p.last_valorisation.clone(),
+            total_valorisation: p.total_valorisation.clone(),
+            tarif_resume: p.tarif_resume.clone(),
+            est_bibliotheque: p.est_bibliotheque,
+        };
+        garder_metadonnees(&p.id, existants.get(&p.id), &mut projet, &acceptees, &mut alertes);
+        map.insert(p.id.clone(), projet);
     }
     let registry = Registry {
         projects: map,
@@ -1818,7 +1950,8 @@ pub(crate) fn save_registry_full(
         // vue `ProjectEntry`, cette reconstruction ne doit pas valoir effacement.
         champs_inconnus: inconnu,
     };
-    ecrire_registry_atomique(path, &registry)
+    ecrire_registry_atomique(path, &registry)?;
+    Ok(alertes)
 }
 
 pub(crate) fn is_excluded(path: &Path) -> bool {
@@ -1897,6 +2030,8 @@ pub(crate) fn reindex_from_disk(
             release_modified,
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
             version_manually_edited: false,
             source_hash: String::new(),
             tarif_mode: default_tarif_mode(),
@@ -2192,9 +2327,10 @@ mod tests
     use crate::registry::tarif_valide;
 
     use super::{
-        default_tarif_mode, default_web_country, load_preferences, load_registry, load_web_cache,
-        montant_local, save_preferences, save_registry_full, Preferences, Result, TarifPoint, Tri,
-        validate_status, validate_version, ProjectEntry, STATUSES, WebCache,
+        accepter_modification, default_tarif_mode, default_web_country, load_preferences,
+        load_registry, load_web_cache, montant_local, save_preferences, save_registry_full,
+        Preferences, Result, SnapshotCompile, TarifPoint, Tri, validate_status, validate_version,
+        ProjectEntry, STATUSES, WebCache,
     };
 
     fn temp_registry(name: &str) -> PathBuf {
@@ -2214,7 +2350,7 @@ mod tests
     fn save_registry(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
         let web = load_web_cache(path);
         let prefs = load_preferences(path);
-        save_registry_full(path, projects, &web, &prefs)
+        save_registry_full(path, projects, &web, &prefs).map(|_| ())
     }
 
     /// Les dossiers de sauvegarde placés sous `src/` ne doivent pas changer
@@ -2453,11 +2589,13 @@ mod tests
                 version_release: String::new(),
                 debug_modified: String::new(),
                 release_modified: String::new(),
-                last_compile_debug_secs: 0,
-                last_compile_release_secs: 0,
-                version_manually_edited: false,
-                source_hash: String::new(),
-                tarif_mode: default_tarif_mode(),
+last_compile_debug_secs: 0,
+            last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
+            version_manually_edited: false,
+            source_hash: String::new(),
+            tarif_mode: default_tarif_mode(),
                 tarif_manual: 0.0,
                 tarif_web_series: Vec::new(),
                 tarif_web_fetched_ms: 0,
@@ -2524,6 +2662,8 @@ mod tests
                     release_modified: String::new(),
 last_compile_debug_secs: 0,
                 last_compile_release_secs: 0,
+                debug_snapshot: None,
+                release_snapshot: None,
                 version_manually_edited: false,
                 source_hash: String::new(),
                 tarif_mode: default_tarif_mode(),
@@ -2577,6 +2717,8 @@ last_compile_debug_secs: 0,
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
             version_manually_edited: false,
             source_hash: String::new(),
             tarif_mode: default_tarif_mode(),
@@ -3285,6 +3427,8 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
             version_manually_edited: false,
             source_hash: String::new(),
             tarif_mode: default_tarif_mode(),
@@ -3558,4 +3702,169 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
         assert_eq!(montant_local(10.0, "XXX", None, None), None);
         assert_eq!(montant_local(10.0, "", None, None), None);
       }
+
+    fn entree(id: &str, version: &str, version_release: &str) -> ProjectEntry {
+        ProjectEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: PathBuf::from(format!("/tmp/{id}")),
+            description: String::new(),
+            status: String::new(),
+            version: version.to_string(),
+            token: String::new(),
+            used_pct: String::new(),
+            spent: String::new(),
+            last_model: String::new(),
+            modified: String::new(),
+            total_tokens: String::new(),
+            total_cost: String::new(),
+            session_count: String::new(),
+            last_session_tokens: String::new(),
+            last_session_cost: String::new(),
+            last_session_cost_local: String::new(),
+            last_agent: String::new(),
+            last_time_created: String::new(),
+            last_session_context_pct: String::new(),
+            status_debug: String::new(),
+            version_debug: version.to_string(),
+            status_release: String::new(),
+            version_release: version_release.to_string(),
+            debug_modified: String::new(),
+            release_modified: String::new(),
+            last_compile_debug_secs: 0,
+            last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
+            version_manually_edited: false,
+            source_hash: String::new(),
+            tarif_mode: default_tarif_mode(),
+            tarif_manual: 0.0,
+            tarif_web_series: Vec::new(),
+            tarif_web_fetched_ms: 0,
+            tarif_web_secteur: false,
+            tarif_web_pays: String::new(),
+            last_duree: String::new(),
+            total_duree: String::new(),
+            last_valorisation: String::new(),
+            total_valorisation: String::new(),
+            tarif_resume: String::new(),
+            est_bibliotheque: false,
+        }
+    }
+
+    /// Une métadonnée modifiée sans être déclarée doit être restaurée à sa
+    /// valeur persistée, avec une alerte — le registre est un fichier partagé
+    /// qu'une version ultérieure (ou une main) ne doit pas dériver.
+    #[test]
+    fn garde_restaure_une_modification_non_declaree()
+      {
+        let dir = temp_registry("garde-revert");
+        let path = dir.join("opencode/projects.json");
+        let e = entree("g1", "1.0.0", "1.0.0");
+        load_registry(&path).unwrap();
+        save_registry_full(&path, std::slice::from_ref(&e), &WebCache::default(), &Preferences::default())
+          .unwrap()
+          .assert_empty_alertes();
+
+        // Reload puis mutation non déclarée (bug ou édition manuelle interne).
+        let mut proj = load_registry(&path).unwrap().remove(0);
+        proj.version_debug = "9.9.9".to_string();
+        proj.version = "9.9.9".to_string();
+        let alertes = save_registry_full(&path, &[proj], &WebCache::default(), &Preferences::default())
+          .unwrap();
+        assert_eq!(alertes.len(), 2, "version_debug et version restaurées : {alertes:?}");
+
+        let relu = load_registry(&path).unwrap();
+        assert_eq!(relu[0].version_debug, "1.0.0", "métadonnée restaurée sur le disque");
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    /// Une mutation déclarée via [`accepter_modification`] doit, elle, survivre.
+    #[test]
+    fn garde_laisse_passer_une_modification_declaree()
+      {
+        let dir = temp_registry("garde-ok");
+        let path = dir.join("opencode/projects.json");
+        let e = entree("g2", "1.0.0", "1.0.0");
+        load_registry(&path).unwrap();
+        save_registry_full(&path, std::slice::from_ref(&e), &WebCache::default(), &Preferences::default())
+          .unwrap()
+          .assert_empty_alertes();
+
+        let mut proj = load_registry(&path).unwrap().remove(0);
+        accepter_modification(format!("{}:version_debug", proj.id));
+        accepter_modification(format!("{}:version", proj.id));
+        proj.version_debug = "8.8.8".to_string();
+        proj.version = "8.8.8".to_string();
+        let alertes = save_registry_full(&path, &[proj], &WebCache::default(), &Preferences::default())
+          .unwrap();
+        assert!(alertes.is_empty(), "aucune restauration attendue : {alertes:?}");
+
+        let relu = load_registry(&path).unwrap();
+        assert_eq!(relu[0].version_debug, "8.8.8", "mutation déclarée persistée");
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    /// Les snapshots de build validé voyagent avec la fiche (`serde`).
+    #[test]
+    fn snapshots_de_build_passent_l_ecriture_et_la_lecture()
+      {
+        let dir = temp_registry("snapshots");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+        let mut e = entree("s1", "0.0.1", "0.0.1");
+        e.debug_snapshot = Some(SnapshotCompile {
+            version: "0.0.1".to_string(),
+            statut: "Release".to_string(),
+            compile_secs: 1_700_000_000,
+        });
+        e.release_snapshot = Some(SnapshotCompile {
+            version: "0.20.24".to_string(),
+            statut: "Beta-Release".to_string(),
+            compile_secs: 1_700_000_100,
+        });
+        save_registry_full(&path, &[e.clone()], &WebCache::default(), &Preferences::default())
+          .unwrap()
+          .assert_empty_alertes();
+
+        let relu = load_registry(&path).unwrap();
+        assert_eq!(relu[0].debug_snapshot, e.debug_snapshot);
+        assert_eq!(relu[0].release_snapshot, e.release_snapshot);
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    /// Un registre écrit avant l'introduction des snapshots migre vers
+    /// « aucune fiche » — la sonde prendra alors le relais au chargement.
+    #[test]
+    fn registre_ancien_sans_snapshots_migre_vers_aucune_fiche()
+      {
+        let dir = temp_registry("snap-vieil");
+        let path = dir.join("opencode/projects.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+          &path,
+          serde_json::json!({
+              "projects": { "v": { "name": "v", "path": "/tmp/v", "description": "",
+                  "version": "1.0.0", "version_debug": "1.0.0" } }
+          })
+          .to_string(),
+        )
+        .unwrap();
+        let relu = load_registry(&path).unwrap();
+        assert_eq!(relu[0].debug_snapshot, None);
+        assert_eq!(relu[0].release_snapshot, None);
+        assert_eq!(relu[0].version_debug, "1.0.0", "champs historiques conservés");
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    /// Alerte dédiée pour les tests : une écriture ne doit rien restaurer.
+    trait AlertesAssert {
+        fn assert_empty_alertes(self) -> Vec<String>;
+    }
+    impl AlertesAssert for Vec<String> {
+        fn assert_empty_alertes(self) -> Vec<String> {
+            assert!(self.is_empty(), "restauration inattendue : {self:?}");
+            self
+        }
+    }
   }

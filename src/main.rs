@@ -23,7 +23,7 @@ use std::{
     cmp::Ordering,
     env,
     fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -746,25 +746,45 @@ fn set_manifest_version(dir: &Path, version: &str) -> Result<bool>
 /// la version du binaire (CARGO_PKG_VERSION). Appelé au démarrage.
 /// Ne synchronise QUE si la version binaire est PLUS RÉCENTE que le registre
 /// (semver), ou si le registre est vide. Ne JAMAIS écraser un bump AutoPatch.
+///
+/// Le statut n'est PAS écrit ici : c'était un artefact (« Beta-Release » codé
+/// en dur) qui falsifiait la variante Release. La variante Debug reflète la
+/// version compilée — c'est la vérité du disque — et rien d'autre.
 fn sync_menu_project_version(app: &mut App) -> Result<()>
   {
     let expected_version = env!("CARGO_PKG_VERSION");
-    let expected_status = "Beta-Release";
     if let Some(p) = app.projects.iter_mut().find(|p| p.name == "OpenCode Start Menu")
       {
         let registry_version = &p.version_debug;
         let should_sync = registry_version.is_empty()
             || version_greater(expected_version, registry_version);
         if should_sync {
+            registry::accepter_modification(format!("{}:version_debug", p.id));
+            registry::accepter_modification(format!("{}:version", p.id));
             p.version_debug = expected_version.to_string();
-            p.status_debug = expected_status.to_string();
             p.version = p.version_debug.clone();
-            p.status = p.status_debug.clone();
+            // Référence de compilation du menu : le mtime de target/debug, et
+            // le snapshot correspondant — le binaire courant fait foi.
+            if let Some(t) = registry::variant_modified_time(&p.path, "debug")
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
+            {
+                registry::accepter_modification(format!("{}:last_compile_debug_secs", p.id));
+                registry::accepter_modification(format!("{}:debug_snapshot", p.id));
+                p.last_compile_debug_secs = t;
+                p.debug_snapshot = Some(registry::SnapshotCompile {
+                    version: expected_version.to_string(),
+                    statut: p.status_debug.clone(),
+                    compile_secs: t,
+                });
+            }
             // Sync auto vers CARGO_PKG_VERSION ≠ édition manuelle utilisateur
             // Ne PAS toucher à version_manually_edited ici.
             let _ = set_manifest_version(&p.path, &p.version_debug);
             // Persister la mise à jour dans le registre.
-            registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
+            let alertes = registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
+            if !alertes.is_empty() {
+                app.push_info(alertes.join("  ·  "));
+            }
         }
       }
     Ok(())
@@ -789,6 +809,88 @@ fn version_greater(a: &str, b: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Garde « vérité du disque » au chargement.
+///
+/// Détecte les métadonnées qui se sont écartées d'une vérité connue pendant
+/// que le menu ne tournait pas — typiquement une édition manuelle du registre
+/// (la cause du faux « Release 0.50.1 »). Les valeurs sont restaurées et
+/// déclarées à la garde, qui les re-persistera sans les neutraliser.
+///
+/// Variante Release : aucun chemin légitime ne l'écrit sans reconstruction.
+/// Dès qu'une vérité est connue — snapshot cohérent avec le binaire, ou, à
+/// défaut de fiche, la version réellement compilée (`lire_version_compilee`) —
+/// une valeur divergente est rendue.
+///
+/// Variante Debug : la seule incohérence sûre est une version relancée PLUS
+/// ANCIENNE que le dernier build constaté. Une version plus récente est un
+/// bump légitime non encore reconstruit, jamais restaurée ici.
+///
+/// Renvoie (nombre de restaurations, alertes à afficher).
+fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
+    let mut restaurees = 0usize;
+    let mut alertes: Vec<String> = Vec::new();
+    for p in app.projects.iter_mut() {
+        let id = p.id.clone();
+        let t_release = registry::variant_modified_time(&p.path, "release")
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
+        // Clone : éviter d'emprunter `p` (via le snapshot) en réécrivant `p`.
+        let snap_release = p.release_snapshot.clone();
+        if let Some(snap) = snap_release {
+            // Le binaire présent EST celui du snapshot : la fiche fait foi.
+            if t_release == Some(snap.compile_secs) {
+                if p.version_release != snap.version {
+                    registry::accepter_modification(format!("{id}:version_release"));
+                    p.version_release = snap.version.clone();
+                    restaurees += 1;
+                    alertes.push(format!(
+                      "{id} : version Release restaurée (vérité du dernier build)."
+                    ));
+                }
+                if p.status_release != snap.statut {
+                    registry::accepter_modification(format!("{id}:status_release"));
+                    p.status_release = snap.statut.clone();
+                    restaurees += 1;
+                    alertes.push(format!(
+                      "{id} : statut Release restauré (vérité du dernier build)."
+                    ));
+                }
+            }
+            // binaire plus récent que la fiche : le rattrapage du rescan fera
+            // foi, on ne force rien ici.
+        } else if let Some(v) = lire_version_compilee(&p.path, "release") {
+            // Pas de fiche : le binaire est le seul témoin fiable (sonde).
+            if p.version_release != v {
+                registry::accepter_modification(format!("{id}:version_release"));
+                p.version_release = v;
+                restaurees += 1;
+                alertes.push(format!(
+                  "{id} : version Release restaurée (valeur compilée du binaire)."
+                ));
+            }
+        }
+        // Variante Debug : ne restaurer jamais une version bumpée en avant.
+        let snap_debug = p.debug_snapshot.clone();
+        if let Some(snap) = snap_debug
+            && let Some(t_debug) = registry::variant_modified_time(&p.path, "debug")
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
+            && t_debug == snap.compile_secs
+            && registry::validate_version(&p.version_debug)
+            && registry::validate_version(&snap.version)
+            && version_greater(&snap.version, &p.version_debug)
+        {
+            registry::accepter_modification(format!("{id}:version_debug"));
+            registry::accepter_modification(format!("{id}:version"));
+            p.version_debug = snap.version.clone();
+            p.version = snap.version.clone();
+            restaurees += 1;
+            alertes.push(format!(
+              "{id} : version Debug restaurée (plus ancienne que le dernier build)."
+            ));
+        }
+    }
+    (restaurees, alertes)
 }
 
 pub(crate) const MAX_MESSAGE_LINES: usize = 6;
@@ -844,6 +946,23 @@ impl App {
         // Les entrées vivant sous la racine des bibliothèques sont des
         // bibliothèques de droit, même si la mention n'a jamais été écrite.
         registry::deriver_bibliotheques(&mut app.projects, &app.prefs.lib_root_resolu());
+        // Garde « vérité du disque » au chargement : des métadonnées écartées
+        // d'une vérité connue (édition manuelle) sont restaurées et persistées.
+        let (restaurees, alertes_meta) = valider_metadonnees_chargement(&mut app);
+        if !alertes_meta.is_empty() {
+            app.push_error(alertes_meta.join("  ·  "));
+        }
+        if restaurees > 0 {
+            match registry::save_registry_full(
+              &app.registry_path,
+              &app.projects,
+              &app.web_cache,
+              &app.prefs,
+            ) {
+                Ok(_) => {}
+                Err(e) => app.push_error(format!("Métadonnées restaurées mais registre non écrit : {e}")),
+            }
+        }
         // Auto-sync projet menu : aligner version_debug sur CARGO_PKG_VERSION.
         progress.begin(Step::SyncVersion);
         let _ = sync_menu_project_version(&mut app);
@@ -1111,12 +1230,15 @@ impl App {
     /// au prochain démarrage, le disque disant « plus rien ici » : le rescan
     /// effacerait alors l'entrée.
     fn sauver_et_refiltrer(&mut self) -> Result<()> {
-        registry::save_registry_full(
+        let alertes = registry::save_registry_full(
             &self.registry_path,
             &self.projects,
             &self.web_cache,
             &self.prefs,
         )?;
+        if !alertes.is_empty() {
+            self.push_info(alertes.join("  ·  "));
+        }
         refresh_project_selection(self);
         Ok(())
     }
@@ -1185,6 +1307,95 @@ fn binary_freshness_note(projet: &Path) -> Option<String>
       heure(sources)?
     ))
   }
+
+/// Nom du binaire compilé d'un projet Rust, déduit de son manifeste.
+///
+/// Cargo nomme le binaire d'après le premier `[[bin]] name`, sinon le nom de
+/// package — c'est ce que produit `cargo build` par défaut depuis `main.rs`.
+fn nom_binaire(dir: &Path) -> Option<String> {
+    let cargo = fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let mut dans_package = false;
+    let mut dans_bin = false;
+    let mut package_name: Option<String> = None;
+    for ligne in cargo.lines() {
+        let t = ligne.trim();
+        if t.starts_with('[') {
+            let section = t.trim_start_matches('[').trim_end_matches(']').trim();
+            dans_package = section == "package";
+            dans_bin = section == "bin";
+            if !dans_bin {
+                package_name = None;
+            }
+            continue;
+        }
+        if let Some(apres_egal) = t.split_once('=') {
+            let cle = apres_egal.0.trim();
+            if cle == "name" {
+                let v = apres_egal.1.trim().trim_matches('"').to_string();
+                if dans_bin {
+                    return Some(v);
+                }
+                if dans_package {
+                    package_name = Some(v);
+                }
+            }
+        }
+    }
+    package_name
+}
+
+/// Première version semver (`x.y.z`) trouvée dans un texte.
+fn premiere_version_semver(texte: &str) -> Option<String> {
+    for token in texte.split_whitespace() {
+        let t = token
+            .trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        let parts: Vec<&str> = t.split('.').collect();
+        if parts.len() == 3
+            && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// Version compilée d'un binaire, lue en l'interrogeant elle-même (`-V`).
+///
+/// Sonde « vérité du disque » : on ne se fie jamais à la version du registre
+/// pour savoir ce qu'un binaire sait réellement faire. Renvoie `None` si le
+/// binaire n'existe pas, ne répond pas avant 2 s, échoue, ou ne publie aucune
+/// version semver lisible. Ne pas confondre avec `-V` du projet menu, qui
+/// n'exécute rien : ici un vrai binaire est lancé.
+fn lire_version_compilee(dir: &Path, profil: &str) -> Option<String> {
+    let binaire = dir.join("target").join(profil).join(nom_binaire(dir)?);
+    if !binaire.is_file() {
+        return None;
+    }
+    let mut enfant = std::process::Command::new(&binaire)
+        .arg("-V")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let echeance = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(statut) = enfant.try_wait().ok()? {
+            if !statut.success() {
+                return None;
+            }
+            break;
+        }
+        if std::time::Instant::now() >= echeance {
+            let _ = enfant.kill();
+            let _ = enfant.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut sortie = String::new();
+    enfant.stdout.take()?.read_to_string(&mut sortie).ok()?;
+    premiere_version_semver(&sortie)
+}
 
 fn print_help() {
     println!("Usage : op [mot-clé|id|nom]");
@@ -1851,17 +2062,14 @@ fn main() -> Result<()> {
                 }
             }
         } else {
-            // Version du menu lui-même (depuis le registre si possible).
-            if let Some(p) = app.projects.iter().find(|p| p.name == "OpenCode Start Menu") {
-                println!("{}_{}", sanitize(&p.version_debug), sanitize(&p.status_debug).replace(['-', ' '], "_"));
-                // La version affichée ne change qu'à la compilation : sans cette
-                // ligne, un binaire vieux de plusieurs commits affiche encore
-                // l'ancienne version, sans aucun signe visible du décalage.
-                if let Some(note) = binary_freshness_note(&p.path) {
-                    println!("{note}");
-                }
-            } else {
-                println!("{}", env!("CARGO_PKG_VERSION"));
+            // Version du menu lui-même : la vérité compilée du binaire en
+            // cours, pas une valeur du registre (qui ne change qu'à la
+            // compilation — d'où la note de fraîcheur qui l'accompagne).
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            if let Some(p) = app.projects.iter().find(|p| p.name == "OpenCode Start Menu")
+                && let Some(note) = binary_freshness_note(&p.path)
+            {
+                println!("{note}");
             }
         }
         return Ok(());
@@ -2087,7 +2295,16 @@ fn confirmer_bump(app: &mut App)
             );
             match sauve
               {
-                Ok(()) => app.push_info(format!("{nom} : {avant} → {apres}")),
+                Ok(alertes) =>
+                  {
+                    let mut msg = format!("{nom} : {avant} → {apres}");
+                    if !alertes.is_empty()
+                      {
+                        msg.push_str("  ·  ");
+                        msg.push_str(&alertes.join("  ·  "));
+                      }
+                    app.push_info(msg);
+                  }
                 Err(e) => app.push_error(format!(
                   "{nom} : {avant} → {apres}, mais registre non écrit ({e})"
                 )),
@@ -2115,6 +2332,9 @@ fn bump_projet(p: &mut ProjectEntry) -> Result<(String, String)>
         p.version_debug.clone()
       };
     let nouvelle = bump_patch(&p.version_debug).unwrap_or_else(|| "0.0.1".to_string());
+    // Geste utilisateur explicite (touche `b`) : mutation déclarée à la garde.
+    registry::accepter_modification(format!("{}:version_debug", p.id));
+    registry::accepter_modification(format!("{}:version", p.id));
     p.version_debug = nouvelle.clone();
     p.version = nouvelle.clone();
     // Un édition manuelle suspendait les bumps automatiques : le geste
@@ -3012,11 +3232,15 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
               }
             if let Some(v) = new_version
               {
+                // Le manifeste fait foi : la version relue du disque est une
+                // mutation « vérité du disque », déclarée à la garde.
+                registry::accepter_modification(format!("{}:version", entry.id));
                 entry.version = v.clone();
                 // La variante Debug n'est resynchronisée que si elle est vide,
                 // pour ne pas écraser une version éditée manuellement.
                 if entry.version_debug.is_empty()
                   {
+                    registry::accepter_modification(format!("{}:version_debug", entry.id));
                     entry.version_debug = v;
                   }
               }
@@ -3167,11 +3391,24 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
             // Modification de code détectée
             let baseline = entry.source_hash.is_empty();
             entry.source_hash = current_hash.clone();
-            // Mettre à jour la référence mtime pour cohérence
+            // Constat documenté : une nouvelle compilation est détectée sur le
+            // disque, la référence de compilation et le snapshot Debug suivent
+            // le binaire (sa vérité). Le snapshot fige la version DEJA en
+            // vigueur à cet instant — si le code redemande un bump ci-dessous,
+            // elle reflète le dernier état réellement construit.
             let t_debug = registry::variant_modified_time(&entry.path, "debug")
               .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
             if let Some(t) = t_debug {
+                registry::accepter_modification(format!("{}:last_compile_debug_secs", entry.id));
+                registry::accepter_modification(format!("{}:debug_snapshot", entry.id));
                 entry.last_compile_debug_secs = t;
+                let version_snapshot =
+                    if entry.version_debug.is_empty() { entry.version.clone() } else { entry.version_debug.clone() };
+                entry.debug_snapshot = Some(registry::SnapshotCompile {
+                    version: version_snapshot,
+                    statut: entry.status_debug.clone(),
+                    compile_secs: t,
+                });
             }
             written = true;
 
@@ -3194,6 +3431,9 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                         } else {
                             entry.version_debug.clone()
                         };
+                        // Bump AutoPatch : mutation déclarée à la garde.
+                        registry::accepter_modification(format!("{}:version_debug", entry.id));
+                        registry::accepter_modification(format!("{}:version", entry.id));
                         entry.version_debug = v.clone();
                         // La Release n'est PAS bumpée ici : son binaire n'a pas
                         // été reconstruit, elle reste à sa version antérieure.
@@ -3215,28 +3455,52 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
         }
 
         // Release rattrapage : si target/release reconstruit
-        let t_release = registry::variant_modified_time(&entry.path, "release")
-          .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
+        let t_release_syst = registry::variant_modified_time(&entry.path, "release");
+        let t_release = t_release_syst.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
         if let Some(t) = t_release
           && t > entry.last_compile_release_secs
         {
-            entry.last_compile_release_secs = t;
-            // Rattrapage : la Release reconstruite reprend la version et le
-            // statut du code courant (variante Debug élue / manifeste).
-            let v = if entry.version_debug.is_empty()
-              {
-                entry.version.clone()
-              }
-            else
-              {
-                entry.version_debug.clone()
-              };
-            if !v.is_empty()
-              {
-                entry.version_release = v;
-                entry.status_release = entry.status_debug.clone();
-              }
-            written = true;
+            // Exiger un binaire au moins aussi récent que les sources : un
+            // binaire Release retombé sur un code plus vieux (checkout,
+            // récupération) ne doit pas être pris pour une reconstruction.
+            // Sinon : alerte, aucune écriture — la fiche reste l'ancienne.
+            let sources = registry::source_modified_time(&entry.path);
+            let binaire_apres_sources = sources.is_none_or(|s| t_release_syst.is_some_and(|b| b >= s));
+            if binaire_apres_sources {
+                // Constat documenté d'un build release validé : la référence,
+                // les métadonnées de la variante et son snapshot suivent.
+                registry::accepter_modification(format!("{}:last_compile_release_secs", entry.id));
+                registry::accepter_modification(format!("{}:version_release", entry.id));
+                registry::accepter_modification(format!("{}:status_release", entry.id));
+                registry::accepter_modification(format!("{}:release_snapshot", entry.id));
+                entry.last_compile_release_secs = t;
+                // Rattrapage : la Release reconstruite reprend la version et le
+                // statut du code courant (variante Debug élue / manifeste).
+                let v = if entry.version_debug.is_empty()
+                  {
+                    entry.version.clone()
+                  }
+                else
+                  {
+                    entry.version_debug.clone()
+                  };
+                if !v.is_empty()
+                  {
+                    entry.version_release = v.clone();
+                    entry.status_release = entry.status_debug.clone();
+                    entry.release_snapshot = Some(registry::SnapshotCompile {
+                        version: v,
+                        statut: entry.status_debug.clone(),
+                        compile_secs: t,
+                    });
+                  }
+                written = true;
+            } else {
+                alertes.push(format!(
+                  "{} : binaire Release plus ancien que les sources, rattrapage ignoré",
+                  entry.name
+                ));
+            }
           }
         t_autopatch += debut.elapsed();
         if signature_persistee(entry) != avant
@@ -3261,7 +3525,8 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
     if added > 0 || changed > 0 || written
       {
         progress.begin(Step::RescanSave);
-        registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
+        let alertes_garde = registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
+        alertes.extend(alertes_garde);
         let mut parts: Vec<String> = Vec::new();
         if !bumps.is_empty()
           {
@@ -3840,6 +4105,8 @@ fn handle_creation_input(
                         release_modified: "jamais compilée".to_string(),
                         last_compile_debug_secs: 0,
                         last_compile_release_secs: 0,
+                        debug_snapshot: None,
+                        release_snapshot: None,
                         version_manually_edited: false,
                         source_hash: String::new(),
                         tarif_mode: "web".to_string(),
@@ -3855,6 +4122,22 @@ fn handle_creation_input(
                         tarif_resume: String::new(),
                         est_bibliotheque: state.bibliotheque,
                     });
+                    // Création de projet : la fiche naît du menu, toutes ses
+                    // métadonnées sont déclarées d'emblée à la garde.
+                    for champ in [
+                      "status",
+                      "version",
+                      "status_debug",
+                      "version_debug",
+                      "status_release",
+                      "version_release",
+                      "last_compile_debug_secs",
+                      "last_compile_release_secs",
+                      "debug_snapshot",
+                      "release_snapshot",
+                    ] {
+                      registry::accepter_modification(format!("{}:{champ}", state.id));
+                    }
                     registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
                     finalize_project_list(app);
 
@@ -4035,6 +4318,11 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     if !(version_ok && statut_ok && desc_ok) {
         return false;
     }
+    // Édition utilisateur explicite (popup nouveau) : mutation déclarée.
+    registry::accepter_modification(format!("{}:version_debug", p.id));
+    registry::accepter_modification(format!("{}:status_debug", p.id));
+    registry::accepter_modification(format!("{}:version", p.id));
+    registry::accepter_modification(format!("{}:status", p.id));
     p.version_debug = state.pending_version.clone();
     p.status_debug = state.pending_status.clone();
     p.description = state.pending_description.clone();
@@ -4494,10 +4782,14 @@ fn handle_edit_input(
                   }
                 else if apply_edit(app, state)
                   {
-                    registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
-                    app.push_info(
-                      "Projet mis à jour : variante Debug enregistrée".to_string(),
-                    );
+                    let alertes = registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
+                    let mut msg = "Projet mis à jour : variante Debug enregistrée".to_string();
+                    if !alertes.is_empty()
+                      {
+                        msg.push_str("  ·  ");
+                        msg.push_str(&alertes.join("  ·  "));
+                      }
+                    app.push_info(msg);
                     return Ok(InputMode::Normal);
                   }
                 else
@@ -4781,6 +5073,8 @@ mod tests
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            debug_snapshot: None,
+            release_snapshot: None,
             version_manually_edited: false,
             source_hash: String::new(),
             tarif_mode: "web".to_string(),
@@ -6367,6 +6661,8 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
                 release_modified: String::new(),
                 last_compile_debug_secs: 0,
                 last_compile_release_secs: 0,
+                debug_snapshot: None,
+                release_snapshot: None,
                 version_manually_edited: false,
                 source_hash: String::new(),
                 tarif_mode: "manuel".to_string(),
@@ -6387,6 +6683,173 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
             "les archives ne doivent pas peser dans le décompte"
         );
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Un « binaire » simulé sous `target/<profil>`, dont le mtime fait foi.
+    fn binaire_simule(profil: &str, projet: &Path) -> PathBuf {
+        let bin = projet
+            .join("target")
+            .join(profil)
+            .join("opencode-start-menu");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, "binaire simulé").unwrap();
+        bin
+    }
+
+    /// Fixe l'horodatage de modification d'un fichier au temps voulu.
+    fn horodater(p: &Path, t: std::time::SystemTime) {
+        use std::fs::FileTimes;
+        fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(t))
+            .unwrap();
+    }
+
+    /// Registre d'un projet dont la fiche Release est volontairement décalée
+    /// d'une snapshot de build validé : la garde de chargement doit la rétablir.
+    fn registre_release_derivee(dir: &Path, projet: &Path) -> PathBuf {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "version": "1.0.0",
+                    "version_debug": "1.0.0",
+                    "version_release": "9.9.9",
+                    "status_release": "Release",
+                    "description": "",
+                    "tarif_mode": "manuel",
+                    "release_snapshot": {
+                        "version": "0.20.24",
+                        "statut": "Beta-Release",
+                        "compile_secs": 1700000000
+                    }
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        binaire_simule("release", projet);
+        horodater(
+            &projet.join("target/release/opencode-start-menu"),
+            t,
+        );
+        registre
+    }
+
+    /// La fiche Release dérive de sa propre snapshot validée mais le binaire
+    /// est intact : au chargement, la vérité du dernier build reprend le dessus.
+    #[test]
+    fn le_chargement_restaure_la_release_sur_la_verite_du_binaire() {
+        let dir = temp_dir("verite-release");
+        let projet = projet_a_bumper(&dir);
+        let registre = registre_release_derivee(&dir, &projet);
+        let mut app = crate::App::new_light(registre, SortOrder::Modified);
+
+        let (restaurees, alertes) = crate::valider_metadonnees_chargement(&mut app);
+
+        assert_eq!(app.projects[0].version_release, "0.20.24");
+        assert_eq!(app.projects[0].status_release, "Beta-Release");
+        assert_eq!(restaurees, 2, "{alertes:?}");
+        assert!(alertes.iter().any(|a| a.contains("Release")), "{alertes:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Un binaire plus récent que la fiche laisse la Release au rattrapage du
+    /// rescan : la garde ne force rien à son insu.
+    #[test]
+    fn le_chargement_ne_restaure_pas_une_release_au_binaire_present() {
+        let dir = temp_dir("verite-release-nouveau");
+        let projet = projet_a_bumper(&dir);
+        let registre = registre_release_derivee(&dir, &projet);
+        // Un second fichier, plus récent que la snapshot : le binaire simulé a
+        // changé sur le disque, la fiche n'a plus autorité.
+        let autre = projet.join("target/release/contenu-nouveau");
+        fs::write(&autre, "fraîchement écrit").unwrap();
+        let mut app = crate::App::new_light(registre, SortOrder::Modified);
+
+        let (restaurees, _) = crate::valider_metadonnees_chargement(&mut app);
+
+        assert_eq!(restaurees, 0, "aucune restauration malgré la fiche divergente");
+        assert_eq!(app.projects[0].version_release, "9.9.9", "le rattrapage tranchera");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// La variante Debug ne suit jamais un bump posé en avant de la dernière
+    /// vérité : une version plus jeune que le dernier build n'est pas rétablie.
+    #[test]
+    fn le_chargement_ne_rebute_pas_un_bump_debug_en_avant() {
+        let dir = temp_dir("verite-debug-avant");
+        let projet = projet_a_bumper(&dir);
+        let bin = binaire_simule("debug", &projet);
+        horodater(&bin, std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "version": "2.0.0",
+                    "version_debug": "2.0.0",
+                    "description": "",
+                    "tarif_mode": "manuel",
+                    "debug_snapshot": {
+                        "version": "1.0.0",
+                        "statut": "Debug",
+                        "compile_secs": 1700000000
+                    }
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = crate::App::new_light(registre, SortOrder::Modified);
+
+        let (restaurees, _) = crate::valider_metadonnees_chargement(&mut app);
+
+        assert_eq!(restaurees, 0, "la 2.0.0 (bump en avant) a raison sur la fiche");
+        assert_eq!(app.projects[0].version_debug, "2.0.0");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// L'inverse : une version Debug retombée derrière le dernier build validé
+    /// (fiche éditable à la main) est relevée à la vérité du disque.
+    #[test]
+    fn le_chargement_releve_une_version_debug_retombee_derriere() {
+        let dir = temp_dir("verite-debug-arriere");
+        let projet = projet_a_bumper(&dir);
+        let bin = binaire_simule("debug", &projet);
+        horodater(&bin, std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "version": "0.9.0",
+                    "version_debug": "0.9.0",
+                    "description": "",
+                    "tarif_mode": "manuel",
+                    "debug_snapshot": {
+                        "version": "1.0.0",
+                        "statut": "Debug",
+                        "compile_secs": 1700000000
+                    }
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = crate::App::new_light(registre, SortOrder::Modified);
+
+        let (restaurees, alertes) = crate::valider_metadonnees_chargement(&mut app);
+
+        assert_eq!(app.projects[0].version_debug, "1.0.0");
+        assert_eq!(app.projects[0].version, "1.0.0");
+        assert_eq!(restaurees, 1, "{alertes:?}");
+        assert!(alertes.iter().any(|a| a.contains("Debug")), "{alertes:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
