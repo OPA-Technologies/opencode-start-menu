@@ -59,7 +59,15 @@ pub(crate) fn contextuel(mode: &InputMode) -> Vec<Raccourci> {
             raccourci("m", "Module"),
             raccourci("n", "Nouveau"),
             raccourci("r", "Rafraîchir"),
+            raccourci("c", "Cohérence"),
             raccourci("F1", "Aide"),
+        ],
+        // La modale se parcourt comme la liste ; Entrée applique, `x` refuse.
+        InputMode::Coherence(_) => vec![
+            raccourci("↑/↓", "Naviguer"),
+            raccourci("Entrée", "Appliquer"),
+            raccourci("x", "Refuser"),
+            raccourci("Échap", "Fermer"),
         ],
         InputMode::ChoixNouveau { .. } => vec![
             raccourci("↑/↓", "Projet / Bibliothèque"),
@@ -186,6 +194,7 @@ pub(crate) fn complet() -> Vec<(Cow<'static, str>, Vec<Raccourci>)> {
                 raccourci("b", "Bumper la version"),
                 raccourci("a", "Archiver le projet"),
                 raccourci("A", "Vue des archives (a y restaure)"),
+                raccourci("c", "Contrôler la cohérence"),
                 raccourci("n", "Nouveau (projet / bibliothèque)"),
                 raccourci("r", "Rafraîchir les données"),
                 raccourci("q ou Échap", "Quitter"),
@@ -247,6 +256,15 @@ pub(crate) fn complet() -> Vec<(Cow<'static, str>, Vec<Raccourci>)> {
                 raccourci("Entrée ou Espace", "Basculer l'option"),
                 raccourci("Tab/⇧Tab", "Onglet suivant/précédent"),
                 raccourci("Échap", "Fermer ou annuler la saisie"),
+            ],
+        ),
+        (
+            Cow::Borrowed("Cohérence"),
+            vec![
+                raccourci("↑/↓ ou j/k", "Naviguer parmi les écarts"),
+                raccourci("Entrée", "Appliquer l'action proposée"),
+                raccourci("x ou r", "Refuser l'action (conservé)"),
+                raccourci("q ou Échap", "Fermer"),
             ],
         ),
         (

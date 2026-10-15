@@ -23,12 +23,14 @@ use std::{
     cmp::Ordering,
     env,
     fs,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
 mod apport;
+mod coherence;
 mod compta;
+mod conformite;
 mod constat;
 mod keymap;
 mod launch;
@@ -38,10 +40,20 @@ mod perms;
 mod registry;
 mod startup;
 mod ui;
+mod variante;
 
 use crate::launch::{run_launch_sequence, session_existante, LaunchKind};
 use crate::registry::ProjectEntry;
 use crate::startup::{Progress, Step};
+
+/// Contrat `-V` du menu lui-même. Op est un projet comme un autre : son binaire
+/// publie sa propre vérité, figée à la compilation (`<version>_<statut>
+/// (<jj-mm-yyyy>)`), lue depuis ces trois constantes — jamais déduite du
+/// registre. `RELEASE` suit `CARGO_PKG_VERSION` ; `STATUT` et `DATE_LAST_MAJ`
+/// se tiennent comme ceux de tout projet.
+const RELEASE: &str = env!("CARGO_PKG_VERSION");
+const STATUT: &str = "Release";
+const DATE_LAST_MAJ: &str = "15-10-2026";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -133,6 +145,18 @@ pub(crate) struct App {
     /// Registre présent mais illisible : aucune réindexation ni réécriture
     /// automatique tant qu'il n'est pas réparé.
     registry_broken: bool,
+    /// Refus de cohérence par projet (id → refus), pour re-notification.
+    pub(crate) refus: std::collections::HashMap<String, Vec<registry::RefusCoherence>>,
+    /// Diagnostics de cohérence courants, recalculés à chaque contrôle
+    /// (lancement et retour au menu).
+    pub(crate) diagnostics: Vec<DiagnosticProjet>,
+}
+
+/// Diagnostic de cohérence d'un projet, accompagné de son identité.
+pub(crate) struct DiagnosticProjet {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) diagnostic: coherence::Diagnostic,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -323,6 +347,9 @@ pub(crate) enum InputMode {
     /// Une seule touche y mène depuis la liste : `p`, sur Paramètres, et
     /// `Tab`/`⇧Tab` desservent les trois onglets.
     Popup(Popup),
+    /// Examen des incohérences détectées : proposer une action par écart,
+    /// laisser l'utilisateur l'appliquer ou la refuser.
+    Coherence(CoherenceState),
     /// Aide contextuelle (F1) ou liste complète (F10).
     ///
     Aide {
@@ -336,6 +363,18 @@ pub(crate) enum InputMode {
         /// écran : sans défilement, la fin de la liste serait inaccessible.
         scroll: usize,
     },
+}
+
+/// État de la modale d'examen des incohérences.
+///
+/// La liste affichée est plate : chaque ligne est un écart d'un projet. Les
+/// refus déjà enregistrés restent visibles, marqués, pour être re-notifiés.
+#[derive(Clone, Default)]
+pub(crate) struct CoherenceState {
+    /// Index de la ligne (écart) sélectionnée dans la liste plate.
+    pub(crate) selection: usize,
+    /// Une action Release attend sa confirmation dédiée : index de la ligne.
+    pub(crate) confirmation_release: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -771,10 +810,22 @@ fn sync_menu_project_version(app: &mut App) -> Result<()>
                 registry::accepter_modification(format!("{}:last_compile_debug_secs", p.id));
                 registry::accepter_modification(format!("{}:debug_snapshot", p.id));
                 p.last_compile_debug_secs = t;
+                // La date et l'empreinte viennent du binaire lui-même ; à
+                // défaut de sonde, les constantes compilées du menu font foi.
+                let (date, empreinte_v) = match variante::lire_variante(&p.path, "debug")
+                  {
+                    Some(l) => (l.etat.date, l.empreinte),
+                    None => (
+                        DATE_LAST_MAJ.to_string(),
+                        variante::empreinte_v(&format!("{RELEASE}_{STATUT} ({DATE_LAST_MAJ})")),
+                    ),
+                  };
                 p.debug_snapshot = Some(registry::SnapshotCompile {
                     version: expected_version.to_string(),
                     statut: p.status_debug.clone(),
+                    date,
                     compile_secs: t,
+                    empreinte_v,
                 });
             }
             // Sync auto vers CARGO_PKG_VERSION ≠ édition manuelle utilisateur
@@ -820,12 +871,16 @@ fn version_greater(a: &str, b: &str) -> bool {
 ///
 /// Variante Release : aucun chemin légitime ne l'écrit sans reconstruction.
 /// Dès qu'une vérité est connue — snapshot cohérent avec le binaire, ou, à
-/// défaut de fiche, la version réellement compilée (`lire_version_compilee`) —
+/// défaut de fiche, la version réellement compilée (`variante::lire_etat_variante`) —
 /// une valeur divergente est rendue.
 ///
 /// Variante Debug : la seule incohérence sûre est une version relancée PLUS
 /// ANCIENNE que le dernier build constaté. Une version plus récente est un
 /// bump légitime non encore reconstruit, jamais restaurée ici.
+///
+/// Migration : une fiche antérieure à l'introduction de `date`/`empreinte_v`
+/// est complétée depuis la sonde du binaire témoin (mtime cohérent), sans
+/// jamais toucher version ni statut.
 ///
 /// Renvoie (nombre de restaurations, alertes à afficher).
 fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
@@ -833,7 +888,10 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
     let mut alertes: Vec<String> = Vec::new();
     for p in app.projects.iter_mut() {
         let id = p.id.clone();
-        let t_release = registry::variant_modified_time(&p.path, "release")
+        let chemin = p.path.clone();
+        let t_release = registry::variant_modified_time(&chemin, "release")
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
+        let t_debug = registry::variant_modified_time(&chemin, "debug")
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
         // Clone : éviter d'emprunter `p` (via le snapshot) en réécrivant `p`.
         let snap_release = p.release_snapshot.clone();
@@ -856,10 +914,26 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
                       "{id} : statut Release restauré (vérité du dernier build)."
                     ));
                 }
+                // Migration : fiche antérieure à l'introduction de `date` et
+                // `empreinte_v`. Le binaire témoin est présent (mtime cohérent) :
+                // sa sonde `-V` complète la fiche, sans toucher version ni
+                // statut — la Release reste immuable hors reconstruction.
+                if snap.empreinte_v.is_empty()
+                    && let Some(l) = variante::lire_variante(&chemin, "release")
+                    && let Some(fiche) = p.release_snapshot.as_mut()
+                {
+                    registry::accepter_modification(format!("{id}:release_snapshot"));
+                    fiche.date = l.etat.date;
+                    fiche.empreinte_v = l.empreinte;
+                    restaurees += 1;
+                    alertes.push(format!(
+                      "{id} : fiche Release complétée (date et empreinte)."
+                    ));
+                }
             }
             // binaire plus récent que la fiche : le rattrapage du rescan fera
             // foi, on ne force rien ici.
-        } else if let Some(v) = lire_version_compilee(&p.path, "release") {
+        } else if let Some(v) = variante::lire_etat_variante(&chemin, "release").map(|e| e.version) {
             // Pas de fiche : le binaire est le seul témoin fiable (sonde).
             if p.version_release != v {
                 registry::accepter_modification(format!("{id}:version_release"));
@@ -872,22 +946,35 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
         }
         // Variante Debug : ne restaurer jamais une version bumpée en avant.
         let snap_debug = p.debug_snapshot.clone();
-        if let Some(snap) = snap_debug
-            && let Some(t_debug) = registry::variant_modified_time(&p.path, "debug")
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
-            && t_debug == snap.compile_secs
-            && registry::validate_version(&p.version_debug)
-            && registry::validate_version(&snap.version)
-            && version_greater(&snap.version, &p.version_debug)
-        {
-            registry::accepter_modification(format!("{id}:version_debug"));
-            registry::accepter_modification(format!("{id}:version"));
-            p.version_debug = snap.version.clone();
-            p.version = snap.version.clone();
-            restaurees += 1;
-            alertes.push(format!(
-              "{id} : version Debug restaurée (plus ancienne que le dernier build)."
-            ));
+        if let Some(snap) = snap_debug {
+            if t_debug == Some(snap.compile_secs)
+                && registry::validate_version(&p.version_debug)
+                && registry::validate_version(&snap.version)
+                && version_greater(&snap.version, &p.version_debug)
+            {
+                registry::accepter_modification(format!("{id}:version_debug"));
+                registry::accepter_modification(format!("{id}:version"));
+                p.version_debug = snap.version.clone();
+                p.version = snap.version.clone();
+                restaurees += 1;
+                alertes.push(format!(
+                  "{id} : version Debug restaurée (plus ancienne que le dernier build)."
+                ));
+            }
+            // Migration de la fiche Debug (date/empreinte manquantes).
+            if snap.empreinte_v.is_empty()
+                && t_debug == Some(snap.compile_secs)
+                && let Some(l) = variante::lire_variante(&chemin, "debug")
+                && let Some(fiche) = p.debug_snapshot.as_mut()
+            {
+                registry::accepter_modification(format!("{id}:debug_snapshot"));
+                fiche.date = l.etat.date;
+                fiche.empreinte_v = l.empreinte;
+                restaurees += 1;
+                alertes.push(format!(
+                  "{id} : fiche Debug complétée (date et empreinte)."
+                ));
+            }
         }
     }
     (restaurees, alertes)
@@ -926,6 +1013,8 @@ impl App {
             web_cache: registry::WebCache::default(),
             prefs: registry::Preferences::default(),
             registry_broken: false,
+            refus: std::collections::HashMap::new(),
+            diagnostics: Vec::new(),
         };
         progress.begin(Step::WebCache);
         app.web_cache = registry::load_web_cache(&app.registry_path);
@@ -986,6 +1075,10 @@ impl App {
         {
             app.push_info(bandeau);
         }
+        // Contrôle de cohérence au lancement : on expose les écarts, on ne
+        // tranche pas. Les refus déjà enregistrés sont rechargés et re-notifiés.
+        app.refus = registry::load_refus(&app.registry_path);
+        signaler_coherence(&mut app);
         app
     }
 
@@ -1020,6 +1113,8 @@ impl App {
             web_cache: registry::WebCache::default(),
             prefs: registry::Preferences::default(),
             registry_broken: false,
+            refus: std::collections::HashMap::new(),
+            diagnostics: Vec::new(),
         };
         match registry::load_registry(&app.registry_path) {
             Ok(projects) => app.projects = projects,
@@ -1307,95 +1402,6 @@ fn binary_freshness_note(projet: &Path) -> Option<String>
       heure(sources)?
     ))
   }
-
-/// Nom du binaire compilé d'un projet Rust, déduit de son manifeste.
-///
-/// Cargo nomme le binaire d'après le premier `[[bin]] name`, sinon le nom de
-/// package — c'est ce que produit `cargo build` par défaut depuis `main.rs`.
-fn nom_binaire(dir: &Path) -> Option<String> {
-    let cargo = fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    let mut dans_package = false;
-    let mut dans_bin = false;
-    let mut package_name: Option<String> = None;
-    for ligne in cargo.lines() {
-        let t = ligne.trim();
-        if t.starts_with('[') {
-            let section = t.trim_start_matches('[').trim_end_matches(']').trim();
-            dans_package = section == "package";
-            dans_bin = section == "bin";
-            if !dans_bin {
-                package_name = None;
-            }
-            continue;
-        }
-        if let Some(apres_egal) = t.split_once('=') {
-            let cle = apres_egal.0.trim();
-            if cle == "name" {
-                let v = apres_egal.1.trim().trim_matches('"').to_string();
-                if dans_bin {
-                    return Some(v);
-                }
-                if dans_package {
-                    package_name = Some(v);
-                }
-            }
-        }
-    }
-    package_name
-}
-
-/// Première version semver (`x.y.z`) trouvée dans un texte.
-fn premiere_version_semver(texte: &str) -> Option<String> {
-    for token in texte.split_whitespace() {
-        let t = token
-            .trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-        let parts: Vec<&str> = t.split('.').collect();
-        if parts.len() == 3
-            && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        {
-            return Some(t.to_string());
-        }
-    }
-    None
-}
-
-/// Version compilée d'un binaire, lue en l'interrogeant elle-même (`-V`).
-///
-/// Sonde « vérité du disque » : on ne se fie jamais à la version du registre
-/// pour savoir ce qu'un binaire sait réellement faire. Renvoie `None` si le
-/// binaire n'existe pas, ne répond pas avant 2 s, échoue, ou ne publie aucune
-/// version semver lisible. Ne pas confondre avec `-V` du projet menu, qui
-/// n'exécute rien : ici un vrai binaire est lancé.
-fn lire_version_compilee(dir: &Path, profil: &str) -> Option<String> {
-    let binaire = dir.join("target").join(profil).join(nom_binaire(dir)?);
-    if !binaire.is_file() {
-        return None;
-    }
-    let mut enfant = std::process::Command::new(&binaire)
-        .arg("-V")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let echeance = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if let Some(statut) = enfant.try_wait().ok()? {
-            if !statut.success() {
-                return None;
-            }
-            break;
-        }
-        if std::time::Instant::now() >= echeance {
-            let _ = enfant.kill();
-            let _ = enfant.wait();
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let mut sortie = String::new();
-    enfant.stdout.take()?.read_to_string(&mut sortie).ok()?;
-    premiere_version_semver(&sortie)
-}
 
 fn print_help() {
     println!("Usage : op [mot-clé|id|nom]");
@@ -2065,7 +2071,7 @@ fn main() -> Result<()> {
             // Version du menu lui-même : la vérité compilée du binaire en
             // cours, pas une valeur du registre (qui ne change qu'à la
             // compilation — d'où la note de fraîcheur qui l'accompagne).
-            println!("{}", env!("CARGO_PKG_VERSION"));
+            println!("{RELEASE}_{STATUT} ({DATE_LAST_MAJ})");
             if let Some(p) = app.projects.iter().find(|p| p.name == "OpenCode Start Menu")
                 && let Some(note) = binary_freshness_note(&p.path)
             {
@@ -2170,7 +2176,7 @@ fn main() -> Result<()> {
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// Ctrl+C ou Ctrl+D : quitter. Sans modificateur, la touche « c » garde son
-/// sens (popup Coût) et « q » la sortie normale.
+/// sens (contrôle de cohérence) et « q » la sortie normale.
 fn ctrl_quit(key: crossterm::event::KeyEvent) -> bool
   {
     use crossterm::event::KeyModifiers;
@@ -2312,6 +2318,562 @@ fn confirmer_bump(app: &mut App)
           }
         Err(e) => app.push_error(format!("Bump impossible : {e}")),
       }
+  }
+
+// --- Contrôle de cohérence ------------------------------------------------
+
+/// Une ligne affichée par la modale de cohérence : un écart d'un projet,
+/// l'action proposée, et la date d'un refus éventuel.
+#[derive(Clone)]
+pub(crate) struct LigneCoherence {
+    pub(crate) projet_id: String,
+    pub(crate) projet_nom: String,
+    pub(crate) ecart: coherence::Ecart,
+    pub(crate) action: coherence::Action,
+    pub(crate) refus_date: Option<String>,
+}
+
+/// Date du jour au format `jj-mm-yyyy` (convention du contrat `-V`).
+fn aujourd_hui() -> String
+  {
+    chrono::Local::now().format("%d-%m-%Y").to_string()
+  }
+
+/// Recalcule les diagnostics de tous les projets, les mémorise dans `app`, et
+/// renvoie `(total, non refusés)`.
+///
+/// Le total compte tous les écarts, y compris refusés : un refus est conservé
+/// et re-notifié. Les « non refusés » sont ceux qui n'ont pas encore été
+/// tranchés par l'utilisateur.
+fn controler_coherence(app: &mut App) -> (usize, usize)
+  {
+    let mut diagnostics = Vec::new();
+    for p in &app.projects
+      {
+        let obs = coherence::observer(p);
+        let diagnostic = coherence::diagnostiquer(&obs);
+        if !diagnostic.est_vide()
+          {
+            diagnostics.push(DiagnosticProjet {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                diagnostic,
+            });
+          }
+      }
+    app.diagnostics = diagnostics;
+    let mut total = 0usize;
+    let mut non_refuses = 0usize;
+    for d in &app.diagnostics
+      {
+        for e in &d.diagnostic.ecarts
+          {
+            total += 1;
+            if !refus_existe(app, &d.id, &e.cle(), e.action().code())
+              {
+                non_refuses += 1;
+              }
+          }
+      }
+    (total, non_refuses)
+  }
+
+/// Contrôle la cohérence et signale à l'utilisateur les écarts non tranchés.
+fn signaler_coherence(app: &mut App)
+  {
+    let (_, non_refuses) = controler_coherence(app);
+    if non_refuses > 0
+      {
+        app.push_info(format!(
+          "{non_refuses} incohérence(s) détectée(s) — touche 'c' pour examiner"
+        ));
+      }
+  }
+
+/// Un refus est-il déjà enregistré pour cet écart et cette action ?
+fn refus_existe(app: &App, id: &str, ecart: &str, action: &str) -> bool
+  {
+    app.refus
+        .get(id)
+        .is_some_and(|liste| liste.iter().any(|r| r.ecart == ecart && r.action == action))
+  }
+
+/// Construit la liste plate des écarts affichés par la modale.
+pub(crate) fn lignes_coherence(app: &App) -> Vec<LigneCoherence>
+  {
+    let mut lignes = Vec::new();
+    for d in &app.diagnostics
+      {
+        for e in &d.diagnostic.ecarts
+          {
+            let action = e.action();
+            let refus_date = app.refus.get(&d.id).and_then(|liste| {
+                liste
+                    .iter()
+                    .find(|r| r.ecart == e.cle() && r.action == action.code())
+                    .map(|r| r.quand.clone())
+            });
+            lignes.push(LigneCoherence {
+                projet_id: d.id.clone(),
+                projet_nom: d.name.clone(),
+                ecart: e.clone(),
+                action,
+                refus_date,
+            });
+          }
+      }
+    lignes
+  }
+
+/// Ouvre la modale de cohérence, ou annonce qu'il n'y a rien à voir.
+fn ouvrir_coherence(app: &mut App) -> InputMode
+  {
+    let (total, _) = controler_coherence(app);
+    if total == 0
+      {
+        app.push_info("Aucune incohérence détectée".to_string());
+        return InputMode::Normal;
+      }
+    // Résume les actions proposées, sans doublon, dans l'ordre des projets.
+    let mut libelles: Vec<&'static str> = Vec::new();
+    for d in &app.diagnostics
+      {
+        for a in d.diagnostic.actions()
+          {
+            let l = a.libelle();
+            if !libelles.contains(&l)
+              {
+                libelles.push(l);
+              }
+          }
+      }
+    app.push_info(format!(
+      "{total} incohérence(s) — actions proposées : {}",
+      libelles.join(", ")
+    ));
+    InputMode::Coherence(CoherenceState::default())
+  }
+
+/// Aligne la base (registre) sur la vérité du disque pour un projet.
+///
+/// La version et le statut Debug viennent du binaire s'il répond au contrat
+/// `-V`, sinon du manifeste. Les mutations sont déclarées à la garde, puis
+/// persistées.
+fn executer_maj_base(app: &mut App, id: &str) -> Result<()>
+  {
+    let Some(idx) = app.projects.iter().position(|p| p.id == id)
+      else
+        {
+          return Ok(());
+        };
+    let obs = coherence::observer(&app.projects[idx]);
+    let (version, statut) = match &obs.debug
+      {
+        Some(e) if !e.version.is_empty() => (e.version.clone(), e.statut.clone()),
+        _ => (obs.sources_version.clone(), String::new()),
+      };
+    if version.is_empty()
+      {
+        anyhow::bail!("aucune version à aligner");
+      }
+    registry::accepter_modification(format!("{id}:version_debug"));
+    if !statut.is_empty()
+      {
+        registry::accepter_modification(format!("{id}:status_debug"));
+      }
+    let p = &mut app.projects[idx];
+    p.version_debug = version;
+    if !statut.is_empty()
+      {
+        p.status_debug = statut;
+      }
+    let _ = registry::save_registry_full(
+      &app.registry_path,
+      &app.projects,
+      &app.web_cache,
+      &app.prefs,
+    )?;
+    Ok(())
+  }
+
+/// Lance `cargo` dans un projet en capturant sa sortie.
+///
+/// La sortie est capturée, jamais héritée : en mode brut, sur l'écran alternatif,
+/// les lignes de cargo écriraient par-dessus l'interface. En cas d'échec, un
+/// extrait de stderr remonte dans le message d'erreur, sinon l'utilisateur ne
+/// verrait qu'un code de retour muet.
+fn lancer_cargo(dir: &Path, args: &[&str]) -> Result<()>
+  {
+    let sortie = std::process::Command::new("cargo")
+        .args(args)
+        .current_dir(dir)
+        .output()?;
+    if !sortie.status.success()
+      {
+        let err = String::from_utf8_lossy(&sortie.stderr);
+        let lignes: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
+        let debut = lignes.len().saturating_sub(5);
+        let extrait = lignes[debut..].join(" | ");
+        if extrait.is_empty()
+          {
+            anyhow::bail!("cargo {} a échoué", args.join(" "));
+          }
+        anyhow::bail!("cargo {} a échoué : {extrait}", args.join(" "));
+      }
+    Ok(())
+  }
+
+/// Reconstruit la variante Debug d'un projet, met à jour le snapshot Debug
+/// et aligne la base Debug sur le binaire fraîchement construit.
+fn executer_rebuild_debug(app: &mut App, id: &str) -> Result<()>
+  {
+    let Some(idx) = app.projects.iter().position(|p| p.id == id)
+      else
+        {
+          return Ok(());
+        };
+    let path = app.projects[idx].path.clone();
+    lancer_cargo(&path, &["build"])?;
+    let Some(lv) = crate::variante::lire_variante(&path, "debug")
+      else
+        {
+          anyhow::bail!("binaire debug hors contrat après build");
+        };
+    let mtime = registry::variant_modified_time(&path, "debug")
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
+        .unwrap_or_else(|| {
+          std::time::SystemTime::now()
+              .duration_since(std::time::UNIX_EPOCH)
+              .unwrap_or_default()
+              .as_secs()
+        });
+    registry::accepter_modification(format!("{id}:version_debug"));
+    registry::accepter_modification(format!("{id}:status_debug"));
+    let p = &mut app.projects[idx];
+    p.version_debug = lv.etat.version.clone();
+    p.status_debug = lv.etat.statut.clone();
+    p.debug_snapshot = Some(registry::SnapshotCompile {
+        version: lv.etat.version.clone(),
+        statut: lv.etat.statut.clone(),
+        date: lv.etat.date.clone(),
+        empreinte_v: lv.empreinte.clone(),
+        compile_secs: mtime,
+    });
+    let _ = registry::save_registry_full(
+      &app.registry_path,
+      &app.projects,
+      &app.web_cache,
+      &app.prefs,
+    )?;
+    Ok(())
+  }
+
+/// Reconstruit la variante Release d'un projet, met à jour le snapshot Release
+/// et aligne la base Release sur le binaire fraîchement construit.
+fn executer_rebuild_release(app: &mut App, id: &str) -> Result<()>
+  {
+    let Some(idx) = app.projects.iter().position(|p| p.id == id)
+      else
+        {
+          return Ok(());
+        };
+    let path = app.projects[idx].path.clone();
+    lancer_cargo(&path, &["build", "--release"])?;
+    let Some(lv) = crate::variante::lire_variante(&path, "release")
+      else
+        {
+          anyhow::bail!("binaire release hors contrat après build");
+        };
+    let mtime = registry::variant_modified_time(&path, "release")
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
+        .unwrap_or_else(|| {
+          std::time::SystemTime::now()
+              .duration_since(std::time::UNIX_EPOCH)
+              .unwrap_or_default()
+              .as_secs()
+        });
+    registry::accepter_modification(format!("{id}:version_release"));
+    registry::accepter_modification(format!("{id}:status_release"));
+    let p = &mut app.projects[idx];
+    p.version_release = lv.etat.version.clone();
+    p.status_release = lv.etat.statut.clone();
+    p.release_snapshot = Some(registry::SnapshotCompile {
+        version: lv.etat.version.clone(),
+        statut: lv.etat.statut.clone(),
+        date: lv.etat.date.clone(),
+        empreinte_v: lv.empreinte.clone(),
+        compile_secs: mtime,
+    });
+    let _ = registry::save_registry_full(
+      &app.registry_path,
+      &app.projects,
+      &app.web_cache,
+      &app.prefs,
+    )?;
+    Ok(())
+  }
+
+/// Statut valide à retenir pour un projet : le statut enregistré Debug s'il
+/// appartient à la liste connue, sinon celui de Release, sinon « Release ».
+///
+/// Sert à la fois à conformer un binaire hors contrat et à corriger un statut
+/// hors liste : on ne retient jamais une valeur inventée, seulement une valeur
+/// déjà connue d'op.
+fn statut_cible(entry: &registry::ProjectEntry) -> String
+  {
+    for s in [&entry.status_debug, &entry.status_release]
+      {
+        if registry::validate_status(s)
+          {
+            return s.clone();
+          }
+      }
+    "Release".to_string()
+  }
+
+/// Version des sources à figer dans `RELEASE` : la version du manifeste, sinon
+/// celle enregistrée pour Debug.
+fn version_cible(entry: &registry::ProjectEntry) -> String
+  {
+    if entry.version.is_empty()
+      {
+        entry.version_debug.clone()
+      }
+    else
+      {
+        entry.version.clone()
+      }
+  }
+
+/// Conforme le module principal d'un projet au contrat `-V`, puis reconstruit
+/// Debug pour que le binaire publié reflète le code corrigé.
+///
+/// L'écriture est confinée au module principal : aucune autre source n'est
+/// touchée, et une bibliothèque (sans binaire) n'est jamais conforme.
+fn conformer_et_rebuild(app: &mut App, id: &str, statut: &str) -> Result<()>
+  {
+    let Some(idx) = app.projects.iter().position(|p| p.id == id)
+      else
+        {
+          return Ok(());
+        };
+    let path = app.projects[idx].path.clone();
+    let version = version_cible(&app.projects[idx]);
+    if version.is_empty()
+      {
+        anyhow::bail!("version inconnue : manifeste muet et registre vide");
+      }
+    let Some(module) = conformite::module_principal(&path)
+      else
+        {
+          anyhow::bail!("module principal introuvable (bibliothèque sans binaire ?)");
+        };
+    let contenu = fs::read_to_string(&module)?;
+    let (nouveau, modifie) =
+      conformite::conformer_constantes(&contenu, &version, statut, &aujourd_hui());
+    if modifie
+      {
+        write_atomic(&module, &nouveau)?;
+      }
+    // Le binaire Debug doit republier la vérité corrigée : sans reconstruction,
+    // il resterait hors contrat.
+    executer_rebuild_debug(app, id)?;
+    Ok(())
+  }
+
+/// Conforme le code au contrat `-V` (binaire qui ne publie pas sa version).
+fn executer_conformer_code(app: &mut App, id: &str) -> Result<()>
+  {
+    let Some(idx) = app.projects.iter().position(|p| p.id == id)
+      else
+        {
+          return Ok(());
+        };
+    let statut = statut_cible(&app.projects[idx]);
+    conformer_et_rebuild(app, id, &statut)
+  }
+
+/// Corrige un statut hors liste en le ramenant à une valeur connue.
+///
+/// Le statut est une constante du code : le corriger dans la base seule serait
+/// un mensonge contredit par le `-V` du binaire. On révise donc le code, puis on
+/// reconstruit Debug.
+fn executer_corriger_statut(app: &mut App, id: &str) -> Result<()>
+  {
+    let Some(idx) = app.projects.iter().position(|p| p.id == id)
+      else
+        {
+          return Ok(());
+        };
+    let statut = statut_cible(&app.projects[idx]);
+    conformer_et_rebuild(app, id, &statut)
+  }
+
+/// Applique l'action proposée par une ligne, si elle est exécutable.
+fn appliquer_action(app: &mut App, ligne: &LigneCoherence) -> Result<()>
+  {
+    use coherence::Action::*;
+    match ligne.action
+      {
+        MajBase =>
+          {
+            executer_maj_base(app, &ligne.projet_id)?;
+            retirer_refus_ecart(app, &ligne.projet_id, &ligne.ecart.cle())?;
+            controler_coherence(app);
+            app.push_info(format!("{} : base mise à jour", ligne.projet_nom));
+            Ok(())
+          }
+        RebuildDebug =>
+          {
+            executer_rebuild_debug(app, &ligne.projet_id)?;
+            retirer_refus_ecart(app, &ligne.projet_id, &ligne.ecart.cle())?;
+            controler_coherence(app);
+            app.push_info(format!("{} : Debug reconstruit", ligne.projet_nom));
+            Ok(())
+          }
+        RebuildRelease =>
+          {
+            executer_rebuild_release(app, &ligne.projet_id)?;
+            retirer_refus_ecart(app, &ligne.projet_id, &ligne.ecart.cle())?;
+            controler_coherence(app);
+            app.push_info(format!("{} : Release reconstruite", ligne.projet_nom));
+            Ok(())
+          }
+        ConformerCode =>
+          {
+            executer_conformer_code(app, &ligne.projet_id)?;
+            retirer_refus_ecart(app, &ligne.projet_id, &ligne.ecart.cle())?;
+            controler_coherence(app);
+            app.push_info(format!("{} : code conformé au contrat -V", ligne.projet_nom));
+            Ok(())
+          }
+        CorrigerStatut =>
+          {
+            executer_corriger_statut(app, &ligne.projet_id)?;
+            retirer_refus_ecart(app, &ligne.projet_id, &ligne.ecart.cle())?;
+            controler_coherence(app);
+            app.push_info(format!("{} : statut corrigé", ligne.projet_nom));
+            Ok(())
+          }
+      }
+  }
+
+/// Enregistre un refus, persisté et re-notifié tant que l'écart est identique.
+fn enregistrer_refus(app: &mut App, ligne: &LigneCoherence) -> Result<()>
+  {
+    let ecart = ligne.ecart.cle();
+    let action = ligne.action.code().to_string();
+    let liste = app.refus.entry(ligne.projet_id.clone()).or_default();
+    if !liste.iter().any(|r| r.ecart == ecart && r.action == action)
+      {
+        liste.push(registry::RefusCoherence {
+            ecart,
+            action,
+            quand: aujourd_hui(),
+        });
+      }
+    registry::save_refus(&app.registry_path, &app.refus)?;
+    controler_coherence(app);
+    app.push_info(format!(
+      "{} : {} refusée (touche c pour revoir)",
+      ligne.projet_nom,
+      ligne.action.libelle()
+    ));
+    Ok(())
+  }
+
+/// Retire tout refus portant sur un écart donné (l'écart est résolu).
+fn retirer_refus_ecart(app: &mut App, id: &str, ecart: &str) -> Result<()>
+  {
+    if let Some(liste) = app.refus.get_mut(id)
+      {
+        liste.retain(|r| r.ecart != ecart);
+        if liste.is_empty()
+          {
+            app.refus.remove(id);
+          }
+      }
+    registry::save_refus(&app.registry_path, &app.refus)
+  }
+
+/// Gère les touches de la modale de cohérence.
+fn handle_coherence_input(
+    key: event::KeyEvent,
+    state: &mut CoherenceState,
+    app: &mut App,
+) -> Result<InputMode>
+  {
+    let lignes = lignes_coherence(app);
+    if lignes.is_empty()
+      {
+        return Ok(InputMode::Normal);
+      }
+    let n = lignes.len();
+    state.selection = state.selection.min(n - 1);
+
+    // Confirmation dédiée d'une action Release en attente.
+    if let Some(conf) = state.confirmation_release
+      {
+        match key.code
+          {
+            KeyCode::Char('o') | KeyCode::Char('O') | KeyCode::Enter =>
+              {
+                state.confirmation_release = None;
+                if let Some(ligne) = lignes.get(conf).cloned()
+                  {
+                    appliquer_action(app, &ligne)?;
+                  }
+              }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') =>
+              {
+                state.confirmation_release = None;
+              }
+            _ => {}
+          }
+        if lignes_coherence(app).is_empty()
+          {
+            return Ok(InputMode::Normal);
+          }
+        return Ok(InputMode::Coherence(state.clone()));
+      }
+
+    match key.code
+      {
+        KeyCode::Esc | KeyCode::Char('q') => return Ok(InputMode::Normal),
+        KeyCode::Down | KeyCode::Char('j') =>
+          {
+            state.selection = (state.selection + 1) % n;
+          }
+        KeyCode::Up | KeyCode::Char('k') =>
+          {
+            state.selection = (state.selection + n - 1) % n;
+          }
+        KeyCode::Enter =>
+          {
+            let ligne = lignes[state.selection].clone();
+            // Toute action touchant la Release exige une confirmation dédiée.
+            if ligne.action.touche_release()
+              {
+                state.confirmation_release = Some(state.selection);
+              }
+            else
+              {
+                appliquer_action(app, &ligne)?;
+              }
+          }
+        KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('r') =>
+          {
+            let ligne = lignes[state.selection].clone();
+            enregistrer_refus(app, &ligne)?;
+          }
+        _ => {}
+      }
+    // Si une action a tout résolu, la modale n'a plus lieu d'être.
+    if lignes_coherence(app).is_empty()
+      {
+        return Ok(InputMode::Normal);
+      }
+    Ok(InputMode::Coherence(state.clone()))
   }
 
 /// Incrémente le patch d'un projet et resynchronise le manifeste et le hash.
@@ -2695,6 +3257,7 @@ fn libelle_mode(mode: &InputMode) -> &'static str
         InputMode::CreatingProject(_) => "creation",
         InputMode::SelectModule { .. } => "module",
         InputMode::Popup(_) => "popup",
+        InputMode::Coherence(_) => "coherence",
         InputMode::Aide { detaillee: true, .. } => "aide-complete",
         InputMode::Aide { detaillee: false, .. } => "aide",
       }
@@ -2835,6 +3398,7 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         demander_bump(&mut app);
                         InputMode::Normal
                     }
+                    KeyCode::Char('c') | KeyCode::Char('C') => ouvrir_coherence(&mut app),
                     // `a` archive dans la liste, restaure dans les archives :
                     // un seul geste, sa direction donnée par la vue.
                     KeyCode::Char('a') => {
@@ -2994,6 +3558,16 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
                         Onglet::Parametres => handle_parametres_input(key, &mut app, &mut popup),
                     }
                 }
+                // Modale de cohérence : appliquer, refuser ou fermer.
+                InputMode::Coherence(mut state) => {
+                    match handle_coherence_input(key, &mut state, &mut app) {
+                        Ok(mode) => mode,
+                        Err(e) => {
+                            app.push_error(format!("Cohérence : {e}"));
+                            InputMode::Normal
+                        }
+                    }
+                }
                 // Échap et F1 referment l'aide. F10 y bascule vers la vue
                 // complète, ce qui évite d'avoir à refermer pour y aller.
                 InputMode::Aide { detaillee, origine, scroll } => {
@@ -3078,6 +3652,8 @@ fn tui_loop(terminal: &mut Term, mut app: App, mode_initial: InputMode) -> Resul
             } else {
                 None
             };
+            // Retour au menu : contrôle de cohérence systématique (C5).
+            signaler_coherence(&mut app);
             // Constat de fin : la session passée est auditée (best-effort).
             if let Some(resume) = apport::constater_retour(
                 &app.registry_path,
@@ -3404,10 +3980,19 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                 entry.last_compile_debug_secs = t;
                 let version_snapshot =
                     if entry.version_debug.is_empty() { entry.version.clone() } else { entry.version_debug.clone() };
+                // Date et empreinte : complément issu du binaire (sonde `-V`).
+                // La version/statut conservent leur sémantique d'avant-bump.
+                let (date, empreinte_v) = match variante::lire_variante(&entry.path, "debug")
+                  {
+                    Some(l) => (l.etat.date, l.empreinte),
+                    None => (String::new(), String::new()),
+                  };
                 entry.debug_snapshot = Some(registry::SnapshotCompile {
                     version: version_snapshot,
                     statut: entry.status_debug.clone(),
+                    date,
                     compile_secs: t,
+                    empreinte_v,
                 });
             }
             written = true;
@@ -3488,10 +4073,19 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                   {
                     entry.version_release = v.clone();
                     entry.status_release = entry.status_debug.clone();
+                    // Date et empreinte de la Release reconstruite : le binaire
+                    // release vient d'être sonde, il déclare sa propre vérité.
+                    let (date, empreinte_v) = match variante::lire_variante(&entry.path, "release")
+                      {
+                        Some(l) => (l.etat.date, l.empreinte),
+                        None => (String::new(), String::new()),
+                      };
                     entry.release_snapshot = Some(registry::SnapshotCompile {
                         version: v,
                         statut: entry.status_debug.clone(),
+                        date,
                         compile_secs: t,
+                        empreinte_v,
                     });
                   }
                 written = true;
@@ -3611,8 +4205,24 @@ fn signature_persistee(e: &ProjectEntry) -> String
       e.last_compile_debug_secs.to_string(),
       e.last_compile_release_secs.to_string(),
       e.version_manually_edited.to_string(),
+      signature_fiche(e.debug_snapshot.as_ref()),
+      signature_fiche(e.release_snapshot.as_ref()),
     ]
     .join("|")
+  }
+
+/// Signature courte d'une fiche d'état (snapshot), pour `signature_persistee`.
+/// Renvoie un vide si la fiche est absente.
+fn signature_fiche(fiche: Option<&registry::SnapshotCompile>) -> String
+  {
+    match fiche
+      {
+        Some(f) => format!(
+          "{};{};{};{};{}",
+          f.version, f.statut, f.date, f.compile_secs, f.empreinte_v
+        ),
+        None => String::new(),
+      }
   }
 
 /// Résumé lisible du tarif appliqué, affiché dans le popup (touche `t`).
@@ -4839,7 +5449,7 @@ mod tests
   {
     use crate::{
         cout_affiche, kind_pour_repertoire, normaliser_recherche, sanitize, startup,
-        variant_label, Cli, LaunchKind, Progress, SortOrder,
+        variant_label, App, Cli, LaunchKind, Progress, SortOrder,
     };
     use clap::Parser;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4928,6 +5538,17 @@ mod tests
     // `op new` et `op --new new` se ressemblent mais n'ont rien à voir :
     // le premier est un mot-clé de projet, le second une demande de
     // création. C'est le genre de distinction que seul un test protège.
+
+    /// Le `-V` du menu respecte son propre contrat : les trois constantes
+    /// s'assemblent en une ligne que la sonde sait relire.
+    #[test]
+    fn le_contrat_version_du_menu_se_relit() {
+        let ligne = format!("{}_{} ({})", crate::RELEASE, crate::STATUT, crate::DATE_LAST_MAJ);
+        let etat = crate::variante::parser_etat_variante(&ligne).unwrap();
+        assert_eq!(etat.version, crate::RELEASE);
+        assert_eq!(etat.statut, crate::STATUT);
+        assert_eq!(etat.date, crate::DATE_LAST_MAJ);
+    }
 
     #[test]
     fn op_new_est_un_mot_cle_et_non_une_creation() {
@@ -5090,6 +5711,83 @@ mod tests
             tarif_resume: String::new(),
             est_bibliotheque: false,
         }
+    }
+
+    #[test]
+    fn le_statut_cible_retient_une_valeur_connue() {
+        // Aucun statut enregistré : repli sur « Release », jamais une invention.
+        let mut p = entry("a", "A", PathBuf::from("/tmp/a"));
+        assert_eq!(super::statut_cible(&p), "Release");
+        // Un statut valide enregistré est retenu tel quel.
+        p.status_debug = "Beta".to_string();
+        assert_eq!(super::statut_cible(&p), "Beta");
+        // Un statut hors liste est ignoré au profit d'un autre, valide.
+        p.status_debug = "Zorglub".to_string();
+        p.status_release = "Beta-Release".to_string();
+        assert_eq!(super::statut_cible(&p), "Beta-Release");
+        // Tous hors liste : repli sur « Release ».
+        p.status_debug = "Zorglub".to_string();
+        p.status_release = "Gnarf".to_string();
+        assert_eq!(super::statut_cible(&p), "Release");
+    }
+
+    #[test]
+    fn la_version_cible_prefere_le_manifeste() {
+        let mut p = entry("a", "A", PathBuf::from("/tmp/a"));
+        p.version = "2.0.0".to_string();
+        p.version_debug = "1.9.0".to_string();
+        assert_eq!(super::version_cible(&p), "2.0.0");
+        // Manifeste muet : la version enregistrée pour Debug fait foi.
+        p.version = String::new();
+        assert_eq!(super::version_cible(&p), "1.9.0");
+    }
+
+    /// Bout en bout : un projet dont le statut est hors liste est corrigé dans
+    /// son module principal, reconstruit, et son `-V` publie alors le contrat.
+    ///
+    /// Le projet d'essai n'a aucune dépendance : il se compile hors ligne. C'est
+    /// le seul test qui lance réellement `cargo build`.
+    #[test]
+    fn corriger_statut_rend_le_binaire_conforme() {
+        let dir = temp_dir("corriger-statut");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"opessai\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/main.rs"),
+            "const RELEASE: &str = \"1.0.0\";\n\
+             const STATUT: &str = \"Zorglub\";\n\
+             const DATE_LAST_MAJ: &str = \"01-01-2020\";\n\
+             fn main() {\n\
+             \x20   if std::env::args().any(|a| a == \"-V\") {\n\
+             \x20       println!(\"{RELEASE}_{STATUT} ({DATE_LAST_MAJ})\");\n\
+             \x20       return;\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut app = App::new_light(dir.join("projects.json"), SortOrder::Modified);
+        let mut p = entry("opessai", "opessai", dir.clone());
+        p.version = "1.0.0".to_string();
+        p.status_debug = "Release".to_string();
+        app.projects = vec![p];
+
+        super::executer_corriger_statut(&mut app, "opessai").unwrap();
+
+        let contenu = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(
+            contenu.contains("const STATUT: &str = \"Release\";"),
+            "le statut doit être ramené à une valeur connue :\n{contenu}"
+        );
+        let etat = crate::variante::lire_etat_variante(&dir, "debug")
+            .expect("le binaire Debug doit publier le contrat");
+        assert_eq!(etat.version, "1.0.0");
+        assert_eq!(etat.statut, "Release");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

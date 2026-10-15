@@ -108,6 +108,17 @@ pub(crate) fn ui(
         render_popup_unifie(f, size, app, popup);
     }
 
+    // Modale d'examen des incohérences, et sa confirmation Release éventuelle.
+    if let InputMode::Coherence(state) = input_mode {
+        render_coherence_dialog(f, size, app, state);
+        if let Some(idx) = state.confirmation_release {
+            let lignes = crate::lignes_coherence(app);
+            if let Some(ligne) = lignes.get(idx) {
+                render_confirmation_release(f, size, ligne.action.libelle());
+            }
+        }
+    }
+
     // Module selector overlay
     if let InputMode::SelectModule {
         project_idx,
@@ -802,20 +813,95 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
           }
       };
 
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(""),
-      ];
-    for (i, (lbl, val)) in fields.iter().enumerate()
+    // Ligne d'un champ simple : libellé + « : » + valeur, une seule rangée.
+    let ligne_champ = |i: usize| -> Line<'static>
       {
-        // La valeur reste au style par défaut : ce qui désigne le champ, c'est
-        // son libellé, et le curseur réel posé plus bas.
-        lines.push(Line::from(vec![
-            Span::styled(*lbl, lbl_style(i)),
+        Line::from(vec![
+            Span::styled(fields[i].0, lbl_style(i)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
-            Span::styled(val.clone(), Style::default()),
-          ]));
+            Span::styled(fields[i].1.clone(), Style::default()),
+        ])
+      };
+
+    // La Description occupe une zone dédiée de hauteur fixe, repliée au mot :
+    // lue en entier, elle ne pousse jamais Statut, Version ni « Ouvrir ? », qui
+    // gardent leur rangée. `3` = libellé + deux lignes de continuation.
+    const DESC_H: usize = 3;
+    let largeur = area.width.saturating_sub(2) as usize; // intérieur du cadre
+    let prefixe = format!("{} : ", fields[3].0);
+    let (repliees, positions) =
+      replier_texte(&format!("{prefixe}{}", fields[3].1), largeur);
+    let prefixe_chars = prefixe.chars().count();
+    let curseur_repli = if active == 3
+      {
+        let idx = (prefixe_chars + state.input_offset).min(positions.len().saturating_sub(1));
+        Some(positions[idx])
       }
+      else
+        {
+          None
+        };
+    // Défilement automatique : la zone s'ouvre en haut et ne glisse qu'autant
+    // qu'il faut pour garder le curseur visible.
+    let scroll = match curseur_repli
+      {
+        Some((cr, _)) if cr >= DESC_H => cr + 1 - DESC_H,
+        _ => 0,
+      };
+    let mut lignes_desc: Vec<Line<'static>> = Vec::with_capacity(DESC_H);
+    for li in scroll..scroll + DESC_H
+      {
+        let ligne = match (li, repliees.get(li))
+          {
+            (0, Some(txt)) =>
+              {
+                let coupe = prefixe_chars.min(txt.chars().count());
+                let (tete, queue): (String, String) = txt.chars().enumerate().fold(
+                  (String::new(), String::new()),
+                  |(mut tete, mut queue), (k, c)| {
+                    if k < coupe
+                      {
+                        tete.push(c);
+                      }
+                    else
+                      {
+                        queue.push(c);
+                      }
+                    (tete, queue)
+                  },
+                );
+                Line::from(vec![
+                    Span::styled(tete, lbl_style(3)),
+                    Span::styled(queue, Style::default()),
+                ])
+              }
+            (_, Some(txt)) => Line::from(Span::styled(txt.clone(), Style::default())),
+            (_, None) => Line::from(""),
+          };
+        lignes_desc.push(ligne);
+      }
+
+    // Rangée intérieure d'un champ simple : ID/Nom/Chemin en tête (index 2,
+    // 3, 4), puis Statut, Version et « Ouvrir ? » reconduits sous la zone.
+    let rangee_champ = |i: usize| -> usize
+      {
+        if i < 3
+          {
+            2 + i
+          }
+        else
+          {
+            1 + DESC_H + i
+          }
+      };
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(""), Line::from("")];
+    lines.push(ligne_champ(0));
+    lines.push(ligne_champ(1));
+    lines.push(ligne_champ(2));
+    lines.extend(lignes_desc);
+    lines.push(ligne_champ(4));
+    lines.push(ligne_champ(5));
 
     // Ligne de confirmation finale o/N (toujours visible, actif si active_field == 6).
     // L'indication passe en gras quand elle est active : elle cesse d'être un
@@ -833,7 +919,7 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         confirm_lbl,
         Span::styled(" : ", Style::default().fg(Color::DarkGray)),
         Span::styled("o/N", confirm_style),
-      ]));
+    ]));
 
     // Confirmation d'un nouveau statut (hors liste du registre)
     if state.confirm_status
@@ -867,28 +953,38 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
         lines.push(Line::from(""));
       }
 
-    // Pas de retour automatique à la ligne : chaque champ occupe exactement une
-    // rangée, ce qui est la condition pour que le curseur et le menu Statut se
-    // posent sur la bonne ligne. Une valeur trop longue est tronquée à droite.
+    // Rendu sans retour automatique : chaque champ occupe une rangée connue, ce
+    // qui est la condition pour que le curseur et le menu Statut se posent au
+    // bon endroit. La description est déjà repliée avec le même compte.
     let paragraph = Paragraph::new(lines).block(block).style(opaque);
     f.render_widget(paragraph, area);
 
-    // Curseur réel : sur la valeur du champ actif.
-    // Colonne de début de valeur = bordure + libellé réel + « : ».
-    let cursor_y = area.y + 3 + active as u16; // bordure(1) + 2 lignes vides + index champ
-    // Décalage dans le champ : largeur rendue du préfixe saisi, pas son
-    // nombre de caractères (sinon les accents décalent le curseur).
-    let dans_champ = if active == 4 && !state.status_free_text
+    // Curseur réel : dans la zone repliée pour la Description, sur la rangée du
+    // champ sinon. La colonne de début de valeur = bordure + libellé + « : »,
+    // plus la largeur rendue du préfixe saisi (pas ses caractères : sinon les
+    // accents décalent le curseur).
+    let (cursor_x, cursor_y) = if active == 3
       {
-        0
+        let (cr, cc) = curseur_repli.unwrap_or((0, 0));
+        (area.x + 1 + cc as u16, area.y + 1 + (2 + 3 + cr - scroll) as u16)
       }
     else
       {
-        colonne_curseur(&state.input_buffer, state.input_offset)
+        let dans_champ = if active == 4 && !state.status_free_text
+          {
+            0
+          }
+          else
+            {
+              colonne_curseur(&state.input_buffer, state.input_offset)
+            };
+        (
+          area.x + 1 + fields.get(active).map_or(13, |f| f.0.chars().count()) as u16 + 3
+            + dans_champ as u16,
+          area.y + 1 + rangee_champ(active) as u16,
+        )
       };
-    let cursor_x = (area.x + 1 + fields.get(active).map_or(13, |f| f.0.chars().count()) as u16 + 3
-      + dans_champ as u16)
-      .min(area.x.saturating_add(area.width).saturating_sub(2));
+    let cursor_x = cursor_x.min(area.x.saturating_add(area.width).saturating_sub(2));
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 
     // Menu déroulant Statut (champ 4) : popup opaque sous la ligne du champ.
@@ -903,7 +999,9 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
           }
         let width = items.iter().map(|s| s.chars().count()).max().unwrap_or(8) + 2;
         let px = (area.x + 3).min(area.x.saturating_add(area.width).saturating_sub(width as u16));
-        let py = area.y + 8; // sous la ligne du champ Statut (row = area.y+7)
+        // Sous la ligne du champ Statut (rangée intérieure `5 + DESC_H`, soit
+        // `area.y + 1 + 5 + DESC_H` sur l'écran).
+        let py = area.y + 2 + (5 + DESC_H) as u16;
         let parea = Rect {
             x: px,
             y: py,
@@ -1004,52 +1102,116 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         current_value(state, 2),
       ];
 
-    let mut lines = vec![Line::from("")];
-    for i in 0..4
+    // Version et Statut : une rangée chacun, sous une rangée vide d'amorce.
+    let ligne_champ = |i: usize| -> Line<'static>
       {
-        let mut spans = vec![
+        Line::from(vec![
             Span::styled(labels[i].0, lbl_style(i)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
-          ];
-        if i == crate::EDIT_CONFIRM_FIELD
-          {
-            // « Enregistrer ? » n'est pas un texte : c'est un choix
-            // explicite. Le surlignage porte sur la réponse qu'Entrée
-            // exécutera, `[Non]` étant le défaut.
-            let choix = |oui: bool| -> Style
-              {
-                if oui == state.choix_oui
-                  {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                  }
-                else
-                  {
-                    Style::default().fg(Color::DarkGray)
-                  }
-              };
-            spans.push(Span::styled("[Oui]", choix(true)));
-            spans.push(Span::styled(" / ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled("[Non]", choix(false)));
-          }
-        else
-          {
-            // La valeur reste au style par défaut : le champ actif se lit au
-            // libellé surligné, et la saisie en cours à la valeur affichée.
-            spans.push(Span::styled(&vals[i], Style::default()));
-          }
-        lines.push(Line::from(spans));
-      }
-    if let Some(err) = &state.error
+            Span::styled(vals[i].clone(), Style::default()),
+        ])
+      };
+
+    // Bloc bas de page à position fixe : la description défilante, au-dessus,
+    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Trois
+    // rangées en tête (vide + Version + Statut), quatre en pied.
+    let hauteur = area.height as usize;
+    let zone_haut = 3usize;
+    let zone_bas = 4usize;
+    let zone_h = hauteur.saturating_sub(zone_haut + zone_bas).max(1);
+
+    // Description repliée au mot dans sa zone dédiée : lue en entier, elle ne
+    // pousse plus les rangées suivantes. Le repli et le curseur partagent le
+    // même calcul, donc restent bord à bord.
+    let prefixe = format!("{} : ", labels[2].0);
+    let (repliees, positions) =
+      replier_texte(&format!("{prefixe}{}", vals[2]), area.width as usize);
+    let prefixe_chars = prefixe.chars().count();
+    let curseur_repli = if state.editing && active == 2
       {
-        lines.push(Line::from(vec![
+        let idx = (prefixe_chars + state.input_offset).min(positions.len().saturating_sub(1));
+        Some(positions[idx])
+      }
+      else
+        {
+          None
+        };
+    // Défilement automatique : la zone s'ouvre en haut et ne glisse qu'autant
+    // qu'il faut pour garder le curseur visible pendant l'édition.
+    let scroll = match curseur_repli
+      {
+        Some((cr, _)) if cr >= zone_h => cr + 1 - zone_h,
+        _ => 0,
+      };
+
+    let mut lignes_zone: Vec<Line<'static>> = Vec::with_capacity(zone_h);
+    for li in scroll..scroll + zone_h
+      {
+        let ligne = match (li, repliees.get(li))
+          {
+            (0, Some(txt)) =>
+              {
+                let coupe = prefixe_chars.min(txt.chars().count());
+                let (tete, queue): (String, String) = txt.chars().enumerate().fold(
+                  (String::new(), String::new()),
+                  |(mut tete, mut queue), (k, c)| {
+                    if k < coupe
+                      {
+                        tete.push(c);
+                      }
+                    else
+                      {
+                        queue.push(c);
+                      }
+                    (tete, queue)
+                  },
+                );
+                Line::from(vec![
+                    Span::styled(tete, lbl_style(2)),
+                    Span::styled(queue, Style::default()),
+                ])
+              }
+            (_, Some(txt)) => Line::from(Span::styled(txt.clone(), Style::default())),
+            (_, None) => Line::from(""),
+          };
+        lignes_zone.push(ligne);
+      }
+
+    // « Enregistrer ? » n'est pas un texte : c'est un choix explicite. Le
+    // surlignage porte sur la réponse qu'Entrée exécutera, `[Non]` par défaut.
+    let ligne_confirm = {
+        let choix = |oui: bool| -> Style
+          {
+            if oui == state.choix_oui
+              {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+              }
+            else
+              {
+                Style::default().fg(Color::DarkGray)
+              }
+          };
+        Line::from(vec![
+            Span::styled(labels[3].0, lbl_style(3)),
+            Span::styled(" : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Oui]", choix(true)),
+            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Non]", choix(false)),
+        ])
+      };
+
+    let mut lines: Vec<Line<'static>> =
+      vec![Line::from(""), ligne_champ(0), ligne_champ(1)];
+    lines.extend(lignes_zone);
+    lines.push(ligne_confirm);
+    lines.push(match &state.error
+      {
+        Some(err) => Line::from(vec![
             Span::styled("!", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" {err}"), Style::default().fg(Color::Yellow)),
-          ]));
-      }
-    else
-      {
-        lines.push(Line::from(""));
-      }
+        ]),
+        None => Line::from(""),
+      });
     lines.push(Line::from(
       if state.status_menu_open
         {
@@ -1069,36 +1231,33 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         }
     )
     .centered());
-    // indices ^ [line1] - hint. Aide champ (sur 2 lignes) + espace réservé
     lines.push(Line::from(
       "Version : x.y.z seulement · Statut : valeur de la liste connue · Description : non vide",
     )
     .centered());
 
-    // Remplit les lignes restantes pour un fond entièrement opaque
-    while lines.len() < area.height as usize
-      {
-        lines.push(Line::from(""));
-      }
-
-    // Pas de retour automatique à la ligne : le contenu est rendu sans cadre
-    // (le cadre est celui de `Fenetre`), donc ligne `i` = rangée `area.y + i`.
-    // Une description longue tronque à droite au lieu de pousser les lignes
-    // suivantes — et avec elles le curseur et le menu Statut.
+    // Rendu sans retour automatique : ligne `i` = rangée `area.y + i`. Le repli
+    // de la description est déjà calculé avec le même compte que le curseur.
     let paragraph = Paragraph::new(lines).block(block).style(opaque);
     f.render_widget(paragraph, area);
 
     // Curseur réel : sur la valeur du champ en cours d'édition.
     if state.editing
       {
-        // Sans bordure : ligne 0 = rangée vide, puis les quatre champs.
-        let cursor_y = area.y + 1 + active as u16;
-        // Colonne de début de valeur = libellé réel + « : », puis largeur
-        // rendue du préfixe saisi (pas son nombre de caractères).
-        let value_x = area.x + labels[active].0.chars().count() as u16 + 3;
-        let dans_champ = colonne_curseur(&state.input_buffer, state.input_offset);
-        let cursor_x =
-          (value_x + dans_champ as u16).min(area.x.saturating_add(area.width).saturating_sub(1));
+        let (cursor_x, cursor_y) = if active == 2
+          {
+            let (cr, cc) = curseur_repli.unwrap_or((0, 0));
+            (area.x + cc as u16, area.y + zone_haut as u16 + (cr - scroll) as u16)
+          }
+        else
+          {
+            // Sans bordure : ligne 0 = rangée vide, puis Version, Statut.
+            let value_x = area.x + labels[active].0.chars().count() as u16 + 3;
+            let dans_champ = colonne_curseur(&state.input_buffer, state.input_offset);
+            (value_x + dans_champ as u16, area.y + 1 + active as u16)
+          };
+        let cursor_x = cursor_x.min(area.x.saturating_add(area.width).saturating_sub(1));
+        let cursor_y = cursor_y.min(area.y.saturating_add(area.height).saturating_sub(1));
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
       }
 
@@ -1216,6 +1375,114 @@ fn render_module_dialog(
         .border_style(Style::default().fg(THEME_GRIS.bordure))
         .style(Style::default().bg(THEME_GRIS.fond));
 
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+/// Modale d'examen des incohérences : une ligne par écart détecté.
+///
+/// Chaque ligne nomme le projet, décrit l'écart et rappelle l'action proposée.
+/// Un écart déjà refusé est marqué `REFUSÉ` avec sa date : il reste visible
+/// tant que l'écart n'a pas changé, pour être re-notifié sans insister.
+fn render_coherence_dialog(
+    f: &mut Frame,
+    size: Rect,
+    app: &App,
+    state: &crate::CoherenceState,
+) {
+    let lignes = crate::lignes_coherence(app);
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        format!("{} incohérence(s) détectée(s)", lignes.len()),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Hauteur utile : cadre, en-tête, ligne d'aide et une marge.
+    let hauteur_utile = (size.height as usize).saturating_sub(6).max(1);
+    for (i, ligne) in lignes.iter().enumerate() {
+        let selectionnee = i == state.selection;
+        let style = if selectionnee {
+            Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let marqueur = if selectionnee { "►" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} {} — {}",
+                marqueur,
+                sanitize(&ligne.projet_nom),
+                ligne.ecart.description()
+            ),
+            style,
+        )));
+        let mut suffixe = format!("      → {}", ligne.action.libelle());
+        if let Some(date) = &ligne.refus_date {
+            suffixe.push_str(&format!("  [REFUSÉ le {date}]"));
+        }
+        lines.push(Line::from(Span::styled(suffixe, style)));
+    }
+
+    // N'affiche que la fenêtre visible, centrée sur la sélection.
+    let hauteur_contenu = lines.len();
+    let debut = state
+        .selection
+        .saturating_sub(hauteur_utile / 2)
+        .min(hauteur_contenu.saturating_sub(hauteur_utile));
+    let fin = (debut + hauteur_utile).min(hauteur_contenu);
+    let fenetre: Vec<Line> = lines[debut..fin].to_vec();
+
+    let dialog_width = size.width.min(90);
+    let dialog_height = (hauteur_utile as u16 + 4).min(size.height.saturating_sub(2));
+    let Some(area) = op_tui::layout::popup_rect(size, dialog_width, dialog_height) else {
+        return;
+    };
+    op_tui::overlay::fond_opaque(f, area, THEME_GRIS);
+    let block = Block::default()
+        .title(" Cohérence ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_GRIS.bordure))
+        .style(Style::default().bg(THEME_GRIS.fond));
+
+    let mut contenu = vec![Line::from("")];
+    contenu.extend(fenetre);
+    contenu.push(Line::from(""));
+    contenu.push(
+        Line::from("↑/↓ naviguer  ·  Entrée appliquer  ·  x refuser  ·  Échap fermer")
+            .centered(),
+    );
+
+    let paragraph = Paragraph::new(contenu).block(block).wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+/// Confirmation dédiée d'une action Release : jamais d'écriture sans ce pas.
+fn render_confirmation_release(f: &mut Frame, size: Rect, action: &str)
+{
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Action Release — confirmation requise",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Vous allez : {action}.")));
+    lines.push(Line::from("La Release ne se reconstruit que sur instruction explicite."));
+    lines.push(Line::from(""));
+    lines.push(Line::from("o/Entrée confirmer  ·  n/Échap annuler").centered());
+
+    let dialog_width = size.width.min(80);
+    let dialog_height = (lines.len() as u16 + 2).min(size.height.saturating_sub(2));
+    let Some(area) = op_tui::layout::popup_rect(size, dialog_width, dialog_height) else {
+        return;
+    };
+    op_tui::overlay::fond_opaque(f, area, THEME_GRIS);
+    let block = Block::default()
+        .title(" Confirmation ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(THEME_GRIS.fond));
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
@@ -1541,6 +1808,84 @@ fn lignes_repliees(texte: &str, largeur: u16) -> usize
           }
       }
     lignes
+  }
+
+/// Largeur d'affichage d'un caractère, en cellules de terminal.
+///
+/// Un caractère large (`漢`, certains émojis) en occupe deux : la même mesure
+/// que `colonne_curseur`, pour que le repli et le curseur tombent ensemble.
+fn largeur_cellule(c: char) -> usize
+  {
+    Line::from(c.to_string()).width()
+  }
+
+/// Replie `texte` en lignes d'au plus `largeur` colonnes d'affichage, au mot
+/// quand c'est possible et au caractère pour un mot trop long.
+///
+/// Retourne les lignes du repli et, pour chaque caractère **et sa fin**, la
+/// `(rangée, colonne)` correspondante. Le rendu et le curseur s'appuient ainsi
+/// sur le même calcul : ils restent bord à bord à toute largeur, ce qu'un
+/// `Paragraph::wrap` ne permettrait pas de retrouver côté curseur.
+fn replier_texte(texte: &str, largeur: usize) -> (Vec<String>, Vec<(usize, usize)>)
+  {
+    let largeur = largeur.max(1);
+    let caracteres: Vec<char> = texte.chars().collect();
+    let mut lignes: Vec<String> = vec![String::new()];
+    let mut positions: Vec<(usize, usize)> = Vec::with_capacity(caracteres.len() + 1);
+    let mut rangee = 0usize;
+    let mut colonne = 0usize;
+    let mut i = 0usize;
+    while i < caracteres.len()
+      {
+        let c = caracteres[i];
+        if c == ' '
+          {
+            // L'espace est ignorée en tête de ligne ; ailleurs elle n'est posée
+            // que si le mot suivant tient derrière elle, pour ne pas rester
+            // seule en fin de ligne.
+            let mut j = i + 1;
+            while j < caracteres.len() && caracteres[j] == ' '
+              {
+                j += 1;
+              }
+            let largeur_mot: usize = caracteres[j..]
+              .iter()
+              .take_while(|&&x| x != ' ')
+              .map(|&x| largeur_cellule(x))
+              .sum();
+            if colonne == 0 || j >= caracteres.len() || colonne + 1 + largeur_mot <= largeur
+              {
+                if colonne > 0
+                  {
+                    lignes[rangee].push(' ');
+                    colonne += 1;
+                  }
+                positions.push((rangee, colonne.saturating_sub(1)));
+              }
+            else
+              {
+                rangee += 1;
+                lignes.push(String::new());
+                colonne = 0;
+                positions.push((rangee, colonne));
+              }
+            i += 1;
+            continue;
+          }
+        let lc = largeur_cellule(c);
+        if colonne > 0 && colonne + lc > largeur
+          {
+            rangee += 1;
+            lignes.push(String::new());
+            colonne = 0;
+          }
+        lignes[rangee].push(c);
+        positions.push((rangee, colonne));
+        colonne += lc;
+        i += 1;
+      }
+    positions.push((rangee, colonne));
+    (lignes, positions)
   }
 
 /// Bloc « Synthèse » : le travail accompli et ce qu'il a coûté, en un seul
@@ -2346,11 +2691,13 @@ mod tests
     /// `Fenetre`) : ligne `i` = rangée `area.y + i`. Le calcul comptait la
     /// bordure en plus et posait le curseur une rangée trop bas — sur le champ
     /// suivant, ou sur le pied quand on éditait le dernier.
+    /// « Enregistrer ? » est un choix, pas un champ texte : seuls Version,
+    /// Statut et Description portent un curseur.
     #[test]
     fn le_curseur_du_popup_se_pose_sur_la_ligne_du_champ()
       {
         let (app, _dir) = app_de_test("curseur-popup");
-        let libelles = ["Version Debug", "Statut Debug", "Description", "Enregistrer ?"];
+        let libelles = ["Version Debug", "Statut Debug", "Description"];
         for (champ, libelle) in libelles.iter().enumerate()
           {
             let mut popup = popup_de_test(&app, crate::Onglet::Projet);
@@ -2368,22 +2715,64 @@ mod tests
           }
       }
 
-    /// Un champ ne doit pas changer de rangée quand sa valeur déborde : avec
-    /// un retour automatique, la description longue poussait « Enregistrer ? »
-    /// vers le bas, et le curseur (calculé sur l'index) restait derrière.
+    /// Une description longue se replie dans sa zone dédiée : « Enregistrer ? »
+    /// garde sa rangée fixe, et le texte se lit en entier, ligne après ligne,
+    /// au lieu d'être tronqué à droite.
     #[test]
     fn une_description_longue_ne_deplace_pas_les_lignes_suivantes()
       {
         let (mut app, _dir) = app_de_test("desc-longue");
-        app.projects[0].description = "x".repeat(300);
-        let popup = popup_de_test(&app, crate::Onglet::Projet);
-        let buf = popup_dans_buffer(&app, &popup, 110, 34);
-        let description = rang(&buf, "Description").expect("la ligne Description doit être là");
-        let enregistrer = rang(&buf, "Enregistrer ?")
-            .expect("la ligne Enregistrer doit être là");
+        let rendre = |app: &mut crate::App, desc: &str| -> Buffer
+          {
+            app.projects[0].description = desc.to_string();
+            let popup = popup_de_test(app, crate::Onglet::Projet);
+            popup_dans_buffer(app, &popup, 110, 34)
+          };
+        let courte = rendre(&mut app, "court");
+        let longue = rendre(&mut app, &"x".repeat(300));
+
+        let enregistrer = |b: &Buffer| rang(b, "Enregistrer ?")
+            .unwrap_or_else(|| panic!("la ligne Enregistrer doit être là :\n{}", texte(b)));
         assert_eq!(
-            enregistrer, description + 1,
-            "la description longue ne doit pas décaler la ligne suivante :\n{}",
+            enregistrer(&courte), enregistrer(&longue),
+            "une description longue ne doit pas décaler « Enregistrer ? » :\n{}",
+            texte(&longue)
+        );
+
+        let description =
+          rang(&longue, "Description").expect("la ligne Description doit être là");
+        assert!(
+            colonne(&ligne(&longue, description + 1), "xxxx").is_some(),
+            "la description longue doit se poursuivre sur la ligne suivante :\n{}",
+            texte(&longue)
+        );
+      }
+
+    /// Pendant l'édition d'une description plus longue que sa zone, le curseur
+    /// reste visible : la zone défile automatiquement jusqu'au bas, au lieu de
+    /// laisser le curseur hors des lignes rendues.
+    #[test]
+    fn le_curseur_reste_visible_dans_une_description_tres_longue()
+      {
+        let (mut app, _dir) = app_de_test("desc-defile");
+        let texte_long = "x".repeat(5000);
+        app.projects[0].description = texte_long.clone();
+        let mut popup = popup_de_test(&app, crate::Onglet::Projet);
+        popup.projet.editing = true;
+        popup.projet.active_field = 2;
+        popup.projet.input_buffer = texte_long.clone();
+        popup.projet.input_offset = texte_long.chars().count();
+        let (buf, (_, curseur_y)) = popup_avec_curseur(&app, &popup, 110, 34);
+        let enregistrer =
+          rang(&buf, "Enregistrer ?").expect("Enregistrer doit rester visible");
+        assert_eq!(
+            curseur_y, enregistrer - 1,
+            "le curseur doit se poser au bas de la zone, juste au-dessus d'Enregistrer :\n{}",
+            texte(&buf)
+        );
+        assert!(
+            ligne(&buf, curseur_y).contains(&'x'),
+            "la zone doit avoir défilé jusqu'à la fin de la description :\n{}",
             texte(&buf)
         );
       }
@@ -2416,8 +2805,9 @@ mod tests
           }
       }
 
-    /// Même règle sans retour automatique : un chemin très long est tronqué à
-    /// droite, et la confirmation finale reste à sa place.
+    /// Un chemin très long reste tronqué à droite, et la confirmation finale
+    /// garde sa rangée. L'écart ID → « Ouvrir ? » inclut la zone fixe de la
+    /// Description (libellé + deux lignes) : 8 rangées au total.
     #[test]
     fn une_valeur_longue_ne_deplace_pas_la_confirmation()
       {
@@ -2427,9 +2817,33 @@ mod tests
         let id = rang(&buf, "ID").expect("la ligne ID doit être là");
         let ouvrir = rang(&buf, "Ouvrir ?").expect("la ligne Ouvrir doit être là");
         assert_eq!(
-            ouvrir, id + 6,
+            ouvrir, id + 8,
             "le chemin long ne doit pas décaler les lignes suivantes :\n{}",
             texte(&buf)
+        );
+      }
+
+    /// La Description du formulaire de création se replie dans sa zone fixe :
+    /// le début se lit sur la ligne du libellé, la suite en dessous, et les
+    /// champs suivants gardent leur rangée.
+    #[test]
+    fn une_description_longue_se_replie_dans_le_formulaire_de_creation()
+      {
+        let courte = creation_dans_buffer(&saisie_en_cours("", 0)).0;
+        let mut state = saisie_en_cours("", 0);
+        state.description = "y".repeat(200);
+        let (longue, _) = creation_dans_buffer(&state);
+        assert_eq!(
+            rang(&courte, "Ouvrir ?"), rang(&longue, "Ouvrir ?"),
+            "la description longue ne doit pas décaler « Ouvrir ? » :\n{}",
+            texte(&longue)
+        );
+        let description =
+          rang(&longue, "Description").expect("la ligne Description doit être là");
+        assert!(
+            colonne(&ligne(&longue, description + 1), "yyy").is_some(),
+            "la description doit se poursuivre sous sa ligne :\n{}",
+            texte(&longue)
         );
       }
 
@@ -3306,6 +3720,7 @@ mod tests
             "popup parametres",
             InputMode::Popup(crate::Popup::sans_projet(crate::Onglet::Parametres, "FRA".into())),
           ),
+          ("cohérence", InputMode::Coherence(crate::CoherenceState::default())),
         ]
       }
 

@@ -216,15 +216,42 @@ fn default_tarif_mode() -> String {
 /// recompilé (mtime égal à `compile_secs`, version compilée égale à `version`),
 /// les métadonnées de la variante ne doivent pas bouger. Une fiche présente et
 /// cohérente immunise le registre contre toute écriture manuelle non marquée ;
-/// une fiche absente laisse la sonde `lire_version_compilee` trancher.
+/// une fiche absente laisse la sonde `variante::lire_etat_variante` trancher.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub(crate) struct SnapshotCompile {
     /// Version compilée du binaire au moment du build validé.
     pub(crate) version: String,
     /// Statut affiché par le binaire (`env!("CARGO_PKG_VERSION")`-age du menu).
     pub(crate) statut: String,
+    /// Date de dernière mise à jour déclarée (`jj-mm-yyyy`), vide hors contrat.
+    /// Champ ajouté après coup : les anciennes fiches le migrent vide.
+    #[serde(default)]
+    pub(crate) date: String,
     /// Vérité du disque : horodatage (epoch secondes) du binaire mis en build.
     pub(crate) compile_secs: u64,
+    /// Empreinte SHA-256 de la ligne `-V`, signal fin de départage (§B7). Vide
+    /// hors contrat et sur les fiches antérieures à son introduction.
+    #[serde(default)]
+    pub(crate) empreinte_v: String,
+}
+
+/// Refus utilisateur d'une action de cohérence, conservé pour re-notification.
+///
+/// Le refus se rattache à la **clé de l'écart** (voir `coherence::Ecart::cle`) :
+/// tant que l'écart reste identique, la proposition est re-présentée marquée
+/// « refusée » ; si l'écart change, la clé change et le refus ne s'applique
+/// plus.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub(crate) struct RefusCoherence {
+    /// Clé de l'écart refusé.
+    #[serde(default)]
+    pub(crate) ecart: String,
+    /// Code stable de l'action refusée (voir `coherence::Action::code`).
+    #[serde(default)]
+    pub(crate) action: String,
+    /// Date du refus (`jj-mm-yyyy`).
+    #[serde(default)]
+    pub(crate) quand: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -331,6 +358,10 @@ pub(crate) struct Project {
     /// projet hors de cette racine.
     #[serde(default)]
     est_bibliotheque: bool,
+    /// Refus de cohérence conservés (voir [`RefusCoherence`]). Gérés par
+    /// [`save_refus`], préservés par [`save_registry_full`].
+    #[serde(default)]
+    refus_coherence: Vec<RefusCoherence>,
 }
 
 fn default_true() -> bool {
@@ -1739,6 +1770,59 @@ pub(crate) fn save_preferences(path: &Path, prefs: &Preferences) -> Result<()> {
     ecrire_registry_atomique(path, &registry)
 }
 
+/// Charge les refus de cohérence de tous les projets (id → refus).
+///
+/// Un registre illisible ne fait pas échouer le chargement : le menu démarre
+/// avec des refus vides, perdant tout au plus une re-notification.
+pub(crate) fn load_refus(path: &Path) -> HashMap<String, Vec<RefusCoherence>>
+  {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Registry>(&s).ok())
+        .map(|r| {
+            r.projects
+              .into_iter()
+              .filter(|(_, p)| !p.refus_coherence.is_empty())
+              .map(|(id, p)| (id, p.refus_coherence))
+              .collect()
+        })
+        .unwrap_or_default()
+  }
+
+/// Écrit les refus de cohérence par projet, en préservant tout le reste.
+///
+/// Comme [`save_preferences`], passe par un registre complet lu puis réécrit :
+/// `ProjectEntry` est une vue d'usage et n'a pas à porter les refus.
+pub(crate) fn save_refus(
+    path: &Path,
+    refus: &HashMap<String, Vec<RefusCoherence>>,
+) -> Result<()>
+  {
+    ensure_regular(path)?;
+    let existant = fs::read_to_string(path).unwrap_or_default();
+    let mut registry: Registry = serde_json::from_str(&existant).unwrap_or_default();
+    for (id, liste) in refus
+      {
+        if let Some(p) = registry.projects.get_mut(id)
+          {
+            p.refus_coherence = liste.clone();
+          }
+      }
+    // Un projet sans refus doit voir les siens effacés, sinon un refus levé
+    // resterait écrit.
+    let connus: Vec<String> = registry.projects.keys().cloned().collect();
+    for id in connus
+      {
+        if !refus.contains_key(&id)
+            && let Some(p) = registry.projects.get_mut(&id)
+            && !p.refus_coherence.is_empty()
+          {
+            p.refus_coherence.clear();
+          }
+      }
+    ecrire_registry_atomique(path, &registry)
+}
+
 /// Écrit le registre par fichier temporaire puis renommage.
 ///
 /// Le nom du temporaire porte l'identifiant du processus : deux instances du
@@ -1934,6 +2018,12 @@ pub(crate) fn save_registry_full(
             total_valorisation: p.total_valorisation.clone(),
             tarif_resume: p.tarif_resume.clone(),
             est_bibliotheque: p.est_bibliotheque,
+            // Les refus de cohérence sont gérés par `save_refus`, jamais par la
+            // vue d'usage `ProjectEntry` : on préserve la valeur persistée.
+            refus_coherence: existants
+                .get(&p.id)
+                .map(|o| o.refus_coherence.clone())
+                .unwrap_or_default(),
         };
         garder_metadonnees(&p.id, existants.get(&p.id), &mut projet, &acceptees, &mut alertes);
         map.insert(p.id.clone(), projet);
@@ -2328,9 +2418,9 @@ mod tests
 
     use super::{
         accepter_modification, default_tarif_mode, default_web_country, load_preferences,
-        load_registry, load_web_cache, montant_local, save_preferences, save_registry_full,
-        Preferences, Result, SnapshotCompile, TarifPoint, Tri, validate_status, validate_version,
-        ProjectEntry, STATUSES, WebCache,
+        load_refus, load_registry, load_web_cache, montant_local, save_preferences, save_refus,
+        save_registry_full, Preferences, RefusCoherence, Result, SnapshotCompile, TarifPoint, Tri,
+        validate_status, validate_version, ProjectEntry, STATUSES, WebCache,
     };
 
     fn temp_registry(name: &str) -> PathBuf {
@@ -2352,6 +2442,37 @@ mod tests
         let prefs = load_preferences(path);
         save_registry_full(path, projects, &web, &prefs).map(|_| ())
     }
+
+    /// Un refus enregistré doit survivre à une réécriture du registre, qui ne
+    /// connaît que la vue d'usage `ProjectEntry` et ignore les refus.
+    #[test]
+    fn les_refus_survivent_a_une_reecriture_du_registre()
+      {
+        let dir = temp_registry("refus-survit");
+        let path = dir.join("projects.json");
+        let projets = vec![entree("a", "1.0.0", "1.0.0")];
+        save_registry(&path, &projets).unwrap();
+
+        let mut refus = HashMap::new();
+        refus.insert("a".to_string(), vec![RefusCoherence {
+            ecart: "sources>debug".to_string(),
+            action: "rebuild-debug".to_string(),
+            quand: "15-10-2026".to_string(),
+        }]);
+        save_refus(&path, &refus).unwrap();
+
+        // Une écriture ultérieure, qui ignore les refus, les préserve.
+        save_registry(&path, &projets).unwrap();
+        let relus = load_refus(&path);
+        assert_eq!(relus.get("a").map(Vec::len), Some(1), "refus préservé");
+        assert_eq!(relus["a"][0].action, "rebuild-debug");
+        assert_eq!(relus["a"][0].quand, "15-10-2026");
+
+        // Un refus levé disparaît du fichier, sinon il resterait écrit.
+        refus.remove("a");
+        save_refus(&path, &refus).unwrap();
+        assert!(load_refus(&path).is_empty(), "refus levé effacé");
+      }
 
     /// Les dossiers de sauvegarde placés sous `src/` ne doivent pas changer
     /// le hash de sources : Rust ne les compile pas, mais une retouche dans
@@ -3816,12 +3937,16 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
         e.debug_snapshot = Some(SnapshotCompile {
             version: "0.0.1".to_string(),
             statut: "Release".to_string(),
+            date: "09-10-2026".to_string(),
             compile_secs: 1_700_000_000,
+            empreinte_v: "abc123".to_string(),
         });
         e.release_snapshot = Some(SnapshotCompile {
             version: "0.20.24".to_string(),
             statut: "Beta-Release".to_string(),
+            date: "14-10-2026".to_string(),
             compile_secs: 1_700_000_100,
+            empreinte_v: "def456".to_string(),
         });
         save_registry_full(&path, &[e.clone()], &WebCache::default(), &Preferences::default())
           .unwrap()
@@ -3854,6 +3979,37 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
         assert_eq!(relu[0].debug_snapshot, None);
         assert_eq!(relu[0].release_snapshot, None);
         assert_eq!(relu[0].version_debug, "1.0.0", "champs historiques conservés");
+        fs::remove_dir_all(&dir).unwrap();
+      }
+
+    /// Une fiche écrite avant l'ajout de `date`/`empreinte_v` se recharge avec
+    /// ces champs vides : la garde pourra les compléter depuis le binaire.
+    #[test]
+    fn fiche_ancienne_sans_date_ni_empreinte_migre_vide()
+      {
+        let dir = temp_registry("snap-champs-neufs");
+        let path = dir.join("opencode/projects.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+          &path,
+          serde_json::json!({
+              "projects": { "v": {
+                  "name": "v", "path": "/tmp/v", "description": "",
+                  "version": "1.0.0", "version_debug": "1.0.0",
+                  "debug_snapshot": {
+                      "version": "1.0.0", "statut": "Debug", "compile_secs": 42
+                  } } }
+          })
+          .to_string(),
+        )
+        .unwrap();
+        let relu = load_registry(&path).unwrap();
+        let fiche = relu[0].debug_snapshot.clone().expect("fiche conservée");
+        assert_eq!(fiche.version, "1.0.0");
+        assert_eq!(fiche.statut, "Debug");
+        assert_eq!(fiche.compile_secs, 42);
+        assert!(fiche.date.is_empty(), "date migrée vide");
+        assert!(fiche.empreinte_v.is_empty(), "empreinte migrée vide");
         fs::remove_dir_all(&dir).unwrap();
       }
 
