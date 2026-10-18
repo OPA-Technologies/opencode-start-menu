@@ -781,14 +781,14 @@ fn set_manifest_version(dir: &Path, version: &str) -> Result<bool>
     rewrite_manifest_version(dir, version)
   }
 
-/// Synchronise la version du projet menu (opencode-start-menu) avec
-/// la version du binaire (CARGO_PKG_VERSION). Appelé au démarrage.
-/// Ne synchronise QUE si la version binaire est PLUS RÉCENTE que le registre
+/// Synchronise la base de l'entrée menu (opencode-start-menu) sur la version
+/// du binaire en cours (`CARGO_PKG_VERSION`), si elle est plus récente
 /// (semver), ou si le registre est vide. Ne JAMAIS écraser un bump AutoPatch.
 ///
-/// Le statut n'est PAS écrit ici : c'était un artefact (« Beta-Release » codé
-/// en dur) qui falsifiait la variante Release. La variante Debug reflète la
-/// version compilée — c'est la vérité du disque — et rien d'autre.
+/// Rattrapage de base en lecture seule : le manifeste n'est PAS réécrit ici —
+/// la seule écriture de source est l'édition manuelle du popup. Le statut
+/// n'est pas écrit non plus : c'était un artefact (« Beta-Release » codé en
+/// dur) qui falsifiait la variante Release.
 fn sync_menu_project_version(app: &mut App) -> Result<()>
   {
     let expected_version = env!("CARGO_PKG_VERSION");
@@ -829,9 +829,9 @@ fn sync_menu_project_version(app: &mut App) -> Result<()>
                     empreinte_v,
                 });
             }
-            // Sync auto vers CARGO_PKG_VERSION ≠ édition manuelle utilisateur
-            // Ne PAS toucher à version_manually_edited ici.
-            let _ = set_manifest_version(&p.path, &p.version_debug);
+            // Sync auto vers CARGO_PKG_VERSION ≠ édition manuelle utilisateur :
+            // seule la base suit, le manifeste reste tel quel (doctrine —
+            // seule l'édition popup écrit la source).
             // Persister la mise à jour dans le registre.
             let alertes = registry::save_registry_full(&app.registry_path, &app.projects, &app.web_cache, &app.prefs)?;
             if !alertes.is_empty() {
@@ -4979,10 +4979,12 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
         return false;
     }
     // Édition utilisateur explicite (popup nouveau) : mutation déclarée.
+    let ancienne_version = p.version_debug.clone();
     registry::accepter_modification(format!("{}:version_debug", p.id));
     registry::accepter_modification(format!("{}:status_debug", p.id));
     registry::accepter_modification(format!("{}:version", p.id));
     registry::accepter_modification(format!("{}:status", p.id));
+    registry::accepter_modification(format!("{}:date_debug", p.id));
     p.version_debug = state.pending_version.clone();
     p.status_debug = state.pending_status.clone();
     p.description = state.pending_description.clone();
@@ -4991,13 +4993,31 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     // Champs historiques alignés sur la variante élue (Debug).
     p.version = p.version_debug.clone();
     p.status = p.status_debug.clone();
+    // L'édition écrit la SOURCE et rien d'autre : constantes du contrat dans
+    // le module principal, manifeste Cargo, date du jour. Aucun rebuild — le
+    // binaire suivra à la compilation suivante, la source déclarée fait foi.
     if registry::validate_version(&p.version_debug) {
-        // Le drapeau « édité manuellement » n'a de sens que si l'édition a
-        // réellement modifié le manifeste : sinon il resterait levé et
-        // avalerait le prochain vrai bump.
-        let avant = registry::compute_source_hash(&p.path);
+        let date = registry::date_du_jour();
         let _ = set_manifest_version(&p.path, &p.version_debug);
-        if registry::compute_source_hash(&p.path) != avant {
+        // Un projet sans module Rust (ou non inscriptible) conserve son
+        // édition en base : l'écart sera exposé par la conformité.
+        if conformite::ecrire_constantes(
+            &p.path,
+            &p.version_debug,
+            &p.status_debug,
+            &date,
+        )
+        .is_ok()
+        {
+            p.date_debug = date;
+        }
+        // Le hash suit la source réécrite : sans cela, le rescan y verrait
+        // une modification légitime et rebumperait à la session suivante.
+        p.source_hash = registry::compute_source_hash(&p.path);
+        // Le drapeau « édité manuellement » supprime le prochain bump
+        // AutoPatch : il ne se lève que si la version a réellement changé,
+        // sinon il avalerait le prochain vrai bump.
+        if p.version_debug != ancienne_version {
             p.version_manually_edited = true;
         }
     }
@@ -6614,6 +6634,91 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         });
         fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
         crate::App::new_light(registre, SortOrder::Modified)
+      }
+
+    /// L'édition du popup écrit la SOURCE : les trois constantes du contrat
+    /// dans le module principal, la date du jour, aucun rebuild. La base
+    /// suit, la Release reste intacte.
+    #[test]
+    fn l_edition_ecrit_les_constantes_de_la_source()
+      {
+        let mut app = app_avec_projet();
+        let projet = app.projects[0].path.clone();
+        fs::create_dir_all(projet.join("src")).unwrap();
+        fs::write(
+          projet.join("src/main.rs"),
+          "const RELEASE: &str = \"1.0.0\";\nfn main() {}\n",
+        )
+        .unwrap();
+        let mut state = super::ProjectEditState::from_project(&app.projects[0], 0);
+        state.pending_version = "2.0.0".to_string();
+        state.pending_status = "Stable".to_string();
+
+        assert!(super::apply_edit(&mut app, &state), "l'édition est acceptée");
+
+        let source = fs::read_to_string(projet.join("src/main.rs")).unwrap();
+        assert!(source.contains("const RELEASE: &str = \"2.0.0\";"), "{source}");
+        assert!(source.contains("const STATUT: &str = \"Stable\";"), "{source}");
+        assert!(
+          source.contains(&format!(
+            "const DATE_LAST_MAJ: &str = \"{}\";",
+            super::registry::date_du_jour()
+          )),
+          "la date du jour est déclarée : {source}"
+        );
+        let p = &app.projects[0];
+        assert_eq!(p.version_debug, "2.0.0");
+        assert_eq!(p.status_debug, "Stable");
+        assert_eq!(p.date_debug, super::registry::date_du_jour());
+        assert!(p.version_manually_edited, "version changée : drapeau levé");
+        // La Release n'est jamais miroir du Debug.
+        assert!(p.version_release.is_empty());
+        // Le hash décrit la source réécrite : pas de faux bump au rescan.
+        assert_eq!(
+          p.source_hash,
+          super::registry::compute_source_hash(&projet)
+        );
+      }
+
+    /// Un projet sans module Rust conserve son édition en base : rien à
+    /// écrire dans une source que op ne connaît pas, sans erreur.
+    #[test]
+    fn l_edition_d_un_projet_sans_module_reste_en_base()
+      {
+        let mut app = app_avec_projet();
+        let mut state = super::ProjectEditState::from_project(&app.projects[0], 0);
+        state.pending_version = "3.1.4".to_string();
+        state.pending_status = "Deprecated".to_string();
+
+        assert!(super::apply_edit(&mut app, &state));
+        assert_eq!(app.projects[0].version_debug, "3.1.4");
+        assert_eq!(app.projects[0].status_debug, "Deprecated");
+      }
+
+    /// Un simple changement de statut (version inchangée) écrit la source
+    /// sans lever le drapeau anti-bump : le prochain bump reste légitime.
+    #[test]
+    fn un_changement_de_statut_seul_ne_leve_pas_le_drapeau()
+      {
+        let mut app = app_avec_projet();
+        let projet = app.projects[0].path.clone();
+        fs::create_dir_all(projet.join("src")).unwrap();
+        fs::write(
+          projet.join("src/main.rs"),
+          "const RELEASE: &str = \"1.0.0\";\nfn main() {}\n",
+        )
+        .unwrap();
+        let mut state = super::ProjectEditState::from_project(&app.projects[0], 0);
+        state.pending_version = "1.0.0".to_string();
+        state.pending_status = "Deprecated".to_string();
+
+        assert!(super::apply_edit(&mut app, &state));
+        let source = fs::read_to_string(projet.join("src/main.rs")).unwrap();
+        assert!(source.contains("const STATUT: &str = \"Deprecated\";"), "{source}");
+        assert!(
+          !app.projects[0].version_manually_edited,
+          "version inchangée : pas de drapeau"
+        );
       }
 
     /// Un projet neuf n'a aucune Release : sans binaire release, version et

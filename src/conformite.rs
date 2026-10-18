@@ -116,6 +116,35 @@ pub(crate) fn conformer_constantes(
     (out, modifie)
   }
 
+/// Écrit dans le module principal du projet les trois constantes du contrat,
+/// pour la variante élue (Debug). Aucun rebuild : la source est la vérité
+/// déclarée, le binaire suivra à la compilation suivante.
+///
+/// Renvoie `true` si le fichier a été modifié. Un projet sans module
+/// principal (bibliothèque seule, projet non-Rust) est laissé intact — son
+/// édition de source relève de son propre format, pas des constantes Rust.
+pub(crate) fn ecrire_constantes(
+    dir: &Path,
+    version: &str,
+    statut: &str,
+    date: &str,
+) -> std::io::Result<bool>
+  {
+    let Some(module) = module_principal(dir)
+      else
+        {
+          return Ok(false);
+        };
+    let contenu = std::fs::read_to_string(&module)?;
+    let (nouveau, modifie) = conformer_constantes(&contenu, version, statut, date);
+    if !modifie
+      {
+        return Ok(false);
+      }
+    std::fs::write(&module, nouveau)?;
+    Ok(true)
+  }
+
 /// La constante `nom` est-elle déclarée dans le contenu ?
 fn contient_constante(contenu: &str, nom: &str) -> bool
   {
