@@ -812,7 +812,8 @@ fn sync_menu_project_version(app: &mut App) -> Result<()>
                 p.last_compile_debug_secs = t;
                 // La date et l'empreinte viennent du binaire lui-même ; à
                 // défaut de sonde, les constantes compilées du menu font foi.
-                let (date, empreinte_v) = match variante::lire_variante(&p.path, "debug")
+                let (date, empreinte_v) =
+                    match variante::lire_variante_avec_sonde(&p.path, "debug", p.sonde("debug"))
                   {
                     Some(l) => (l.etat.date, l.empreinte),
                     None => (
@@ -871,7 +872,7 @@ fn version_greater(a: &str, b: &str) -> bool {
 ///
 /// Variante Release : aucun chemin légitime ne l'écrit sans reconstruction.
 /// Dès qu'une vérité est connue — snapshot cohérent avec le binaire, ou, à
-/// défaut de fiche, la version réellement compilée (`variante::lire_etat_variante`) —
+/// défaut de fiche, la version réellement compilée (sonde `-V`) —
 /// une valeur divergente est rendue.
 ///
 /// Variante Debug : la seule incohérence sûre est une version relancée PLUS
@@ -889,6 +890,8 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
     for p in app.projects.iter_mut() {
         let id = p.id.clone();
         let chemin = p.path.clone();
+        let sonde_release = p.probe_release.clone();
+        let sonde_debug = p.probe_debug.clone();
         let t_release = registry::variant_modified_time(&chemin, "release")
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()));
         let t_debug = registry::variant_modified_time(&chemin, "debug")
@@ -919,7 +922,11 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
                 // sa sonde `-V` complète la fiche, sans toucher version ni
                 // statut — la Release reste immuable hors reconstruction.
                 if snap.empreinte_v.is_empty()
-                    && let Some(l) = variante::lire_variante(&chemin, "release")
+                    && let Some(l) = variante::lire_variante_avec_sonde(
+                        &chemin,
+                        "release",
+                        (!sonde_release.is_empty()).then_some(sonde_release.as_str()),
+                    )
                     && let Some(fiche) = p.release_snapshot.as_mut()
                 {
                     registry::accepter_modification(format!("{id}:release_snapshot"));
@@ -933,7 +940,13 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
             }
             // binaire plus récent que la fiche : le rattrapage du rescan fera
             // foi, on ne force rien ici.
-        } else if let Some(v) = variante::lire_etat_variante(&chemin, "release").map(|e| e.version) {
+        } else if let Some(v) = variante::lire_variante_avec_sonde(
+            &chemin,
+            "release",
+            (!sonde_release.is_empty()).then_some(sonde_release.as_str()),
+        )
+        .map(|l| l.etat.version)
+        {
             // Pas de fiche : le binaire est le seul témoin fiable (sonde).
             if p.version_release != v {
                 registry::accepter_modification(format!("{id}:version_release"));
@@ -964,7 +977,11 @@ fn valider_metadonnees_chargement(app: &mut App) -> (usize, Vec<String>) {
             // Migration de la fiche Debug (date/empreinte manquantes).
             if snap.empreinte_v.is_empty()
                 && t_debug == Some(snap.compile_secs)
-                && let Some(l) = variante::lire_variante(&chemin, "debug")
+                && let Some(l) = variante::lire_variante_avec_sonde(
+                    &chemin,
+                    "debug",
+                    (!sonde_debug.is_empty()).then_some(sonde_debug.as_str()),
+                )
                 && let Some(fiche) = p.debug_snapshot.as_mut()
             {
                 registry::accepter_modification(format!("{id}:debug_snapshot"));
@@ -2533,12 +2550,17 @@ fn executer_rebuild_debug(app: &mut App, id: &str) -> Result<()>
           return Ok(());
         };
     let path = app.projects[idx].path.clone();
+    let sonde = app.projects[idx].probe_debug.clone();
     lancer_cargo(&path, &["build"])?;
-    let Some(lv) = crate::variante::lire_variante(&path, "debug")
-      else
-        {
+    let Some(lv) = crate::variante::lire_variante_avec_sonde(
+        &path,
+        "debug",
+        (!sonde.is_empty()).then_some(sonde.as_str()),
+    )
+    else
+      {
           anyhow::bail!("binaire debug hors contrat après build");
-        };
+      };
     let mtime = registry::variant_modified_time(&path, "debug")
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
         .unwrap_or_else(|| {
@@ -2578,12 +2600,17 @@ fn executer_rebuild_release(app: &mut App, id: &str) -> Result<()>
           return Ok(());
         };
     let path = app.projects[idx].path.clone();
+    let sonde = app.projects[idx].probe_release.clone();
     lancer_cargo(&path, &["build", "--release"])?;
-    let Some(lv) = crate::variante::lire_variante(&path, "release")
-      else
-        {
+    let Some(lv) = crate::variante::lire_variante_avec_sonde(
+        &path,
+        "release",
+        (!sonde.is_empty()).then_some(sonde.as_str()),
+    )
+    else
+      {
           anyhow::bail!("binaire release hors contrat après build");
-        };
+      };
     let mtime = registry::variant_modified_time(&path, "release")
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs()))
         .unwrap_or_else(|| {
@@ -3982,7 +4009,11 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                     if entry.version_debug.is_empty() { entry.version.clone() } else { entry.version_debug.clone() };
                 // Date et empreinte : complément issu du binaire (sonde `-V`).
                 // La version/statut conservent leur sémantique d'avant-bump.
-                let (date, empreinte_v) = match variante::lire_variante(&entry.path, "debug")
+                let (date, empreinte_v) = match variante::lire_variante_avec_sonde(
+                    &entry.path,
+                    "debug",
+                    entry.sonde("debug"),
+                )
                   {
                     Some(l) => (l.etat.date, l.empreinte),
                     None => (String::new(), String::new()),
@@ -4075,7 +4106,11 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                     entry.status_release = entry.status_debug.clone();
                     // Date et empreinte de la Release reconstruite : le binaire
                     // release vient d'être sonde, il déclare sa propre vérité.
-                    let (date, empreinte_v) = match variante::lire_variante(&entry.path, "release")
+                    let (date, empreinte_v) = match variante::lire_variante_avec_sonde(
+                        &entry.path,
+                        "release",
+                        entry.sonde("release"),
+                    )
                       {
                         Some(l) => (l.etat.date, l.empreinte),
                         None => (String::new(), String::new()),
@@ -5804,8 +5839,9 @@ mod tests
             contenu.contains("const STATUT: &str = \"Release\";"),
             "le statut doit être ramené à une valeur connue :\n{contenu}"
         );
-        let etat = crate::variante::lire_etat_variante(&dir, "debug")
-            .expect("le binaire Debug doit publier le contrat");
+        let etat = crate::variante::lire_variante_avec_sonde(&dir, "debug", None)
+            .expect("le binaire Debug doit publier le contrat")
+            .etat;
         assert_eq!(etat.version, "1.0.0");
         assert_eq!(etat.statut, "Release");
         let _ = fs::remove_dir_all(&dir);

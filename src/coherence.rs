@@ -386,7 +386,12 @@ pub(crate) fn observer(entry: &ProjectEntry) -> Observations
               }
             _ =>
               {
-                crate::variante::lire_variante(&entry.path, variante.profil()).map(|l| l.etat)
+                crate::variante::lire_variante_avec_sonde(
+                  &entry.path,
+                  variante.profil(),
+                  entry.sonde(variante.profil()),
+                )
+                .map(|l| l.etat)
               }
           }
     };

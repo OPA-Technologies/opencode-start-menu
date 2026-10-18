@@ -216,7 +216,7 @@ fn default_tarif_mode() -> String {
 /// recompilé (mtime égal à `compile_secs`, version compilée égale à `version`),
 /// les métadonnées de la variante ne doivent pas bouger. Une fiche présente et
 /// cohérente immunise le registre contre toute écriture manuelle non marquée ;
-/// une fiche absente laisse la sonde `variante::lire_etat_variante` trancher.
+/// une fiche absente laisse la sonde `-V` du binaire trancher.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub(crate) struct SnapshotCompile {
     /// Version compilée du binaire au moment du build validé.
@@ -641,6 +641,20 @@ pub(crate) struct ProjectEntry {
     /// Pays ISO3 auquel se rapporte la série du projet.
     pub(crate) tarif_web_pays: String,
 }
+
+impl ProjectEntry
+  {
+    /// Commande de sonde `-V` réglée pour une variante (`debug`/`release`).
+    ///
+    /// Renvoie `None` quand rien n'est personnalisé : la sonde auto
+    /// (`target/<profil>/<binaire>`) reprend la main.
+    pub(crate) fn sonde(&self, profil: &str) -> Option<&str>
+      {
+        let commande = if profil == "release" { &self.probe_release } else { &self.probe_debug };
+        let t = commande.trim();
+        (!t.is_empty()).then_some(t)
+      }
+  }
 
 pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
     ensure_regular(path)?;

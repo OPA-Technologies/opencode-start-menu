@@ -50,33 +50,61 @@ pub(crate) fn parser_etat_variante(sortie: &str) -> Option<EtatVariante>
       })
   }
 
-/// Interroge le binaire d'une variante (`debug`/`release`) de `dir`.
+/// Sonde une variante avec la commande personnalisée du projet, si réglée.
 ///
-/// Renvoie `None` si le binaire n'existe pas, ne répond pas avant 2 s, échoue,
+/// `sonde` vient des champs `probe_debug`/`probe_release` du registre : une
+/// commande complète (`./bin/mreport -V`, `/usr/local/bin/foo --version`)
+/// exécutée depuis la racine du projet. Vide ou absente : la cible auto
+/// `target/<profil>/<binaire>` reprend la main.
+///
+/// Renvoie `None` si la cible n'existe pas, ne répond pas avant 2 s, échoue,
 /// ou ne publie aucun état lisible.
-pub(crate) fn lire_etat_variante(dir: &Path, profil: &str) -> Option<EtatVariante>
+pub(crate) fn lire_variante_avec_sonde(
+  dir: &Path,
+  profil: &str,
+  sonde: Option<&str>,
+  ) -> Option<LectureVariante>
   {
-    lire_variante(dir, profil).map(|l| l.etat)
-  }
-
-/// Interroge le binaire d'une variante et rend son état et l'empreinte `-V`.
-///
-/// Même contrat que [`lire_etat_variante`], mais conserve en plus l'empreinte
-/// de la sortie : elle sert de signal fin de départage quand deux fiches
-/// partagent la même date de dernière mise à jour.
-pub(crate) fn lire_variante(dir: &Path, profil: &str) -> Option<LectureVariante>
-  {
-    let binaire = dir.join("target").join(profil).join(nom_binaire(dir)?);
-    if !binaire.is_file()
+    let commande = sonde.map(str::trim).filter(|c| !c.is_empty());
+    let sortie = match commande
       {
-        return None;
-      }
-    let sortie = interroger_version(&binaire)?;
+        Some(cmd) => interroger_commande(dir, cmd),
+        None =>
+          {
+            let binaire = cible_auto(dir, profil)?;
+            interroger_version(dir, &binaire)
+          }
+      }?;
     let etat = parser_etat_variante(&sortie)?;
     Some(LectureVariante {
         empreinte: empreinte_v(&sortie),
         etat,
       })
+  }
+
+/// Cible auto d'une variante : binaire Cargo, sinon artefact non-Cargo.
+///
+/// Un projet sans manifeste (script, outil multi-langages) expose quand même
+/// ses variantes sous `target/<profil>/`, sous le nom de son dossier : la
+/// structure disque est unifiée pour tous les projets.
+fn cible_auto(dir: &Path, profil: &str) -> Option<std::path::PathBuf>
+  {
+    let base = dir.join("target").join(profil);
+    if let Some(nom) = nom_binaire(dir)
+      {
+        let chemin = base.join(nom);
+        if chemin.is_file()
+          {
+            return Some(chemin);
+          }
+      }
+    let nom = dir.file_name()?.to_string_lossy().to_string();
+    if nom.is_empty()
+      {
+        return None;
+      }
+    let chemin = base.join(nom);
+    chemin.is_file().then_some(chemin)
   }
 
 /// Empreinte SHA-256 de la première ligne non vide de la sortie `-V`.
@@ -137,15 +165,39 @@ fn nom_binaire(dir: &Path) -> Option<String>
     package_name
   }
 
-/// Lance le binaire avec `-V`, borne à 2 s, et rend sa sortie standard.
-fn interroger_version(binaire: &Path) -> Option<String>
+/// Lance le binaire avec `-V` depuis la racine du projet, borne à 2 s, et
+/// rend sa sortie (stdout **et** stderr : certains outils publient leur
+/// état sur la sortie d'erreur — mreport, par exemple).
+fn interroger_version(dir: &Path, binaire: &Path) -> Option<String>
   {
     let mut enfant = std::process::Command::new(binaire)
         .arg("-V")
+        .current_dir(dir)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
+    attendre_enfant(&mut enfant)
+  }
+
+/// Exécue une commande de sonde personnalisée (`sh -c`) depuis la racine du
+/// projet, bornée à 2 s, et rend stdout+stderr.
+fn interroger_commande(dir: &Path, commande: &str) -> Option<String>
+  {
+    let mut enfant = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(commande)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    attendre_enfant(&mut enfant)
+  }
+
+/// Attend la fin d'un enfant de sonde (2 s max), puis lit ses deux flux.
+fn attendre_enfant(enfant: &mut std::process::Child) -> Option<String>
+  {
     let echeance = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop
       {
@@ -167,6 +219,7 @@ fn interroger_version(binaire: &Path) -> Option<String>
       }
     let mut sortie = String::new();
     enfant.stdout.take()?.read_to_string(&mut sortie).ok()?;
+    enfant.stderr.take()?.read_to_string(&mut sortie).ok()?;
     Some(sortie)
   }
 
@@ -312,5 +365,99 @@ mod tests
         // introuvable : c'est `lire_variante` qui exige un état lisible.
         assert_eq!(empreinte_v(""), empreinte_v("   \n"));
         assert!(parser_etat_variante("").is_none());
+      }
+
+    /// Écrit un exécutable shell jouant le rôle du binaire d'une variante.
+    fn ecrire_binaire(chemin: &Path, corps: &str)
+      {
+        std::fs::create_dir_all(chemin.parent().unwrap()).unwrap();
+        std::fs::write(chemin, format!("#!/bin/sh\n{corps}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(chemin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+      }
+
+    fn repertoire_temp(nom: &str) -> std::path::PathBuf
+      {
+        let dir = std::env::temp_dir().join(format!("op-variante-{nom}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+      }
+
+    /// Projet sans Cargo.toml : l'artefact `target/debug/<nom du dossier>`
+    /// est sondé quand même — la structure disque est unifiée.
+    #[test]
+    fn la_sonde_auto_cible_l_artefact_hors_cargo()
+      {
+        let dir = repertoire_temp("auto-nocargo");
+        let nom = dir.file_name().unwrap().to_string_lossy().to_string();
+        ecrire_binaire(
+          &dir.join("target").join("debug").join(&nom),
+          r#"echo "1.2.3_Debug (01-02-2024)""#,
+        );
+        let lv = lire_variante_avec_sonde(&dir, "debug", None).expect("artefact lisible");
+        assert_eq!(lv.etat.version, "1.2.3");
+        assert_eq!(lv.etat.statut, "Debug");
+        assert_eq!(lv.etat.date, "01-02-2024");
+        // Release absente : rien.
+        assert!(lire_variante_avec_sonde(&dir, "release", None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+      }
+
+    /// Une commande de sonde personnalisée est exécutée depuis la racine du
+    /// projet (le script relit un fichier local pour le prouver).
+    #[test]
+    fn la_sonde_personnalisee_s_execute_depuis_la_racine_du_projet()
+      {
+        let dir = repertoire_temp("sonde-cmd");
+        std::fs::write(dir.join("etat-courant.txt"), "7.7.7_Stable (11-11-2025)").unwrap();
+        let lv = lire_variante_avec_sonde(
+          &dir,
+          "release",
+          Some("cat etat-courant.txt"),
+        )
+        .expect("sortie lisible");
+        assert_eq!(lv.etat.version, "7.7.7");
+        assert_eq!(lv.etat.statut, "Stable");
+        assert_eq!(lv.etat.date, "11-11-2025");
+        let _ = std::fs::remove_dir_all(&dir);
+      }
+
+    /// mreport publie son `-V` sur stderr (avec `\r` de fin de ligne) : les
+    /// deux flux doivent être lus, la sortie d'erreur comprise.
+    #[test]
+    fn la_sonde_lit_aussi_la_sortie_d_erreur()
+      {
+        let dir = repertoire_temp("sonde-stderr");
+        ecrire_binaire(
+          &dir.join("tool"),
+          r#"printf '3.0.0_Beta-Release (05-06-2026)\r\n' 1>&2"#,
+        );
+        let lv = lire_variante_avec_sonde(&dir, "debug", Some("./tool")).expect("stderr lu");
+        assert_eq!(lv.etat.version, "3.0.0");
+        assert_eq!(lv.etat.statut, "Beta-Release");
+        assert_eq!(lv.etat.date, "05-06-2026");
+        let _ = std::fs::remove_dir_all(&dir);
+      }
+
+    /// Deux projets, deux variantes, deux commandes distinctes : la sonde
+    /// réglable reste indépendante par variante.
+    #[test]
+    fn les_sondes_s_independisent_par_variante()
+      {
+        let dir = repertoire_temp("double");
+        ecrire_binaire(&dir.join("out").join("a"), r#"echo "1.0.0_Debug (01-01-2026)""#);
+        ecrire_binaire(&dir.join("out").join("b"), r#"echo "2.0.0_Release (02-02-2026)""#);
+        let debug = lire_variante_avec_sonde(&dir, "debug", Some("out/a"))
+          .expect("debug lisible");
+        let release = lire_variante_avec_sonde(&dir, "release", Some("out/b"))
+          .expect("release lisible");
+        assert_eq!(debug.etat.version, "1.0.0");
+        assert_eq!(release.etat.version, "2.0.0");
+        assert_ne!(debug.empreinte, release.empreinte);
+        let _ = std::fs::remove_dir_all(&dir);
       }
   }
