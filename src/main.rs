@@ -2473,9 +2473,11 @@ fn ouvrir_coherence(app: &mut App) -> InputMode
 
 /// Aligne la base (registre) sur la vérité du disque pour un projet.
 ///
-/// La version et le statut Debug viennent du binaire s'il répond au contrat
-/// `-V`, sinon du manifeste. Les mutations sont déclarées à la garde, puis
-/// persistées.
+/// Rattrapage lecture seule : les deux variantes sont interrogées (fiche si
+/// elle décrit le binaire présent, sinon sonde `-V`), version, statut et
+/// date inclus. Un statut obsolète est effacé quand le binaire n'en déclare
+/// plus ; les champs historiques suivent la variante élue (Debug). Aucune
+/// écriture de source.
 fn executer_maj_base(app: &mut App, id: &str) -> Result<()>
   {
     let Some(idx) = app.projects.iter().position(|p| p.id == id)
@@ -2484,32 +2486,65 @@ fn executer_maj_base(app: &mut App, id: &str) -> Result<()>
           return Ok(());
         };
     let obs = coherence::observer(&app.projects[idx]);
-    let (version, statut) = match &obs.debug
+    // Variante Debug : binaire s'il répond au contrat, sinon manifeste.
+    let (version_d, statut_d, date_d) = match &obs.debug
       {
-        Some(e) if !e.version.is_empty() => (e.version.clone(), e.statut.clone()),
-        _ => (obs.sources_version.clone(), String::new()),
+        Some(e) if !e.version.is_empty() =>
+          (e.version.clone(), e.statut.clone(), e.date.clone()),
+        _ => (obs.sources_version.clone(), String::new(), String::new()),
       };
-    if version.is_empty()
+    if version_d.is_empty()
       {
         anyhow::bail!("aucune version à aligner");
       }
+    // Variante Release : sonde ou fiche, jamais empruntée au Debug.
+    let (version_r, statut_r, date_r) = match &obs.release
+      {
+        Some(e) if !e.version.is_empty() =>
+          (e.version.clone(), e.statut.clone(), e.date.clone()),
+        _ => (String::new(), String::new(), String::new()),
+      };
     registry::accepter_modification(format!("{id}:version_debug"));
-    if !statut.is_empty()
-      {
-        registry::accepter_modification(format!("{id}:status_debug"));
-      }
+    registry::accepter_modification(format!("{id}:status_debug"));
+    registry::accepter_modification(format!("{id}:version"));
+    registry::accepter_modification(format!("{id}:status"));
+    registry::accepter_modification(format!("{id}:version_release"));
+    registry::accepter_modification(format!("{id}:status_release"));
     let p = &mut app.projects[idx];
-    p.version_debug = version;
-    if !statut.is_empty()
+    p.version_debug = version_d.clone();
+    // Le statut suit toujours la vérité sondée, y compris vers le vide :
+    // un statut obsolète ne doit pas survivre à un binaire qui ne le déclare
+    // plus.
+    p.status_debug = statut_d.clone();
+    p.version = version_d;
+    p.status = statut_d;
+    if !version_r.is_empty()
       {
-        p.status_debug = statut;
+        p.version_release = version_r;
+        p.status_release = statut_r;
       }
-    let _ = registry::save_registry_full(
+    // Dates déclarées : la fiche du binaire est la vérité, à défaut la date
+    // est laissée telle quelle (elle sera complétée par le rattrapage).
+    if !date_d.is_empty()
+      {
+        registry::accepter_modification(format!("{id}:date_debug"));
+        p.date_debug = date_d;
+      }
+    if !date_r.is_empty()
+      {
+        registry::accepter_modification(format!("{id}:date_release"));
+        p.date_release = date_r;
+      }
+    let alertes = registry::save_registry_full(
       &app.registry_path,
       &app.projects,
       &app.web_cache,
       &app.prefs,
     )?;
+    if !alertes.is_empty()
+      {
+        app.push_info(alertes.join("  ·  "));
+      }
     Ok(())
   }
 
@@ -2571,9 +2606,17 @@ fn executer_rebuild_debug(app: &mut App, id: &str) -> Result<()>
         });
     registry::accepter_modification(format!("{id}:version_debug"));
     registry::accepter_modification(format!("{id}:status_debug"));
+    registry::accepter_modification(format!("{id}:date_debug"));
+    registry::accepter_modification(format!("{id}:last_compile_debug_secs"));
+    registry::accepter_modification(format!("{id}:debug_snapshot"));
     let p = &mut app.projects[idx];
     p.version_debug = lv.etat.version.clone();
     p.status_debug = lv.etat.statut.clone();
+    if !lv.etat.date.is_empty()
+      {
+        p.date_debug = lv.etat.date.clone();
+      }
+    p.last_compile_debug_secs = mtime;
     p.debug_snapshot = Some(registry::SnapshotCompile {
         version: lv.etat.version.clone(),
         statut: lv.etat.statut.clone(),
@@ -2581,12 +2624,16 @@ fn executer_rebuild_debug(app: &mut App, id: &str) -> Result<()>
         empreinte_v: lv.empreinte.clone(),
         compile_secs: mtime,
     });
-    let _ = registry::save_registry_full(
+    let alertes = registry::save_registry_full(
       &app.registry_path,
       &app.projects,
       &app.web_cache,
       &app.prefs,
     )?;
+    if !alertes.is_empty()
+      {
+        app.push_info(alertes.join("  ·  "));
+      }
     Ok(())
   }
 
@@ -2621,9 +2668,17 @@ fn executer_rebuild_release(app: &mut App, id: &str) -> Result<()>
         });
     registry::accepter_modification(format!("{id}:version_release"));
     registry::accepter_modification(format!("{id}:status_release"));
+    registry::accepter_modification(format!("{id}:date_release"));
+    registry::accepter_modification(format!("{id}:last_compile_release_secs"));
+    registry::accepter_modification(format!("{id}:release_snapshot"));
     let p = &mut app.projects[idx];
     p.version_release = lv.etat.version.clone();
     p.status_release = lv.etat.statut.clone();
+    if !lv.etat.date.is_empty()
+      {
+        p.date_release = lv.etat.date.clone();
+      }
+    p.last_compile_release_secs = mtime;
     p.release_snapshot = Some(registry::SnapshotCompile {
         version: lv.etat.version.clone(),
         statut: lv.etat.statut.clone(),
@@ -2631,12 +2686,16 @@ fn executer_rebuild_release(app: &mut App, id: &str) -> Result<()>
         empreinte_v: lv.empreinte.clone(),
         compile_secs: mtime,
     });
-    let _ = registry::save_registry_full(
+    let alertes = registry::save_registry_full(
       &app.registry_path,
       &app.projects,
       &app.web_cache,
       &app.prefs,
     )?;
+    if !alertes.is_empty()
+      {
+        app.push_info(alertes.join("  ·  "));
+      }
     Ok(())
   }
 
@@ -4018,6 +4077,12 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                     Some(l) => (l.etat.date, l.empreinte),
                     None => (String::new(), String::new()),
                   };
+                // La date déclarée de la variante suit le binaire sondé : le
+                // rattrapage est la seule écriture silencieuse autorisée.
+                if !date.is_empty() {
+                    registry::accepter_modification(format!("{}:date_debug", entry.id));
+                    entry.date_debug = date.clone();
+                }
                 entry.debug_snapshot = Some(registry::SnapshotCompile {
                     version: version_snapshot,
                     statut: entry.status_debug.clone(),
@@ -4115,6 +4180,10 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                         Some(l) => (l.etat.date, l.empreinte),
                         None => (String::new(), String::new()),
                       };
+                    if !date.is_empty() {
+                        registry::accepter_modification(format!("{}:date_release", entry.id));
+                        entry.date_release = date.clone();
+                    }
                     entry.release_snapshot = Some(registry::SnapshotCompile {
                         version: v,
                         statut: entry.status_debug.clone(),
@@ -5866,6 +5935,156 @@ mod tests
         assert_eq!(etat.statut, "Release");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Écrit un exécutable shell jouant le rôle d'un binaire `-V`.
+    fn ecrire_outil(chemin: &Path, ligne: &str)
+      {
+        fs::create_dir_all(chemin.parent().unwrap()).unwrap();
+        fs::write(chemin, format!("#!/bin/sh\necho \"{ligne}\"\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(chemin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+      }
+
+    /// Rattrapage de base : les deux variantes sont alignées sur ce que
+    /// déclarent leurs binaires (ici des sondes personnalisées), dates
+    /// comprises, et un statut obsolète est effacé vers la vérité sondée.
+    #[test]
+    fn maj_base_aligne_les_deux_variantes_et_efface_le_statut_obsolete()
+      {
+        let dir = temp_dir("maj-base");
+        let projet = dir.join("projet");
+        fs::create_dir_all(&projet).unwrap();
+        fs::write(projet.join("Cargo.toml"), "[package]\nname = \"projet\"\n").unwrap();
+        ecrire_outil(&projet.join("tools/d"), "2.0.0_Stable (01-01-2026)");
+        ecrire_outil(&projet.join("tools/r"), "1.5.0_Release (02-02-2026)");
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "description": "",
+                    "version": "0.1.0",
+                    "version_debug": "0.1.0",
+                    "status_debug": "Terminée",
+                    "probe_debug": "./tools/d",
+                    "probe_release": "./tools/r"
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = App::new_light(registre.clone(), SortOrder::Modified);
+
+        super::executer_maj_base(&mut app, "projet").unwrap();
+
+        let p = &app.projects[0];
+        assert_eq!(p.version_debug, "2.0.0", "vérité du binaire Debug");
+        assert_eq!(p.status_debug, "Stable", "le statut obsolète est effacé");
+        assert_eq!(p.date_debug, "01-01-2026");
+        assert_eq!(p.version_release, "1.5.0", "la Release suit sa propre sonde");
+        assert_eq!(p.status_release, "Release");
+        assert_eq!(p.date_release, "02-02-2026");
+        // Champs historiques alignés sur la variante élue (Debug).
+        assert_eq!(p.version, "2.0.0");
+        assert_eq!(p.status, "Stable");
+        // La base écrite survit à la relecture (garde neutralisée par les
+        // déclarations).
+        let relu = super::registry::load_registry(&registre).unwrap();
+        assert_eq!(relu[0].version_debug, "2.0.0");
+        assert_eq!(relu[0].status_debug, "Stable");
+        assert_eq!(relu[0].version_release, "1.5.0");
+        assert_eq!(relu[0].date_release, "02-02-2026");
+        let _ = fs::remove_dir_all(&dir);
+      }
+
+    /// Sans binaire Release, le rattrapage ne prélève rien sur le Debug :
+    /// la Release reste vide, jamais empruntée.
+    #[test]
+    fn maj_base_ne_prete_rien_au_release_sans_binaire()
+      {
+        let dir = temp_dir("maj-base-release-vide");
+        let projet = dir.join("projet");
+        fs::create_dir_all(&projet).unwrap();
+        fs::write(projet.join("Cargo.toml"), "[package]\nname = \"projet\"\n").unwrap();
+        ecrire_outil(&projet.join("tools/d"), "3.0.0_Beta (03-03-2026)");
+        let registre = dir.join("registre.json");
+        let json = serde_json::json!({
+            "projects": {
+                "projet": {
+                    "name": "projet",
+                    "path": projet.to_str().unwrap(),
+                    "description": "",
+                    "version_debug": "0.1.0",
+                    "probe_debug": "./tools/d"
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let mut app = App::new_light(registre, SortOrder::Modified);
+
+        super::executer_maj_base(&mut app, "projet").unwrap();
+
+        let p = &app.projects[0];
+        assert_eq!(p.version_debug, "3.0.0");
+        assert_eq!(p.status_debug, "Beta");
+        assert!(p.version_release.is_empty(), "jamais d'emprunt au Debug");
+        assert!(p.status_release.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+      }
+
+    /// Le rebuild écrit toutes ses métadonnées (base, date, fiche) et les
+    /// déclare à la garde : une relecture du registre ne doit rien
+    /// restaurer — avant correctif, la fiche était rétablie à son ancienne
+    /// valeur en silence.
+    #[test]
+    fn rebuild_debug_persiste_sans_restauration_de_la_garde()
+      {
+        let dir = temp_dir("rebuild-persiste");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+          dir.join("Cargo.toml"),
+          "[package]\nname = \"opreb\"\nversion = \"0.9.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+          dir.join("src/main.rs"),
+          "const RELEASE: &str = \"1.2.3\";\n\
+           const STATUT: &str = \"Debug\";\n\
+           const DATE_LAST_MAJ: &str = \"05-06-2026\";\n\
+           fn main() {\n\
+           \x20   if std::env::args().any(|a| a == \"-V\") {\n\
+           \x20       println!(\"{RELEASE}_{STATUT} ({DATE_LAST_MAJ})\");\n\
+           \x20       return;\n\
+           \x20   }\n\
+           }\n",
+        )
+        .unwrap();
+        let registre = dir.join("projects.json");
+        let mut app = App::new_light(registre.clone(), SortOrder::Modified);
+        let mut p = entry("opreb", "opreb", dir.clone());
+        p.version_debug = "0.9.0".to_string();
+        p.status_debug = "Alpha".to_string();
+        app.projects = vec![p];
+        crate::registry::save_registry_full(&registre, &app.projects, &app.web_cache, &app.prefs)
+          .unwrap();
+
+        super::executer_rebuild_debug(&mut app, "opreb").unwrap();
+
+        // Relecture depuis le disque : la garde ne doit rien restaurer.
+        let relu = super::registry::load_registry(&registre).unwrap();
+        assert_eq!(relu[0].version_debug, "1.2.3", "base persistée");
+        assert_eq!(relu[0].status_debug, "Debug");
+        assert_eq!(relu[0].date_debug, "05-06-2026", "date persistée");
+        assert!(relu[0].last_compile_debug_secs > 0, "référence de build");
+        let fiche = relu[0].debug_snapshot.as_ref().expect("fiche persistée");
+        assert_eq!(fiche.version, "1.2.3");
+        assert_eq!(fiche.date, "05-06-2026");
+        assert!(!fiche.empreinte_v.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+      }
 
     #[test]
     fn sort_by_name_is_case_insensitive() {
