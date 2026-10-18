@@ -297,6 +297,29 @@ pub(crate) struct Project {
     status_release: String,
     #[serde(default)]
     version_release: String,
+    /// Date de dernière mise à jour déclarée de la variante Debug
+    /// (`jj-mm-yyyy`). Complétée au chargement : fiche, puis mtime de build,
+    /// puis date du dossier, puis date du jour.
+    #[serde(default)]
+    date_debug: String,
+    /// Date de dernière mise à jour déclarée de la variante Release
+    /// (`jj-mm-yyyy`). Hérite de Debug quand la Release n'a jamais été
+    /// construite (`last_compile_release_secs` vaut 0).
+    #[serde(default)]
+    date_release: String,
+    /// Commande de sonde `-V` pour la variante Debug (vide = auto). Sert aux
+    /// projets dont l'artefact n'est pas construit par Cargo.
+    #[serde(default)]
+    probe_debug: String,
+    /// Commande de sonde `-V` pour la variante Release (vide = auto).
+    #[serde(default)]
+    probe_release: String,
+    /// Commande de build de la variante Debug (vide = auto : Cargo).
+    #[serde(default)]
+    build_debug: String,
+    /// Commande de build de la variante Release (vide = auto : Cargo).
+    #[serde(default)]
+    build_release: String,
     #[serde(default)]
     last_compile_debug_secs: u64,
     #[serde(default)]
@@ -575,6 +598,18 @@ pub(crate) struct ProjectEntry {
     pub(crate) version_debug: String,
     pub(crate) status_release: String,
     pub(crate) version_release: String,
+    /// Date de mise à jour déclarée de la variante Debug (`jj-mm-yyyy`).
+    pub(crate) date_debug: String,
+    /// Date de mise à jour déclarée de la variante Release (`jj-mm-yyyy`).
+    pub(crate) date_release: String,
+    /// Commande de sonde `-V` de la variante Debug (vide = auto).
+    pub(crate) probe_debug: String,
+    /// Commande de sonde `-V` de la variante Release (vide = auto).
+    pub(crate) probe_release: String,
+    /// Commande de build de la variante Debug (vide = auto : Cargo).
+    pub(crate) build_debug: String,
+    /// Commande de build de la variante Release (vide = auto : Cargo).
+    pub(crate) build_release: String,
     pub(crate) debug_modified: String,
     pub(crate) release_modified: String,
     /// Références (epoch secondes) de la dernière compilation détectée par
@@ -662,6 +697,29 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 } else {
                     (p.last_compile_debug_secs, p.last_compile_release_secs)
                 };
+            // Migration des dates déclarées : fiche conservée telle quelle,
+            // sinon mtime de build de la variante, sinon mtime du dossier,
+            // sinon date du jour. La Release sans build hérite de la date
+            // Debug (« jamais buildée » : la date de la source est la seule
+            // vérité disponible).
+            let date_debug = if !p.date_debug.is_empty() {
+                p.date_debug.clone()
+            } else {
+                t.debug
+                    .or(t.overall)
+                    .map(date_jj_mm_yyyy)
+                    .unwrap_or_else(date_du_jour)
+            };
+            let date_release = if !p.date_release.is_empty() {
+                p.date_release.clone()
+            } else if last_release_secs == 0 {
+                date_debug.clone()
+            } else {
+                t.release
+                    .or(t.overall)
+                    .map(date_jj_mm_yyyy)
+                    .unwrap_or_else(date_du_jour)
+            };
             ProjectEntry {
                 id,
                 name: p.name,
@@ -692,6 +750,12 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 version_debug,
                 status_release,
                 version_release,
+                date_debug,
+                date_release,
+                probe_debug: p.probe_debug,
+                probe_release: p.probe_release,
+                build_debug: p.build_debug,
+                build_release: p.build_release,
                 debug_modified,
                 release_modified,
                 last_compile_debug_secs: last_debug_secs,
@@ -1896,12 +1960,35 @@ fn garder_metadonnees(
           }
       };
     }
+    // Variante du garde pour les dates déclarées : une date absente du
+    // registre persisté (ancienne version, projet neuf) ne protège rien —
+    // la valeur migrée au chargement (mtime, date du jour) peut se persister
+    // silencieusement. Seule une date déjà posée fait autorité.
+    macro_rules! aligner_date {
+      ($champ:ident) => {
+        if ancien.$champ != nouveau.$champ && !ancien.$champ.is_empty()
+          {
+            let clef = format!("{id}:{}", stringify!($champ));
+            if !acceptees.contains(&clef)
+              {
+                nouveau.$champ = ancien.$champ.clone();
+                alertes.push(format!(
+                  "Métadonnée « {clef} » restaurée (modification non déclarée)"
+                ));
+              }
+          }
+      };
+    }
     aligner!(status);
     aligner!(version);
     aligner!(status_debug);
     aligner!(version_debug);
     aligner!(status_release);
     aligner!(version_release);
+    // Les dates déclarées sont des métadonnées de vérité : elles ne peuvent
+    // changer que via une déclaration explicite (édition source, rattrapage).
+    aligner_date!(date_debug);
+    aligner_date!(date_release);
     aligner!(last_compile_debug_secs);
     aligner!(last_compile_release_secs);
     aligner!(debug_snapshot);
@@ -1989,6 +2076,12 @@ pub(crate) fn save_registry_full(
             version_debug: p.version_debug.clone(),
             status_release: p.status_release.clone(),
             version_release: p.version_release.clone(),
+            date_debug: p.date_debug.clone(),
+            date_release: p.date_release.clone(),
+            probe_debug: p.probe_debug.clone(),
+            probe_release: p.probe_release.clone(),
+            build_debug: p.build_debug.clone(),
+            build_release: p.build_release.clone(),
             last_compile_debug_secs: p.last_compile_debug_secs,
             last_compile_release_secs: p.last_compile_release_secs,
             debug_snapshot: p.debug_snapshot.clone(),
@@ -2082,10 +2175,19 @@ pub(crate) fn reindex_from_disk(
             return;
         }
         let modified = last_modified(dir).unwrap_or_else(|| "—".to_string());
+        let debug_time = variant_modified_time(dir, "debug");
+        let release_time = variant_modified_time(dir, "release");
         let debug_modified =
-            variant_modified(dir, "debug").unwrap_or_else(|| "jamais compilée".to_string());
+            debug_time.map(format_mod_time).unwrap_or_else(|| "jamais compilée".to_string());
         let release_modified =
-            variant_modified(dir, "release").unwrap_or_else(|| "jamais compilée".to_string());
+            release_time.map(format_mod_time).unwrap_or_else(|| "jamais compilée".to_string());
+        let date_debug = debug_time
+            .or_else(|| last_modified_time(dir))
+            .map(date_jj_mm_yyyy)
+            .unwrap_or_else(date_du_jour);
+        let date_release = release_time
+            .map(date_jj_mm_yyyy)
+            .unwrap_or_else(|| date_debug.clone());
         projects.push(ProjectEntry {
             id: name.clone(),
             name,
@@ -2116,6 +2218,12 @@ pub(crate) fn reindex_from_disk(
             version_debug: String::new(),
             status_release: String::new(),
             version_release: String::new(),
+            date_debug,
+            date_release,
+            probe_debug: String::new(),
+            probe_release: String::new(),
+            build_debug: String::new(),
+            build_release: String::new(),
             debug_modified,
             release_modified,
             last_compile_debug_secs: 0,
@@ -2218,6 +2326,17 @@ pub(crate) fn last_modified_time(dir: &Path) -> Option<std::time::SystemTime> {
 fn format_mod_time(t: std::time::SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%d/%m/%Y %H:%M").to_string()
+}
+
+/// Date « jj-mm-yyyy » d'un instant, format des dates déclarées de variantes.
+pub(crate) fn date_jj_mm_yyyy(t: std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    dt.format("%d-%m-%Y").to_string()
+}
+
+/// Date du jour au format « jj-mm-yyyy », pour initialiser une fiche neuve.
+pub(crate) fn date_du_jour() -> String {
+    chrono::Local::now().format("%d-%m-%Y").to_string()
 }
 
 fn last_modified(dir: &Path) -> Option<String> {
@@ -2708,6 +2827,12 @@ mod tests
                 version_debug: String::new(),
                 status_release: String::new(),
                 version_release: String::new(),
+                date_debug: String::new(),
+                date_release: String::new(),
+                probe_debug: String::new(),
+                probe_release: String::new(),
+                build_debug: String::new(),
+                build_release: String::new(),
                 debug_modified: String::new(),
                 release_modified: String::new(),
 last_compile_debug_secs: 0,
@@ -2779,6 +2904,12 @@ last_compile_debug_secs: 0,
                     version_debug: String::new(),
                     status_release: String::new(),
                     version_release: String::new(),
+                    date_debug: String::new(),
+                    date_release: String::new(),
+                    probe_debug: String::new(),
+                    probe_release: String::new(),
+                    build_debug: String::new(),
+                    build_release: String::new(),
                     debug_modified: String::new(),
                     release_modified: String::new(),
 last_compile_debug_secs: 0,
@@ -2834,6 +2965,12 @@ last_compile_debug_secs: 0,
             version_debug: String::new(),
             status_release: String::new(),
             version_release: String::new(),
+            date_debug: String::new(),
+            date_release: String::new(),
+            probe_debug: String::new(),
+            probe_release: String::new(),
+            build_debug: String::new(),
+            build_release: String::new(),
             debug_modified: String::new(),
             release_modified: String::new(),
             last_compile_debug_secs: 0,
@@ -3077,6 +3214,64 @@ last_compile_debug_secs: 0,
         assert_eq!(loaded[0].version_debug, "1.1.1");
         assert_eq!(loaded[0].status_release, "Release");
         assert_eq!(loaded[0].version_release, "2.2.2");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Un registre sans dates déclarées doit en obtenir deux, lisibles et
+    /// stables : mtime de build si présent, sinon date du jour. La Release
+    /// sans compilation hérite de la date Debug (« jamais buildée »).
+    #[test]
+    fn load_migrates_missing_variant_dates() {
+        let dir = temp_registry("migrate_dates");
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("target/debug")).unwrap();
+        fs::write(proj.join("target/debug/art.rlib"), b"x").unwrap();
+
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+        let json = format!(
+            r#"{{"projects":{{"proj":{{"name":"proj","path":"{}","description":"d","status":"","version":"1.0.0"}}}}}}"#,
+            proj.display()
+        );
+        fs::write(&path, json).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let attendu = super::date_jj_mm_yyyy(
+            super::variant_modified_time(&proj, "debug").expect("mtime debug"),
+        );
+        assert_eq!(loaded[0].date_debug, attendu);
+        // Release jamais compilée : hérite de la date Debug.
+        assert_eq!(loaded[0].date_release, loaded[0].date_debug);
+        assert!(!loaded[0].date_debug.is_empty());
+        // Format jj-mm-yyyy, longueur fixe de 10.
+        assert_eq!(loaded[0].date_debug.len(), 10);
+
+        // Relecture : les dates migrées ne doivent pas bouger.
+        let relu = load_registry(&path).unwrap();
+        assert_eq!(relu[0].date_debug, loaded[0].date_debug);
+        assert_eq!(relu[0].date_release, loaded[0].date_release);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Les dates déclarées dans la fiche font foi : la migration ne doit pas
+    /// les écraser par les mtimes.
+    #[test]
+    fn load_keeps_declared_variant_dates() {
+        let dir = temp_registry("keep_dates");
+        let path = dir.join("opencode/projects.json");
+        load_registry(&path).unwrap();
+
+        let json = r#"{"projects":{"old":{"name":"Legacy","path":"/tmp/nonexistent-proj","description":"d","status":"","version":"1.0.0","date_debug":"01-02-2024","date_release":"03-04-2024","probe_debug":"./old-debug -V","build_release":"make release"}}}"#;
+        fs::write(&path, json).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded[0].date_debug, "01-02-2024");
+        assert_eq!(loaded[0].date_release, "03-04-2024");
+        assert_eq!(loaded[0].probe_debug, "./old-debug -V");
+        assert_eq!(loaded[0].probe_release, "");
+        assert_eq!(loaded[0].build_debug, "");
+        assert_eq!(loaded[0].build_release, "make release");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3544,6 +3739,12 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             version_debug: String::new(),
             status_release: String::new(),
             version_release: String::new(),
+            date_debug: String::new(),
+            date_release: String::new(),
+            probe_debug: String::new(),
+            probe_release: String::new(),
+            build_debug: String::new(),
+            build_release: String::new(),
             debug_modified: String::new(),
             release_modified: String::new(),
             last_compile_debug_secs: 0,
@@ -3850,6 +4051,12 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             version_debug: version.to_string(),
             status_release: String::new(),
             version_release: version_release.to_string(),
+            date_debug: String::new(),
+            date_release: String::new(),
+            probe_debug: String::new(),
+            probe_release: String::new(),
+            build_debug: String::new(),
+            build_release: String::new(),
             debug_modified: String::new(),
             release_modified: String::new(),
             last_compile_debug_secs: 0,
