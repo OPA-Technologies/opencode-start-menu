@@ -474,6 +474,7 @@ impl ProjectEditState
 
 // Libellé de variante : version + statut, séparés par « _ ».
 // La partie « pré-release » d'une version (ex. 0.9.9-beta) est écartée.
+#[cfg(test)]
 fn variant_label(version: &str, status: &str) -> String {
     let core = version.split('-').next().unwrap_or(version);
     let stat = status.replace(['-', ' '], "_");
@@ -483,6 +484,103 @@ fn variant_label(version: &str, status: &str) -> String {
         format!("{core}_{stat}")
     }
 }
+
+/// Affichage bifilaire d'une variante : la vérité binaire (sonde `-V` ou
+/// fiche de build) d'abord, la base du registre en complément quand elles
+/// diffèrent.
+///
+/// Format : `0.50.4_Stable (15-10-2026)` pour le binaire ; si la base
+/// porte une autre version ou un autre statut, ` · base 0.50.5_Terminée`
+/// est ajouté. Sans binaire lisible, la base seule (« — » si elle est
+/// vide) : le vide muet n'existe pas dans cet affichage.
+pub(crate) fn libelle_bifilaire(
+  binaire: Option<(&str, &str, &str)>,
+  base: (&str, &str),
+  ) -> String
+  {
+    let base_libelle = |(v, s): (&str, &str)| -> String
+      {
+        if v.is_empty() && s.is_empty()
+          {
+            "—".to_string()
+          }
+        else if s.is_empty()
+          {
+            v.to_string()
+          }
+        else
+          {
+            format!("{v}_{s}")
+          }
+      };
+    let Some((bv, bs, bd)) = binaire.filter(|(v, _, _)| !v.is_empty()) else
+      {
+        return base_libelle(base);
+      };
+    let mut out = if bs.is_empty() { bv.to_string() } else { format!("{bv}_{bs}") };
+    if !bd.is_empty()
+      {
+        out.push_str(&format!(" ({bd})"));
+      }
+    if base.0 != bv || (!base.1.is_empty() && base.1 != bs)
+      {
+        out.push_str(&format!(" · base {}", base_libelle(base)));
+      }
+    out
+  }
+
+/// Fiche de build à afficher (lecture seule), sans sonde ni lecture disque.
+///
+/// La fiche ne fait foi que si elle colle à la référence du dernier build
+/// détecté (`last_compile_*_secs`, rafraîchie au chargement et par le
+/// rattrapage) : une fiche périmée ne doit pas faire passer un vieux binaire
+/// pour neuf. Aucun accès disque ici, car ce chemin est appelé à chaque image
+/// par le rendu TUI.
+pub(crate) fn fiche_pour_affichage(
+  p: &registry::ProjectEntry,
+  profil: &str,
+  ) -> Option<(String, String, String)>
+  {
+    let (fiche, reference) = if profil == "release"
+      {
+        (p.release_snapshot.as_ref(), p.last_compile_release_secs)
+      }
+    else
+      {
+        (p.debug_snapshot.as_ref(), p.last_compile_debug_secs)
+      };
+    let fiche = fiche?;
+    if reference == 0 || reference != fiche.compile_secs
+      {
+        return None;
+      }
+    Some((fiche.version.clone(), fiche.statut.clone(), fiche.date.clone()))
+  }
+
+/// Vérité binaire à afficher : priorise la fiche cohérente, sinon sonde si
+/// `sonder` est vrai (coût ponctuel, réservé aux affichages en ligne de
+/// commande — jamais au rendu TUI).
+pub(crate) fn affichage_variante_binaire(
+  p: &registry::ProjectEntry,
+  profil: &str,
+  sonder: bool,
+  ) -> Option<(String, String, String)>
+  {
+    if let Some(v) = fiche_pour_affichage(p, profil)
+      {
+        return Some(v);
+      }
+    if !sonder
+      {
+        return None;
+      }
+    let sonde_cmd = p.sonde(profil);
+    if let Some(lv) = variante::lire_variante_avec_sonde(&p.path, profil, sonde_cmd)
+      {
+        return Some((lv.etat.version, lv.etat.statut, lv.etat.date));
+      }
+    None
+  }
 
 // --- Édition de texte : les gestes standards viennent de `op-tui::edit`,
 // --- l'application ne fait que traduire les touches du terminal.
@@ -2042,7 +2140,13 @@ fn main() -> Result<()> {
                 println!("    Chemin   : {}", sanitize(&p.path.to_string_lossy()));
                 println!("    Descript.: {}", sanitize(&p.description));
                 println!("    Modifié  : {}", sanitize(&p.modified));
-                println!("    Variante : {}", sanitize(&variant_label(&p.version_debug, &p.status_debug)));
+                let bin_d = affichage_variante_binaire(p, "debug", false);
+                let bin_r = affichage_variante_binaire(p, "release", false);
+                let d_base = (p.version_debug.as_str(), p.status_debug.as_str());
+                let r_base = (p.version_release.as_str(), p.status_release.as_str());
+                let d_bin = bin_d.as_ref().map(|(v,s,d)| (v.as_str(), s.as_str(), d.as_str()));
+                let r_bin = bin_r.as_ref().map(|(v,s,d)| (v.as_str(), s.as_str(), d.as_str()));
+                println!("    Variante : Debug {} · Release {}", libelle_bifilaire(d_bin, d_base), libelle_bifilaire(r_bin, r_base));
                 println!();
             }
         }
@@ -2050,9 +2154,22 @@ fn main() -> Result<()> {
     }
 
     if cli.version {
-        // Les variantes n'ont pas toutes un build : la Release pas encore
-        // compilée s'affiche « — », pas comme un vide muet.
-        let ou_d = |s: &str| if s.is_empty() { "—".to_string() } else { s.to_string() };
+        // Vérité binaire d'abord (sonde ponctuelle des deux variantes), base
+        // du registre en complément quand elle diverge : le vide muet
+        // n'existe pas, une variante sans build s'affiche « — ».
+        let affiche = |p: &ProjectEntry| {
+            let bin_d = affichage_variante_binaire(p, "debug", true);
+            let bin_r = affichage_variante_binaire(p, "release", true);
+            let d = libelle_bifilaire(
+                bin_d.as_ref().map(|(v, s, d)| (v.as_str(), s.as_str(), d.as_str())),
+                (p.version_debug.as_str(), p.status_debug.as_str()),
+            );
+            let r = libelle_bifilaire(
+                bin_r.as_ref().map(|(v, s, d)| (v.as_str(), s.as_str(), d.as_str())),
+                (p.version_release.as_str(), p.status_release.as_str()),
+            );
+            println!("{} : Debug={} Release={}", sanitize(&p.name), sanitize(&d), sanitize(&r));
+        };
         if let Some(keyword) = cli.keyword.as_deref() {
             let idx = app.matching_indexes(keyword);
             match idx.as_slice() {
@@ -2060,27 +2177,11 @@ fn main() -> Result<()> {
                     eprintln!("Aucun projet ne correspond à : {keyword}");
                 }
                 [i] => {
-                    let p = &app.projects[*i];
-                    println!(
-                        "{} : Debug={} ({}) Release={} ({})",
-                        sanitize(&p.name),
-                        sanitize(&p.version_debug),
-                        sanitize(&p.status_debug),
-                        sanitize(&ou_d(&p.version_release)),
-                        sanitize(&ou_d(&p.status_release))
-                    );
+                    affiche(&app.projects[*i]);
                 }
                 _ => {
                     for i in &idx {
-                        let p = &app.projects[*i];
-                        println!(
-                            "{} : Debug={} ({}) Release={} ({})",
-                            sanitize(&p.name),
-                            sanitize(&p.version_debug),
-                            sanitize(&p.status_debug),
-                            sanitize(&ou_d(&p.version_release)),
-                            sanitize(&ou_d(&p.status_release))
-                        );
+                        affiche(&app.projects[*i]);
                     }
                 }
             }
@@ -2097,7 +2198,6 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-
     let a_mot_cle = cli.keyword.is_some();
     if let Some(keyword) = cli.keyword.clone() {
         app.filter(&keyword, if cli.root { LaunchMode::Root } else { LaunchMode::Normal });
@@ -5789,6 +5889,82 @@ mod tests
     fn variant_label_without_status() {
         assert_eq!(variant_label("3.4.5", ""), "3.4.5");
     }
+
+    #[test]
+    fn libelle_bifilaire_identique_omet_la_base()
+      {
+        let l = super::libelle_bifilaire(
+            Some(("0.50.4", "Stable", "15-10-2026")),
+            ("0.50.4", "Stable"),
+        );
+        assert_eq!(l, "0.50.4_Stable (15-10-2026)");
+      }
+
+    #[test]
+    fn libelle_bifilaire_different_ajoute_la_base()
+      {
+        let l = super::libelle_bifilaire(
+            Some(("0.50.4", "Stable", "15-10-2026")),
+            ("0.50.5", "Terminée"),
+        );
+        assert_eq!(l, "0.50.4_Stable (15-10-2026) · base 0.50.5_Terminée");
+      }
+
+    #[test]
+    fn libelle_bifilaire_sans_binaire_montre_la_base()
+      {
+        assert_eq!(super::libelle_bifilaire(None, ("0.50.4", "Stable")), "0.50.4_Stable");
+        assert_eq!(super::libelle_bifilaire(None, ("", "")), "—");
+      }
+
+    #[test]
+    fn libelle_bifilaire_ignore_un_statut_de_base_vide()
+      {
+        // Base sans statut connue : pas de complément parasite.
+        assert_eq!(
+            super::libelle_bifilaire(Some(("0.50.4", "Stable", "")), ("0.50.4", "")),
+            "0.50.4_Stable",
+        );
+      }
+
+    /// La fiche de build ne s'affiche que si elle colle à la référence du
+    /// dernier build : une fiche périmée ne doit pas faire passer un vieux
+    /// binaire pour neuf.
+    #[test]
+    fn fiche_pour_affichage_exige_la_reference_du_build()
+      {
+        let dir = temp_dir("fiche-affichage");
+        let mut p = entry("projet", "Projet", dir.join("projet"));
+        p.debug_snapshot = Some(crate::registry::SnapshotCompile {
+            version: "1.2.3".to_string(),
+            statut: "Stable".to_string(),
+            date: "15-10-2026".to_string(),
+            compile_secs: 1_700_000_000,
+            empreinte_v: String::new(),
+        });
+        // Référence alignée sur la fiche : la fiche fait foi.
+        p.last_compile_debug_secs = 1_700_000_000;
+        assert_eq!(
+            super::fiche_pour_affichage(&p, "debug"),
+            Some(("1.2.3".to_string(), "Stable".to_string(), "15-10-2026".to_string())),
+            "fiche alignée sur le dernier build : affichée",
+        );
+        // La référence a bougé : la fiche a été prise en défaut.
+        p.last_compile_debug_secs = 1_700_000_100;
+        assert_eq!(
+            super::fiche_pour_affichage(&p, "debug"),
+            None,
+            "référence divergente : aucune fiche affichée",
+        );
+        // Jamais compilée : pas de fiche non plus.
+        p.last_compile_debug_secs = 0;
+        assert_eq!(super::fiche_pour_affichage(&p, "debug"), None);
+        // Sans fiche du tout, rien.
+        p.debug_snapshot = None;
+        p.last_compile_debug_secs = 1_700_000_000;
+        assert_eq!(super::fiche_pour_affichage(&p, "debug"), None);
+        let _ = fs::remove_dir_all(&dir);
+      }
 
     #[test]
     fn initial_selection_modified_targets_latest() {

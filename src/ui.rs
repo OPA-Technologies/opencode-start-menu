@@ -284,6 +284,7 @@ fn variant_box(
     title_color: Color,
     version: &str,
     status: &str,
+    date_declaree: &str,
     modified: &str,
 ) -> Paragraph<'static> {
     let dash = |s: &str| -> String { if s.is_empty() { "—".to_string() } else { s.to_string() } };
@@ -295,6 +296,10 @@ fn variant_box(
         Line::from(vec![
             Span::styled("Statut   : ", Style::default().fg(Color::DarkGray)),
             Span::raw(sanitize(&dash(status))),
+        ]),
+        Line::from(vec![
+            Span::styled("Date maj : ", Style::default().fg(Color::DarkGray)),
+            Span::raw(sanitize(&dash(date_declaree))),
         ]),
         Line::from(vec![
             Span::styled("Modifié le : ", Style::default().fg(Color::DarkGray)),
@@ -494,7 +499,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(11),
         ])
         .split(inner);
@@ -505,29 +510,56 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     f.render_widget(paragraph, top_area);
 
-    // Groupe 3 : variantes Debug | Release (Release en lecture seule)
-    let (debug_version, debug_status, release_version, release_status) =
+    // Groupe 3 : variantes Debug | Release (Release en lecture seule).
+    // Le binaire fait foi (fiche de build alignée sur le dernier build), la
+    // base du registre s'ajoute en complément quand les deux divergent.
+    // Aucune sonde ni lecture disque ici : le rendu d'une image n'exécute rien.
+    let (debug_version, debug_status, debug_date, release_version, release_status, release_date) =
         if let Some(idx) = app.selected_project_idx() {
             let p = &app.projects[idx];
-            (
-                p.version_debug.as_str(),
-                p.status_debug.as_str(),
-                p.version_release.as_str(),
-                p.status_release.as_str(),
-            )
+            let variante =
+                |profil: &str, base_v: &str, base_s: &str, base_d: &str| -> (String, String, String) {
+                    let fiche = crate::fiche_pour_affichage(p, profil);
+                    let libelle = crate::libelle_bifilaire(
+                        fiche.as_ref().map(|(v, s, d)| (v.as_str(), s.as_str(), d.as_str())),
+                        (base_v, base_s),
+                    );
+                    let statut = fiche
+                        .as_ref()
+                        .map(|(_, s, _)| s.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| base_s.to_string());
+                    let date = fiche
+                        .as_ref()
+                        .map(|(_, _, d)| d.clone())
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| base_d.to_string());
+                    (libelle, statut, date)
+                };
+            let (dv, ds, dd) = variante("debug", &p.version_debug, &p.status_debug, &p.date_debug);
+            let (rv, rs, rd) =
+                variante("release", &p.version_release, &p.status_release, &p.date_release);
+            (dv, ds, dd, rv, rs, rd)
         } else {
-            ("", "", "", "")
+            (
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+            )
         };
     let var_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(variant_area);
     f.render_widget(
-        variant_box(" Debug ", Color::Cyan, debug_version, debug_status, &debug_modified),
+        variant_box(" Debug ", Color::Cyan, &debug_version, &debug_status, &debug_date, &debug_modified),
         var_chunks[0],
     );
     f.render_widget(
-        variant_box(" Release ", Color::Green, release_version, release_status, &release_modified),
+        variant_box(" Release ", Color::Green, &release_version, &release_status, &release_date, &release_modified),
         var_chunks[1],
     );
 
@@ -1046,7 +1078,12 @@ fn render_creation_dialog(f: &mut Frame, size: Rect, state: &ProjectCreationStat
 ///
 /// Rendu dans `area` sans cadre ni centrage : le cadre commun et le titre
 /// (qui porte le nom du projet) sont dessinés par `render_popup_unifie`.
-fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
+fn render_contenu_projet(
+    f: &mut Frame,
+    area: Rect,
+    state: &ProjectEditState,
+    projet: Option<&crate::ProjectEntry>,
+  )
   {
     let opaque = Style::default().bg(Color::Black);
 
@@ -1112,11 +1149,31 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
         ])
       };
 
+    // Rappel en lecture seule de la vérité binaire (fiche de build cohérente) :
+    // montre à l'utilisateur ce qui est réellement compilé, et l'écart avec la
+    // base qu'il est en train d'éditer.
+    let ligne_binaire = {
+        let libelle = projet
+            .map(|p| {
+                let fiche = crate::fiche_pour_affichage(p, "debug");
+                crate::libelle_bifilaire(
+                    fiche.as_ref().map(|(v, s, d)| (v.as_str(), s.as_str(), d.as_str())),
+                    (state.pending_version.as_str(), state.pending_status.as_str()),
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
+        Line::from(vec![
+            Span::styled("Binaire  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" : ", Style::default().fg(Color::DarkGray)),
+            Span::styled(sanitize(&libelle), Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
     // Bloc bas de page à position fixe : la description défilante, au-dessus,
-    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Trois
-    // rangées en tête (vide + Version + Statut), quatre en pied.
+    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Quatre
+    // rangées en tête (vide + Version + Statut + Binaire), quatre en pied.
     let hauteur = area.height as usize;
-    let zone_haut = 3usize;
+    let zone_haut = 4usize;
     let zone_bas = 4usize;
     let zone_h = hauteur.saturating_sub(zone_haut + zone_bas).max(1);
 
@@ -1201,7 +1258,7 @@ fn render_contenu_projet(f: &mut Frame, area: Rect, state: &ProjectEditState)
       };
 
     let mut lines: Vec<Line<'static>> =
-      vec![Line::from(""), ligne_champ(0), ligne_champ(1)];
+      vec![Line::from(""), ligne_champ(0), ligne_champ(1), ligne_binaire];
     lines.extend(lignes_zone);
     lines.push(ligne_confirm);
     lines.push(match &state.error
@@ -1692,7 +1749,7 @@ pub(crate) fn render_popup_unifie(f: &mut Frame, size: Rect, app: &App, popup: &
 
     match popup.onglet
       {
-        crate::Onglet::Projet => render_contenu_projet(f, contenu, &popup.projet),
+        crate::Onglet::Projet => render_contenu_projet(f, contenu, &popup.projet, projet),
         crate::Onglet::Couts => {
           if let Some(p) = projet
             {
