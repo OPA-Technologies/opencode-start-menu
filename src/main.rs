@@ -403,6 +403,19 @@ pub(crate) struct ProjectCreationState {
     pub(crate) bibliotheque: bool,
 }
 
+/// Commandes d'outils éditables dans l'onglet Projet : sonde `-V` et commande
+/// de build, par variante. Vide = auto (sonde `target/<profil>`, build Cargo).
+///
+/// Regroupées et boxées pour ne pas alourdir `InputMode` (variante `Popup`) :
+/// quatre `String` en clair feraient franchir le seuil de `large_enum_variant`.
+#[derive(Clone, Default)]
+pub(crate) struct OutilsEdit {
+    pub(crate) probe_debug: String,
+    pub(crate) build_debug: String,
+    pub(crate) probe_release: String,
+    pub(crate) build_release: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProjectEditState {
     pub(crate) project_idx: usize,
@@ -413,6 +426,9 @@ pub(crate) struct ProjectEditState {
     pub(crate) pending_version: String,
     pub(crate) pending_status: String,
     pub(crate) pending_description: String,
+    /// Commandes de sonde (`-V`) et de build par variante, éditées dans
+    /// l'onglet Projet. Vide = auto (sonde `target/<profil>`, build Cargo).
+    pub(crate) outils: Box<OutilsEdit>,
     pub(crate) error: Option<String>,
     /// Le champ vient d'être ouvert : `Suppr` le vide d'un coup, et la
     /// Version repart de zéro à la première frappe.
@@ -439,6 +455,7 @@ impl Default for ProjectEditState
             pending_version: String::new(),
             pending_status: String::new(),
             pending_description: String::new(),
+            outils: Box::new(OutilsEdit::default()),
             error: None,
             premiere_touche: true,
             choix_oui: false,
@@ -462,6 +479,12 @@ impl ProjectEditState
             pending_version: project.version_debug.clone(),
             pending_status: project.status_debug.clone(),
             pending_description: project.description.clone(),
+            outils: Box::new(OutilsEdit {
+                probe_debug: project.probe_debug.clone(),
+                build_debug: project.build_debug.clone(),
+                probe_release: project.probe_release.clone(),
+                build_release: project.build_release.clone(),
+            }),
             error: None,
             premiere_touche: true,
             choix_oui: false,
@@ -2648,6 +2671,26 @@ fn executer_maj_base(app: &mut App, id: &str) -> Result<()>
     Ok(())
   }
 
+/// Extrait des dernières lignes de `stderr` pour un message d'erreur lisible.
+///
+/// Renvoie `""` quand il n'y a rien à montrer, ou `" : <extrait>"` sinon —
+/// forme directement interpolable à la suite d'un message « … a échoué ».
+fn extrait_erreur(stderr: &[u8]) -> String
+  {
+    let texte = String::from_utf8_lossy(stderr);
+    let lignes: Vec<&str> = texte.lines().filter(|l| !l.trim().is_empty()).collect();
+    let debut = lignes.len().saturating_sub(5);
+    let extrait = lignes[debut..].join(" | ");
+    if extrait.is_empty()
+      {
+        String::new()
+      }
+    else
+      {
+        format!(" : {extrait}")
+      }
+  }
+
 /// Lance `cargo` dans un projet en capturant sa sortie.
 ///
 /// La sortie est capturée, jamais héritée : en mode brut, sur l'écran alternatif,
@@ -2662,17 +2705,44 @@ fn lancer_cargo(dir: &Path, args: &[&str]) -> Result<()>
         .output()?;
     if !sortie.status.success()
       {
-        let err = String::from_utf8_lossy(&sortie.stderr);
-        let lignes: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
-        let debut = lignes.len().saturating_sub(5);
-        let extrait = lignes[debut..].join(" | ");
-        if extrait.is_empty()
-          {
-            anyhow::bail!("cargo {} a échoué", args.join(" "));
-          }
-        anyhow::bail!("cargo {} a échoué : {extrait}", args.join(" "));
+        let extrait = extrait_erreur(&sortie.stderr);
+        anyhow::bail!("cargo {} a échoué{extrait}", args.join(" "));
       }
     Ok(())
+  }
+
+/// Lance la commande de build d'une variante, selon son langage.
+///
+/// La commande personnalisée du projet (`build_debug`/`build_release`) prime ;
+/// à défaut, Cargo est utilisé si le dossier porte un `Cargo.toml` ; sinon la
+/// reconstruction s'arrête sur une erreur explicite — un projet d'un autre
+/// langage doit déclarer sa commande dans Réglages.
+fn lancer_build(dir: &Path, profil: &str, commande: &str) -> Result<()>
+  {
+    let commande = commande.trim();
+    if !commande.is_empty()
+      {
+        let sortie = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(commande)
+            .current_dir(dir)
+            .output()?;
+        if !sortie.status.success()
+          {
+            let extrait = extrait_erreur(&sortie.stderr);
+            anyhow::bail!("`{commande}` a échoué{extrait}");
+          }
+        return Ok(());
+      }
+    if dir.join("Cargo.toml").is_file()
+      {
+        let args: &[&str] =
+            if profil == "release" { &["build", "--release"] } else { &["build"] };
+        return lancer_cargo(dir, args);
+      }
+    anyhow::bail!(
+      "aucune commande de build {profil} : renseignez-la dans Réglages (p)"
+    )
   }
 
 /// Reconstruit la variante Debug d'un projet, met à jour le snapshot Debug
@@ -2686,7 +2756,8 @@ fn executer_rebuild_debug(app: &mut App, id: &str) -> Result<()>
         };
     let path = app.projects[idx].path.clone();
     let sonde = app.projects[idx].probe_debug.clone();
-    lancer_cargo(&path, &["build"])?;
+    let build = app.projects[idx].build_debug.clone();
+    lancer_build(&path, "debug", &build)?;
     let Some(lv) = crate::variante::lire_variante_avec_sonde(
         &path,
         "debug",
@@ -2748,7 +2819,8 @@ fn executer_rebuild_release(app: &mut App, id: &str) -> Result<()>
         };
     let path = app.projects[idx].path.clone();
     let sonde = app.projects[idx].probe_release.clone();
-    lancer_cargo(&path, &["build", "--release"])?;
+    let build = app.projects[idx].build_release.clone();
+    lancer_build(&path, "release", &build)?;
     let Some(lv) = crate::variante::lire_variante_avec_sonde(
         &path,
         "release",
@@ -5076,7 +5148,11 @@ fn load_edit_field(state: &mut ProjectEditState)
       {
         0 => state.pending_version.clone(),
         1 => state.pending_status.clone(),
-        2 => state.pending_description.clone(),
+        2 => state.outils.probe_debug.clone(),
+        3 => state.outils.build_debug.clone(),
+        4 => state.outils.probe_release.clone(),
+        5 => state.outils.build_release.clone(),
+        6 => state.pending_description.clone(),
         _ => String::new(),
       };
     state.input_offset = state.input_buffer.chars().count();
@@ -5104,24 +5180,40 @@ fn commit_edit_field(state: &mut ProjectEditState) {
                 false
             }
         }
-        2 if !value.is_empty() => {
+        2 => {
+            state.outils.probe_debug = value;
+            true
+        }
+        3 => {
+            state.outils.build_debug = value;
+            true
+        }
+        4 => {
+            state.outils.probe_release = value;
+            true
+        }
+        5 => {
+            state.outils.build_release = value;
+            true
+        }
+        6 if !value.is_empty() => {
             state.pending_description = value;
             true
         }
-        2 => false,
+        6 => false,
         _ => false,
     };
     if ok {
         state.error = None;
         state.editing = false;
-        if state.active_field < 3 {
+        if state.active_field < EDIT_CONFIRM_FIELD {
             state.active_field += 1;
         }
     } else {
         state.error = Some(match state.active_field {
             0 => "Version invalide : format attendu x.y.z (ex. 1.2.3)".to_string(),
             1 => format!("Statut invalide : attendu l'un de {}.", registry::STATUSES.join(" · ")),
-            2 => "Description invalide : texte non vide requis".to_string(),
+            6 => "Description invalide : texte non vide requis".to_string(),
             _ => String::new(),
         });
     }
@@ -5129,9 +5221,10 @@ fn commit_edit_field(state: &mut ProjectEditState) {
 
 /// Valide l'ensemble des champs et applique les modifications au projet.
 ///
-/// Seule la variante Debug est éditée : la Release garde sa version et son
-/// statut de dernière compilation tant que son binaire n'est pas reconstruit
-/// (rattrapage au prochain rescan).
+/// Seule la variante Debug reçoit version et statut : la Release garde les
+/// siens de dernière compilation tant que son binaire n'est pas reconstruit
+/// (rattrapage au prochain rescan). Les commandes d'outils (sonde, build) sont
+/// en revanche enregistrées pour les deux variantes.
 fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     let Some(p) = app.projects.get_mut(state.project_idx) else {
         return false;
@@ -5157,6 +5250,13 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     p.version_debug = state.pending_version.clone();
     p.status_debug = state.pending_status.clone();
     p.description = state.pending_description.clone();
+    // Commandes d'outils par variante : simples réglages, non protégés par la
+    // garde des métadonnées de vérité. Vide = auto (sonde `target/<profil>`,
+    // build Cargo).
+    p.probe_debug = state.outils.probe_debug.trim().to_string();
+    p.build_debug = state.outils.build_debug.trim().to_string();
+    p.probe_release = state.outils.probe_release.trim().to_string();
+    p.build_release = state.outils.build_release.trim().to_string();
     // Sans miroir : la Release garde sa version/statut tant que son
     // binaire n'est pas reconstruit (rattrapage au prochain rescan).
     // Champs historiques alignés sur la variante élue (Debug).
@@ -5193,7 +5293,7 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     true
 }
 
-const EDIT_CONFIRM_FIELD: usize = 3;
+const EDIT_CONFIRM_FIELD: usize = 7;
 
 /// Nombre de champs éditables du popup de valorisation :
 /// 0 = mode, 1 = tarif manuel, 2 = pays source.
@@ -5602,7 +5702,7 @@ fn handle_edit_input(
                         state.pending_status = sel.to_string();
                         state.status_menu_open = false;
                         state.error = None;
-                        if state.active_field < 3
+                        if state.active_field < EDIT_CONFIRM_FIELD
                           {
                             state.active_field += 1;
                           }
@@ -6262,6 +6362,58 @@ mod tests
         let _ = fs::remove_dir_all(&dir);
       }
 
+    /// La commande personnalisée d'une variante prime sur Cargo, et s'exécute
+    /// dans le dossier du projet.
+    #[test]
+    fn lancer_build_execute_la_commande_personnalisee()
+      {
+        let dir = temp_dir("build-commande");
+        // Un `Cargo.toml` sans source ferait échouer Cargo : la réussite prouve
+        // que la commande déclarée a été utilisée, pas le repli Cargo.
+        fs::write(
+          dir.join("Cargo.toml"),
+          "[package]\nname = \"oprebu\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        super::lancer_build(&dir, "debug", "printf fait > marqueur").unwrap();
+        assert_eq!(
+          fs::read_to_string(dir.join("marqueur")).unwrap(),
+          "fait",
+          "la commande doit tourner dans le dossier du projet"
+        );
+        let _ = fs::remove_dir_all(&dir);
+      }
+
+    /// Sans commande déclarée ni `Cargo.toml`, la reconstruction s'arrête sur
+    /// un message qui dit où régler la commande.
+    #[test]
+    fn lancer_build_sans_cargo_ni_commande_echoue()
+      {
+        let dir = temp_dir("build-sans-commande");
+        let err = super::lancer_build(&dir, "release", "").unwrap_err().to_string();
+        assert!(
+          err.contains("commande de build release"),
+          "le message doit nommer la variante et le réglage : {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+      }
+
+    /// Une commande personnalisée qui échoue remonte un extrait de son stderr,
+    /// plutôt qu'un code de retour muet.
+    #[test]
+    fn lancer_build_remonte_le_stderr_de_la_commande()
+      {
+        let dir = temp_dir("build-stderr");
+        let err = super::lancer_build(&dir, "debug", "printf boom >&2; exit 3")
+          .unwrap_err()
+          .to_string();
+        assert!(
+          err.contains("boom"),
+          "un extrait de stderr doit être remonté : {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+      }
+
     #[test]
     fn sort_by_name_is_case_insensitive() {
         let mut projects = vec![
@@ -6452,7 +6604,7 @@ mod tests
           "FRA".to_string(),
         );
         let mut ouvert = popup.projet.clone();
-        ouvert.active_field = 2;
+        ouvert.active_field = 6;
         ouvert.pending_description = "texte existant".to_string();
         let base = popup.avec_projet(ouvert);
         let etat = frappe_dans_le_champ(&mut app, &base, &[KeyCode::Enter, KeyCode::Char('!')]);
@@ -6464,7 +6616,7 @@ mod tests
         assert_eq!(etat.input_offset, 15, "curseur derrière la frappe");
         // Un champ vide se remplit pareil, sans écrasement particulier.
         let mut vide = popup.projet.clone();
-        vide.active_field = 2;
+        vide.active_field = 6;
         let base = popup.avec_projet(vide);
         let etat = frappe_dans_le_champ(
           &mut app,
@@ -6486,7 +6638,7 @@ mod tests
           "FRA".to_string(),
         );
         let mut ouvert = popup.projet.clone();
-        ouvert.active_field = 2;
+        ouvert.active_field = 6;
         ouvert.pending_description = "abcd".to_string();
         let base = popup.avec_projet(ouvert);
         let etat = frappe_dans_le_champ(
@@ -7088,6 +7240,29 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         assert!(super::apply_edit(&mut app, &state));
         assert_eq!(app.projects[0].version_debug, "3.1.4");
         assert_eq!(app.projects[0].status_debug, "Deprecated");
+      }
+
+    /// Les commandes d'outils éditables (sonde et build, par variante) sont
+    /// reportées sur le projet, rognées. Ce sont des réglages, pas des
+    /// métadonnées de vérité : la garde ne les protège pas.
+    #[test]
+    fn l_edition_enregistre_les_commandes_d_outils()
+      {
+        let mut app = app_avec_projet();
+        let mut state = super::ProjectEditState::from_project(&app.projects[0], 0);
+        state.outils.probe_debug = "  ./bin/mreport -V  ".to_string();
+        state.outils.build_debug = "make debug".to_string();
+        state.outils.probe_release = "./bin/mreport -V".to_string();
+        state.outils.build_release = "make release".to_string();
+
+        assert!(super::apply_edit(&mut app, &state));
+        let p = &app.projects[0];
+        assert_eq!(p.probe_debug, "./bin/mreport -V", "espaces rognés");
+        assert_eq!(p.build_debug, "make debug");
+        assert_eq!(p.probe_release, "./bin/mreport -V");
+        assert_eq!(p.build_release, "make release");
+        assert_eq!(p.sonde("debug"), Some("./bin/mreport -V"));
+        assert_eq!(p.sonde("release"), Some("./bin/mreport -V"));
       }
 
     /// Un simple changement de statut (version inchangée) écrit la source

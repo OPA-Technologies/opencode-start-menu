@@ -1091,7 +1091,7 @@ fn render_contenu_projet(
       .borders(Borders::NONE)
       .style(opaque);
 
-    let active = state.active_field.min(3);
+    let active = state.active_field.min(7);
     // Même règle que le formulaire de création, via le helper commun : la
     // frappe en cours l'emporte sur la valeur validée.
     let current_value = |state: &ProjectEditState, field: usize| -> String
@@ -1100,10 +1100,19 @@ fn render_contenu_projet(
           {
             0 => state.pending_version.as_str(),
             1 => state.pending_status.as_str(),
-            2 => state.pending_description.as_str(),
+            2 => state.outils.probe_debug.as_str(),
+            3 => state.outils.build_debug.as_str(),
+            4 => state.outils.probe_release.as_str(),
+            5 => state.outils.build_release.as_str(),
+            6 => state.pending_description.as_str(),
             _ => "o/N",
           };
-        let placeholder = if field == 1 { "(aucun)" } else { VIDE };
+        let placeholder = match field
+          {
+            1 => "(aucun)",
+            2..=5 => "(auto)",
+            _ => VIDE,
+          };
         valeur_affiche(
             valide,
             &state.input_buffer,
@@ -1130,6 +1139,10 @@ fn render_contenu_projet(
     let labels = [
         ("Version Debug ", "1.2.3 (format x.y.z)"),
         ("Statut Debug  ", "Study · Alpha · Beta · Debug · Beta-Release · Release · Stable · Deprecated"),
+        ("Sonde Debug   ", "commande -V (vide : sonde auto)"),
+        ("Build Debug   ", "commande de build (vide : Cargo)"),
+        ("Sonde Release ", "commande -V (vide : sonde auto)"),
+        ("Build Release ", "commande de build (vide : Cargo)"),
         ("Description   ", "texte libre non vide"),
         ("Enregistrer ? ", "Variante Debug seule enregistrée"),
       ];
@@ -1137,6 +1150,10 @@ fn render_contenu_projet(
         current_value(state, 0),
         current_value(state, 1),
         current_value(state, 2),
+        current_value(state, 3),
+        current_value(state, 4),
+        current_value(state, 5),
+        current_value(state, 6),
       ];
 
     // Version et Statut : une rangée chacun, sous une rangée vide d'amorce.
@@ -1170,21 +1187,21 @@ fn render_contenu_projet(
     };
 
     // Bloc bas de page à position fixe : la description défilante, au-dessus,
-    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Quatre
-    // rangées en tête (vide + Version + Statut + Binaire), quatre en pied.
+    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Huit
+    // rangées en tête (vide + Version + Statut + 4 outils + Binaire), quatre en pied.
     let hauteur = area.height as usize;
-    let zone_haut = 4usize;
+    let zone_haut = 8usize;
     let zone_bas = 4usize;
     let zone_h = hauteur.saturating_sub(zone_haut + zone_bas).max(1);
 
     // Description repliée au mot dans sa zone dédiée : lue en entier, elle ne
     // pousse plus les rangées suivantes. Le repli et le curseur partagent le
     // même calcul, donc restent bord à bord.
-    let prefixe = format!("{} : ", labels[2].0);
+    let prefixe = format!("{} : ", labels[6].0);
     let (repliees, positions) =
-      replier_texte(&format!("{prefixe}{}", vals[2]), area.width as usize);
+      replier_texte(&format!("{prefixe}{}", vals[6]), area.width as usize);
     let prefixe_chars = prefixe.chars().count();
-    let curseur_repli = if state.editing && active == 2
+    let curseur_repli = if state.editing && active == 6
       {
         let idx = (prefixe_chars + state.input_offset).min(positions.len().saturating_sub(1));
         Some(positions[idx])
@@ -1224,7 +1241,7 @@ fn render_contenu_projet(
                   },
                 );
                 Line::from(vec![
-                    Span::styled(tete, lbl_style(2)),
+                    Span::styled(tete, lbl_style(6)),
                     Span::styled(queue, Style::default()),
                 ])
               }
@@ -1249,7 +1266,7 @@ fn render_contenu_projet(
               }
           };
         Line::from(vec![
-            Span::styled(labels[3].0, lbl_style(3)),
+            Span::styled(labels[7].0, lbl_style(7)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
             Span::styled("[Oui]", choix(true)),
             Span::styled(" / ", Style::default().fg(Color::DarkGray)),
@@ -1257,8 +1274,16 @@ fn render_contenu_projet(
         ])
       };
 
-    let mut lines: Vec<Line<'static>> =
-      vec![Line::from(""), ligne_champ(0), ligne_champ(1), ligne_binaire];
+    let mut lines: Vec<Line<'static>> = vec![
+      Line::from(""),
+      ligne_champ(0),
+      ligne_champ(1),
+      ligne_champ(2),
+      ligne_champ(3),
+      ligne_champ(4),
+      ligne_champ(5),
+      ligne_binaire,
+    ];
     lines.extend(lignes_zone);
     lines.push(ligne_confirm);
     lines.push(match &state.error
@@ -1289,7 +1314,7 @@ fn render_contenu_projet(
     )
     .centered());
     lines.push(Line::from(
-      "Version : x.y.z seulement · Statut : valeur de la liste connue · Description : non vide",
+      "Version : x.y.z seulement · Statut : valeur connue · Outils : commande shell (vide = auto) · Description : non vide",
     )
     .centered());
 
@@ -1301,14 +1326,15 @@ fn render_contenu_projet(
     // Curseur réel : sur la valeur du champ en cours d'édition.
     if state.editing
       {
-        let (cursor_x, cursor_y) = if active == 2
+        let (cursor_x, cursor_y) = if active == 6
           {
             let (cr, cc) = curseur_repli.unwrap_or((0, 0));
             (area.x + cc as u16, area.y + zone_haut as u16 + (cr - scroll) as u16)
           }
         else
           {
-            // Sans bordure : ligne 0 = rangée vide, puis Version, Statut.
+            // Sans bordure : ligne 0 = rangée vide, puis les champs simples
+            // (Version, Statut, outils) chacun sur une rangée.
             let value_x = area.x + labels[active].0.chars().count() as u16 + 3;
             let dans_champ = colonne_curseur(&state.input_buffer, state.input_offset);
             (value_x + dans_champ as u16, area.y + 1 + active as u16)
@@ -2754,7 +2780,15 @@ mod tests
     fn le_curseur_du_popup_se_pose_sur_la_ligne_du_champ()
       {
         let (app, _dir) = app_de_test("curseur-popup");
-        let libelles = ["Version Debug", "Statut Debug", "Description"];
+        let libelles = [
+            "Version Debug",
+            "Statut Debug",
+            "Sonde Debug",
+            "Build Debug",
+            "Sonde Release",
+            "Build Release",
+            "Description",
+        ];
         for (champ, libelle) in libelles.iter().enumerate()
           {
             let mut popup = popup_de_test(&app, crate::Onglet::Projet);
@@ -2816,7 +2850,7 @@ mod tests
         app.projects[0].description = texte_long.clone();
         let mut popup = popup_de_test(&app, crate::Onglet::Projet);
         popup.projet.editing = true;
-        popup.projet.active_field = 2;
+        popup.projet.active_field = 6;
         popup.projet.input_buffer = texte_long.clone();
         popup.projet.input_offset = texte_long.chars().count();
         let (buf, (_, curseur_y)) = popup_avec_curseur(&app, &popup, 110, 34);
@@ -3027,7 +3061,7 @@ mod tests
     fn le_champ_actif_de_l_editeur_se_voit()
       {
         let (app, _dir) = app_de_test("editeur-actif");
-        let libelles = ["Version Debug ", "Statut Debug  ", "Description   ", "Enregistrer ? "];
+        let libelles = ["Version Debug ", "Statut Debug  ", "Sonde Debug   ", "Build Debug   ", "Sonde Release ", "Build Release ", "Description   ", "Enregistrer ? "];
         for champ in 0..libelles.len()
           {
             let mut popup = popup_de_test(&app, crate::Onglet::Projet);
