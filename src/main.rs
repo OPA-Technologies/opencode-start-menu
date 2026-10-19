@@ -53,7 +53,7 @@ use crate::startup::{Progress, Step};
 /// se tiennent comme ceux de tout projet.
 const RELEASE: &str = env!("CARGO_PKG_VERSION");
 const STATUT: &str = "Release";
-const DATE_LAST_MAJ: &str = "15-10-2026";
+const DATE_LAST_MAJ: &str = "19-10-2026";
 
 #[derive(Parser, Debug)]
 #[command(
