@@ -60,12 +60,18 @@ pub(crate) enum Ecart
     SourcesAvantDebug,
     /// Le binaire Debug déclare autre chose que ce que la base enregistre.
     DebugDivergeDeBase { base: String, binaire: String },
+    /// Le binaire Release déclare autre chose que ce que la base enregistre
+    /// (symétrique du Debug : la Release ne suit jamais le Debug toute seule).
+    ReleaseDivergeDeBase { base: String, binaire: String },
     /// La version Debug enregistrée ne suit pas la version des sources
     /// (manifeste) : la base a divergé du code.
     BaseDivergeDesSources { base: String, sources: String },
     /// Les métadonnées Debug et Release enregistrées diffèrent — normal tant
     /// que la Release n'a pas été reconstruite.
     DebugDivergeDeRelease { debug: String, release: String },
+    /// La fiche de build d'une variante ne colle plus à la référence du dernier
+    /// build détecté : elle ne décrit plus le binaire présent.
+    FicheBuildPerimee { variante: Variante },
     /// Un binaire présent ne publie pas le contrat `-V` (version, statut, date).
     BinaireHorsContrat { variante: Variante },
     /// Un statut déclaré n'appartient pas à la liste connue d'op.
@@ -82,11 +88,15 @@ impl Ecart
           {
             Ecart::SourcesAvantDebug => "sources>debug".to_string(),
             Ecart::DebugDivergeDeBase { base, binaire } =>
-              format!("debug>base:{base}->{binaire}"),
+              format!("debug<>base:{base}->{binaire}"),
+            Ecart::ReleaseDivergeDeBase { base, binaire } =>
+              format!("release<>base:{base}->{binaire}"),
             Ecart::BaseDivergeDesSources { base, sources } =>
-              format!("base>sources:{base}->{sources}"),
+              format!("base<>sources:{base}->{sources}"),
             Ecart::DebugDivergeDeRelease { debug, release } =>
               format!("debug<>release:{debug}->{release}"),
+            Ecart::FicheBuildPerimee { variante } =>
+              format!("fiche-perimee:{}", variante.profil()),
             Ecart::BinaireHorsContrat { variante } =>
               format!("hors-contrat:{}", variante.profil()),
             Ecart::StatutHorsListe { variante, statut } =>
@@ -101,8 +111,10 @@ impl Ecart
           {
             Ecart::SourcesAvantDebug => Action::RebuildDebug,
             Ecart::DebugDivergeDeBase { .. } => Action::MajBase,
+            Ecart::ReleaseDivergeDeBase { .. } => Action::MajBase,
             Ecart::BaseDivergeDesSources { .. } => Action::MajBase,
             Ecart::DebugDivergeDeRelease { .. } => Action::RebuildRelease,
+            Ecart::FicheBuildPerimee { .. } => Action::MajBase,
             Ecart::BinaireHorsContrat { .. } => Action::ConformerCode,
             Ecart::StatutHorsListe { .. } => Action::CorrigerStatut,
           }
@@ -117,10 +129,14 @@ impl Ecart
               "les sources sont plus récentes que le binaire Debug".to_string(),
             Ecart::DebugDivergeDeBase { base, binaire } =>
               format!("le binaire Debug ({binaire}) diffère de la base ({base})"),
+            Ecart::ReleaseDivergeDeBase { base, binaire } =>
+              format!("le binaire Release ({binaire}) diffère de la base ({base})"),
             Ecart::BaseDivergeDesSources { base, sources } =>
               format!("la base ({base}) ne suit pas les sources ({sources})"),
             Ecart::DebugDivergeDeRelease { debug, release } =>
               format!("Debug ({debug}) et Release ({release}) diffèrent"),
+            Ecart::FicheBuildPerimee { variante } =>
+              format!("la fiche de build {} ne décrit plus le binaire présent", variante.libelle()),
             Ecart::BinaireHorsContrat { variante } =>
               format!("le binaire {} ne publie pas le contrat -V", variante.libelle()),
             Ecart::StatutHorsListe { variante, statut } =>
@@ -203,6 +219,10 @@ pub(crate) struct Observations
     /// sonde sinon). `None` = binaire absent ou hors contrat.
     pub(crate) debug: Option<EtatVariante>,
     pub(crate) release: Option<EtatVariante>,
+    /// La fiche de build ne colle plus à la référence du dernier build détecté
+    /// (`last_compile_*_secs`) : elle décrit un binaire qui n'est plus là.
+    pub(crate) debug_fiche_perimee: bool,
+    pub(crate) release_fiche_perimee: bool,
     /// Base enregistrée.
     pub(crate) base_version: String,
     pub(crate) base_version_debug: String,
@@ -276,6 +296,18 @@ pub(crate) fn diagnostiquer(obs: &Observations) -> Diagnostic
           }
       }
 
+    // Fiches de build périmées : elles décrivent un binaire qui n'est plus là.
+    for (variante, perimee) in [
+        (Variante::Debug, obs.debug_fiche_perimee),
+        (Variante::Release, obs.release_fiche_perimee),
+      ]
+      {
+        if perimee
+          {
+            ecarts.push(Ecart::FicheBuildPerimee { variante });
+          }
+      }
+
     // Statuts déclarés hors de la liste connue.
     for (variante, etat) in [
         (Variante::Debug, &obs.debug),
@@ -323,6 +355,22 @@ pub(crate) fn diagnostiquer(obs: &Observations) -> Diagnostic
                 date: String::new(),
             }),
             binaire: etiquette(d),
+        });
+      }
+
+    // Binaire Release différent de la base : symétrique du Debug. Pas de garde
+    // « en retard » ici, la Release ne suit jamais les sources toute seule.
+    if let Some(r) = &obs.release
+        && !r.version.is_empty()
+        && (obs.base_version_release != r.version || obs.base_status_release != r.statut)
+      {
+        ecarts.push(Ecart::ReleaseDivergeDeBase {
+            base: etiquette(&EtatVariante {
+                version: obs.base_version_release.clone(),
+                statut: obs.base_status_release.clone(),
+                date: String::new(),
+            }),
+            binaire: etiquette(r),
         });
       }
 
@@ -398,6 +446,14 @@ pub(crate) fn observer(entry: &ProjectEntry) -> Observations
     let debug = etat(Variante::Debug, debug_mtime, &entry.debug_snapshot);
     let release = etat(Variante::Release, release_mtime, &entry.release_snapshot);
 
+    // Une fiche est périmée dès qu'elle ne colle plus à la référence du dernier
+    // build détecté : elle ne décrit plus le binaire présent.
+    let fiche_perimee = |snapshot: &Option<registry::SnapshotCompile>, reference: u64| {
+        snapshot
+            .as_ref()
+            .is_some_and(|f| f.compile_secs != reference)
+    };
+
     let sources_mtime = registry::source_modified_time(&entry.path).and_then(secs);
     Observations {
         a_du_code,
@@ -409,6 +465,8 @@ pub(crate) fn observer(entry: &ProjectEntry) -> Observations
         release_mtime,
         debug,
         release,
+        debug_fiche_perimee: fiche_perimee(&entry.debug_snapshot, entry.last_compile_debug_secs),
+        release_fiche_perimee: fiche_perimee(&entry.release_snapshot, entry.last_compile_release_secs),
         base_version: entry.version.clone(),
         base_version_debug: entry.version_debug.clone(),
         base_status_debug: entry.status_debug.clone(),
@@ -442,6 +500,8 @@ mod tests
                 statut: "Release".to_string(),
                 date: "14-10-2026".to_string(),
             }),
+            debug_fiche_perimee: false,
+            release_fiche_perimee: false,
             base_version: "1.0.0".to_string(),
             base_version_debug: "1.0.0".to_string(),
             base_status_debug: "Release".to_string(),
@@ -516,6 +576,30 @@ mod tests
         };
         let d = diagnostiquer(&o);
         assert!(d.ecarts.iter().any(|e| matches!(e, Ecart::DebugDivergeDeBase { .. })));
+        assert!(d.actions().contains(&Action::MajBase));
+      }
+
+    #[test]
+    fn un_binaire_release_different_de_la_base_propose_de_realigner()
+      {
+        let o = Observations {
+            base_version_release: "9.9.9".to_string(),
+            ..obs_projet_coherent()
+        };
+        let d = diagnostiquer(&o);
+        assert!(d.ecarts.iter().any(|e| matches!(e, Ecart::ReleaseDivergeDeBase { .. })));
+        assert!(d.actions().contains(&Action::MajBase));
+      }
+
+    #[test]
+    fn une_fiche_de_build_perimee_est_signalee()
+      {
+        let o = Observations {
+            debug_fiche_perimee: true,
+            ..obs_projet_coherent()
+        };
+        let d = diagnostiquer(&o);
+        assert!(d.ecarts.contains(&Ecart::FicheBuildPerimee { variante: Variante::Debug }));
         assert!(d.actions().contains(&Action::MajBase));
       }
 
@@ -628,6 +712,10 @@ mod tests
                 base: "1.0.0_Release".to_string(),
                 binaire: "1.0.1_Release".to_string(),
             },
+            Ecart::ReleaseDivergeDeBase {
+                base: "1.0.0_Release".to_string(),
+                binaire: "0.9.0_Release".to_string(),
+            },
             Ecart::BaseDivergeDesSources {
                 base: "1.0.1".to_string(),
                 sources: "1.0.0".to_string(),
@@ -636,6 +724,7 @@ mod tests
                 debug: "1.0.0_Release".to_string(),
                 release: "0.9.0_Release".to_string(),
             },
+            Ecart::FicheBuildPerimee { variante: Variante::Release },
             Ecart::BinaireHorsContrat { variante: Variante::Release },
             Ecart::StatutHorsListe {
                 variante: Variante::Debug,
