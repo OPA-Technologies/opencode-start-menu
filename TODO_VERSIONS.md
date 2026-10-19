@@ -1,6 +1,6 @@
 # TODO — Corrections comportement versions
 
-> Document de travail. Révisé le 2026-10-19. Version courante : 0.50.5.
+> Document de travail. Révisé le 2026-10-19. Version courante : 0.50.6.
 > Le chantier « versions » est livré pour ses phases 1 à 7 ; voir
 > `ANALYSE_VERSIONS_RESUME.md` pour le contrat et l'état.
 

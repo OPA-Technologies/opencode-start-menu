@@ -1,7 +1,7 @@
 # Résumé Analyse Versions — opencode-start-menu
 
 > Document de travail. Révisé le 2026-10-19, après la livraison des phases 1 à 7
-> du chantier « versions ». Version courante : 0.50.5 (`Cargo.toml`). Voir
+> du chantier « versions ». Version courante : 0.50.6 (`Cargo.toml`). Voir
 > `TODO_VERSIONS.md` pour les actions encore ouvertes.
 
 ## Principe directeur (cahier des charges)
