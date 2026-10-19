@@ -2967,6 +2967,17 @@ fn executer_corriger_statut(app: &mut App, id: &str) -> Result<()>
     conformer_et_rebuild(app, id, &statut)
   }
 
+/// Libellé d'une action « base mise à jour » : « Release rattrapée » quand la
+/// base rattrape une variante Release, message générique sinon.
+fn libelle_maj_base(ecart: &coherence::Ecart) -> &'static str
+  {
+    match ecart.variante()
+      {
+        Some(coherence::Variante::Release) => "Release rattrapée",
+        _ => "base mise à jour",
+      }
+  }
+
 /// Applique l'action proposée par une ligne, si elle est exécutable.
 fn appliquer_action(app: &mut App, ligne: &LigneCoherence) -> Result<()>
   {
@@ -2978,7 +2989,11 @@ fn appliquer_action(app: &mut App, ligne: &LigneCoherence) -> Result<()>
             executer_maj_base(app, &ligne.projet_id)?;
             retirer_refus_ecart(app, &ligne.projet_id, &ligne.ecart.cle())?;
             controler_coherence(app);
-            app.push_info(format!("{} : base mise à jour", ligne.projet_nom));
+            app.push_info(format!(
+                "{} : {}",
+                ligne.projet_nom,
+                libelle_maj_base(&ligne.ecart)
+            ));
             Ok(())
           }
         RebuildDebug =>
@@ -6024,6 +6039,39 @@ mod tests
         assert_eq!(
             super::libelle_bifilaire(Some(("0.50.4", "Stable", "")), ("0.50.4", "")),
             "0.50.4_Stable",
+        );
+      }
+
+    /// Le message d'action distingue le rattrapage d'une Release du simple
+    /// alignement de la base Debug.
+    #[test]
+    fn libelle_maj_base_nomme_la_release_rattrapee()
+      {
+        use crate::coherence::{Ecart, Variante};
+        assert_eq!(
+            super::libelle_maj_base(&Ecart::ReleaseDivergeDeBase {
+                base: "1.0.0".to_string(),
+                binaire: "0.9.0".to_string(),
+            }),
+            "Release rattrapée",
+        );
+        assert_eq!(
+            super::libelle_maj_base(&Ecart::FicheBuildPerimee { variante: Variante::Release }),
+            "Release rattrapée",
+        );
+        assert_eq!(
+            super::libelle_maj_base(&Ecart::DebugDivergeDeBase {
+                base: "1.0.0".to_string(),
+                binaire: "1.0.1".to_string(),
+            }),
+            "base mise à jour",
+        );
+        assert_eq!(
+            super::libelle_maj_base(&Ecart::DebugDivergeDeRelease {
+                debug: "1.0.0".to_string(),
+                release: "0.9.0".to_string(),
+            }),
+            "base mise à jour",
         );
       }
 

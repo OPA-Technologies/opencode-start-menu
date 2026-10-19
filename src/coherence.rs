@@ -143,6 +143,25 @@ impl Ecart
               format!("statut {} inconnu (« {statut} »)", variante.libelle()),
           }
       }
+
+  /// Variante concernée, quand l'écart n'en vise qu'une seule.
+  ///
+  /// `None` pour [`Ecart::DebugDivergeDeRelease`], qui les concerne toutes les
+  /// deux. Sert aux messages d'action (« Release rattrapée »).
+  pub(crate) fn variante(&self) -> Option<Variante>
+    {
+      match self
+        {
+          Ecart::SourcesAvantDebug
+          | Ecart::DebugDivergeDeBase { .. }
+          | Ecart::BaseDivergeDesSources { .. } => Some(Variante::Debug),
+          Ecart::ReleaseDivergeDeBase { .. } => Some(Variante::Release),
+          Ecart::FicheBuildPerimee { variante }
+          | Ecart::BinaireHorsContrat { variante }
+          | Ecart::StatutHorsListe { variante, .. } => Some(*variante),
+          Ecart::DebugDivergeDeRelease { .. } => None,
+        }
+    }
   }
 
 /// Action proposée pour résorber un écart.
@@ -737,6 +756,60 @@ mod tests
             assert!(!e.cle().is_empty(), "clé manquante : {e:?}");
             let _ = e.action();
           }
+      }
+
+    #[test]
+    fn chaque_ecart_sait_sa_variante()
+      {
+        assert_eq!(Ecart::SourcesAvantDebug.variante(), Some(Variante::Debug));
+        assert_eq!(
+            Ecart::DebugDivergeDeBase {
+                base: "1.0.0".to_string(),
+                binaire: "1.0.1".to_string(),
+            }
+            .variante(),
+            Some(Variante::Debug)
+        );
+        assert_eq!(
+            Ecart::ReleaseDivergeDeBase {
+                base: "1.0.0".to_string(),
+                binaire: "0.9.0".to_string(),
+            }
+            .variante(),
+            Some(Variante::Release)
+        );
+        assert_eq!(
+            Ecart::BaseDivergeDesSources {
+                base: "1.0.1".to_string(),
+                sources: "1.0.0".to_string(),
+            }
+            .variante(),
+            Some(Variante::Debug)
+        );
+        assert_eq!(
+            Ecart::DebugDivergeDeRelease {
+                debug: "1.0.0".to_string(),
+                release: "0.9.0".to_string(),
+            }
+            .variante(),
+            None
+        );
+        assert_eq!(
+            Ecart::FicheBuildPerimee { variante: Variante::Release }.variante(),
+            Some(Variante::Release)
+        );
+        assert_eq!(
+            Ecart::BinaireHorsContrat { variante: Variante::Debug }.variante(),
+            Some(Variante::Debug)
+        );
+        assert_eq!(
+            Ecart::StatutHorsListe {
+                variante: Variante::Release,
+                statut: "Zorglub".to_string(),
+            }
+            .variante(),
+            Some(Variante::Release)
+        );
       }
 
     #[test]

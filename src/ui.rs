@@ -1168,29 +1168,40 @@ fn render_contenu_projet(
 
     // Rappel en lecture seule de la vérité binaire (fiche de build cohérente) :
     // montre à l'utilisateur ce qui est réellement compilé, et l'écart avec la
-    // base qu'il est en train d'éditer.
-    let ligne_binaire = {
+    // base qu'il édite. Une ligne par variante : Debug (base = valeurs en cours
+    // d'édition) et Release (base = valeurs persistées, non éditables ici).
+    let ligne_binaire = |profil: &str, base_v: &str, base_s: &str, etiquette: &str| -> Line<'static>
+      {
         let libelle = projet
             .map(|p| {
-                let fiche = crate::fiche_pour_affichage(p, "debug");
+                let fiche = crate::fiche_pour_affichage(p, profil);
                 crate::libelle_bifilaire(
                     fiche.as_ref().map(|(v, s, d)| (v.as_str(), s.as_str(), d.as_str())),
-                    (state.pending_version.as_str(), state.pending_status.as_str()),
+                    (base_v, base_s),
                 )
             })
             .unwrap_or_else(|| "—".to_string());
         Line::from(vec![
-            Span::styled("Binaire  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(etiquette.to_string(), Style::default().fg(Color::DarkGray)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
             Span::styled(sanitize(&libelle), Style::default().fg(Color::DarkGray)),
         ])
-    };
+      };
+    let ligne_binaire_debug =
+        ligne_binaire("debug", &state.pending_version, &state.pending_status, "Binaire D");
+    let ligne_binaire_release = ligne_binaire(
+        "release",
+        projet.map(|p| p.version_release.as_str()).unwrap_or(""),
+        projet.map(|p| p.status_release.as_str()).unwrap_or(""),
+        "Binaire R",
+    );
 
     // Bloc bas de page à position fixe : la description défilante, au-dessus,
-    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Huit
-    // rangées en tête (vide + Version + Statut + 4 outils + Binaire), quatre en pied.
+    // ne peut donc jamais décaler « Enregistrer ? » ni les touches. Neuf
+    // rangées en tête (vide + Version + Statut + 4 outils + 2 binaires), quatre
+    // en pied.
     let hauteur = area.height as usize;
-    let zone_haut = 8usize;
+    let zone_haut = 9usize;
     let zone_bas = 4usize;
     let zone_h = hauteur.saturating_sub(zone_haut + zone_bas).max(1);
 
@@ -1282,7 +1293,8 @@ fn render_contenu_projet(
       ligne_champ(3),
       ligne_champ(4),
       ligne_champ(5),
-      ligne_binaire,
+      ligne_binaire_debug,
+      ligne_binaire_release,
     ];
     lines.extend(lignes_zone);
     lines.push(ligne_confirm);
@@ -3069,6 +3081,18 @@ mod tests
             let buf = popup_dans_buffer(&app, &popup, 110, 34);
             assert_champs_differencies(&buf, &libelles, Some(0), champ, "éditeur");
           }
+      }
+
+    /// Le popup Réglages montre la vérité binaire des deux variantes, comme le
+    /// popup Détails : Debug et Release ont chacune leur ligne.
+    #[test]
+    fn le_popup_reglages_montre_les_deux_binaires()
+      {
+        let (app, _dir) = app_de_test("reglages-bifilaire");
+        let popup = popup_de_test(&app, crate::Onglet::Projet);
+        let rendu = rendre_popup(&app, &popup);
+        assert!(rendu.contains("Binaire D :"), "ligne Debug absente :\n{rendu}");
+        assert!(rendu.contains("Binaire R :"), "ligne Release absente :\n{rendu}");
       }
 
     /// « Enregistrer ? » n'est pas un texte à saisir : c'est un choix

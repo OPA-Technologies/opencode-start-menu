@@ -27,10 +27,13 @@
 6. **Coûts et devises à zéro** — FAIT (commit 1bd77bd) : `cout_affiche()` rend
    « — » quand un coût nul accompagne des tokens, et le montant à zéro n'est
    gardé que pour une session sans tokens.
+7. **Affichage bifilaire Release dans Réglages** — FAIT : le popup montre deux
+   lignes binaires, Debug (base = valeurs éditées) et Release (base =
+   valeurs persistées), comme le popup Détails.
+8. **Distinguer « Release rattrapée » de « Release reconstruite »** — FAIT :
+   `Ecart::variante()` + `libelle_maj_base()` nomment le rattrapage d'une
+   Release ; le rebuild déclaré garde « Release reconstruite ».
 
 ## Encore ouvert
 
-- **Rien de bloquant.** Pistes :
-  - affichage bifilaire Release dans le popup Réglages comme pour le Debug
-    (`ligne_binaire` ne montre aujourd'hui que la variante Debug) ;
-  - distinguer dans le message « Release rattrapée » de « Release rebuildée ».
+- **Rien de bloquant, rien de connu.**
