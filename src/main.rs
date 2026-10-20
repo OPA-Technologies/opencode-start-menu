@@ -440,6 +440,10 @@ pub(crate) struct ProjectEditState {
     pub(crate) status_menu_open: bool,
     pub(crate) status_filter: String,
     pub(crate) status_cursor: usize,
+    /// Typologie du projet, choisie dans un popup dédié (onglet Projet).
+    pub(crate) pending_typologie: String,
+    pub(crate) typologie_menu_open: bool,
+    pub(crate) typologie_cursor: usize,
   }
 
 impl Default for ProjectEditState
@@ -462,6 +466,9 @@ impl Default for ProjectEditState
             status_menu_open: false,
             status_filter: String::new(),
             status_cursor: 0,
+            pending_typologie: registry::TYPOLOGIE_DEFAUT.to_string(),
+            typologie_menu_open: false,
+            typologie_cursor: 0,
           }
       }
   }
@@ -491,6 +498,13 @@ impl ProjectEditState
             status_menu_open: false,
             status_filter: String::new(),
             status_cursor: 0,
+            pending_typologie: if registry::validate_typologie(&project.typologie) {
+                project.typologie.clone()
+            } else {
+                registry::TYPOLOGIE_DEFAUT.to_string()
+            },
+            typologie_menu_open: false,
+            typologie_cursor: 0,
           }
       }
   }
@@ -756,6 +770,12 @@ pub(crate) fn filtered_statuses(filter: &str) -> Vec<&'static str>
           .copied()
           .collect()
       }
+  }
+
+/// Typologies proposées au choix dans l'onglet Projet (liste fermée).
+pub(crate) fn typologies_liste() -> Vec<&'static str>
+  {
+    registry::TYPOLOGIES.to_vec()
   }
 
 /// Incrémente le dernier étage (z) d'une version x.y.z.
@@ -4640,6 +4660,7 @@ fn signature_persistee(e: &ProjectEntry) -> String
       e.last_target_debug_secs.to_string(),
       e.last_target_release_secs.to_string(),
       e.version_manually_edited.to_string(),
+      e.typologie.clone(),
       e.date_debug.clone(),
       e.date_release.clone(),
       e.probe_debug.clone(),
@@ -5181,6 +5202,7 @@ fn handle_creation_input(
                         total_valorisation: String::new(),
                         tarif_resume: String::new(),
                         est_bibliotheque: state.bibliotheque,
+                        typologie: registry::typologie_auto(&dir).to_string(),
                     });
                     // Création de projet : la fiche naît du menu, toutes ses
                     // métadonnées sont déclarées d'emblée à la garde.
@@ -5408,9 +5430,14 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     registry::accepter_modification(format!("{}:version", p.id));
     registry::accepter_modification(format!("{}:status", p.id));
     registry::accepter_modification(format!("{}:date_debug", p.id));
+    registry::accepter_modification(format!("{}:typologie", p.id));
     p.version_debug = state.pending_version.clone();
     p.status_debug = state.pending_status.clone();
     p.description = state.pending_description.clone();
+    if registry::validate_typologie(&state.pending_typologie)
+      {
+        p.typologie = state.pending_typologie.clone();
+      }
     // Commandes d'outils par variante : simples réglages, non protégés par la
     // garde des métadonnées de vérité. Vide = auto (sonde `target/<profil>`,
     // build Cargo).
@@ -5455,7 +5482,7 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
     true
 }
 
-const EDIT_CONFIRM_FIELD: usize = 7;
+const EDIT_CONFIRM_FIELD: usize = 8;
 
 /// Nombre de champs éditables du popup de valorisation :
 /// 0 = mode, 1 = tarif manuel, 2 = pays source.
@@ -5810,6 +5837,11 @@ fn handle_edit_input(
                     state.status_menu_open = false;
                     return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
+                if state.typologie_menu_open
+                  {
+                    state.typologie_menu_open = false;
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
+                  }
                 return Ok(InputMode::Normal);
               }
             KeyCode::Up | KeyCode::Down =>
@@ -5825,6 +5857,19 @@ fn handle_edit_input(
                     else if delta == usize::MAX && state.status_cursor > 0
                       {
                         state.status_cursor -= 1;
+                      }
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
+                  }
+                if state.typologie_menu_open
+                  {
+                    let items = typologies_liste();
+                    if key.code == KeyCode::Down && state.typologie_cursor + 1 < items.len()
+                      {
+                        state.typologie_cursor += 1;
+                      }
+                    else if key.code == KeyCode::Up && state.typologie_cursor > 0
+                      {
+                        state.typologie_cursor -= 1;
                       }
                     return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
@@ -5871,12 +5916,37 @@ fn handle_edit_input(
                       }
                     return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
+                if state.typologie_menu_open
+                  {
+                    let items = typologies_liste();
+                    if let Some(sel) = items.get(state.typologie_cursor).copied()
+                      {
+                        state.pending_typologie = sel.to_string();
+                        state.typologie_menu_open = false;
+                        state.error = None;
+                        if state.active_field < EDIT_CONFIRM_FIELD
+                          {
+                            state.active_field += 1;
+                          }
+                      }
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
+                  }
                 if state.active_field == 1
                   {
                     // Champ Statut : ouverture du menu déroulant.
                     state.status_menu_open = true;
                     state.status_filter.clear();
                     state.status_cursor = 0;
+                    return Ok(InputMode::Popup(base.avec_projet(state.clone())));
+                  }
+                if state.active_field == 7
+                  {
+                    // Champ Typologie : ouverture du menu de choix.
+                    state.typologie_menu_open = true;
+                    state.typologie_cursor = typologies_liste()
+                      .iter()
+                      .position(|t| *t == state.pending_typologie)
+                      .unwrap_or(0);
                     return Ok(InputMode::Popup(base.avec_projet(state.clone())));
                   }
                 if state.active_field < EDIT_CONFIRM_FIELD
@@ -6328,6 +6398,7 @@ mod tests
             total_valorisation: String::new(),
             tarif_resume: String::new(),
             est_bibliotheque: false,
+            typologie: "Other".to_string(),
         }
     }
 
@@ -7566,6 +7637,39 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         assert_eq!(p.sonde("release"), Some("./bin/mreport -V"));
       }
 
+    /// Entrée sur le champ Typologie ouvre le menu de choix, ↓ déplace le
+    /// curseur, Entrée retient la valeur ; le choix se reporte en base.
+    #[test]
+    fn le_menu_typologie_choisit_et_reporte_en_base()
+      {
+        let mut app = app_avec_projet();
+        let mut popup = crate::Popup::nouveau(
+          0,
+          super::ProjectEditState::from_project(&app.projects[0], 0),
+          "FRA".to_string(),
+        );
+        let mut ouvert = popup.projet.clone();
+        ouvert.active_field = 7;
+        popup = popup.avec_projet(ouvert);
+        // Entrée ouvre le menu sur la valeur courante, ↓ puis Entrée choisit.
+        let etat = frappe_dans_le_champ(
+          &mut app,
+          &popup,
+          &[KeyCode::Enter, KeyCode::Down, KeyCode::Enter],
+        );
+        assert!(
+          super::registry::validate_typologie(&etat.pending_typologie),
+          "une typologie connue est retenue : {}",
+          etat.pending_typologie
+        );
+        assert!(!etat.typologie_menu_open, "le menu se referme après validation");
+
+        let mut a_retenir = super::ProjectEditState::from_project(&app.projects[0], 0);
+        a_retenir.pending_typologie = "Code-App".to_string();
+        assert!(super::apply_edit(&mut app, &a_retenir));
+        assert_eq!(app.projects[0].typologie, "Code-App");
+      }
+
     /// Un simple changement de statut (version inchangée) écrit la source
     /// sans lever le drapeau anti-bump : le prochain bump reste légitime.
     #[test]
@@ -8410,7 +8514,8 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
                 tarif_web_fetched_ms: 0,
                 tarif_web_secteur: false,
                 tarif_web_pays: String::new(),
-                est_bibliotheque: false,
+            est_bibliotheque: false,
+            typologie: "Other".to_string(),
             });
         }
         app.archiver_selection().expect("archivage possible");

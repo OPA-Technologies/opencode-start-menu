@@ -389,6 +389,10 @@ pub(crate) struct Project {
     /// projet hors de cette racine.
     #[serde(default)]
     est_bibliotheque: bool,
+    /// Typologie du projet (voir [`TYPOLOGIES`]). Vide dans un ancien registre :
+    /// migrée à la lecture par auto-détection.
+    #[serde(default)]
+    typologie: String,
     /// Refus de cohérence conservés (voir [`RefusCoherence`]). Gérés par
     /// [`save_refus`], préservés par [`save_registry_full`].
     #[serde(default)]
@@ -417,6 +421,43 @@ pub(crate) fn validate_version(v: &str) -> bool {
 
 pub(crate) fn validate_status(s: &str) -> bool {
     STATUSES.contains(&s)
+}
+
+/// Typologie d'un projet : sa nature, pas sa variante. Fermée et stable, elle
+/// décide notamment si op doit confier à opencode l'écriture des constantes
+/// (`Code-*`) ou si la date de cible au mtime suffit.
+pub(crate) const TYPOLOGIES: &[&str] = &[
+    "Code-App",
+    "Code-Lib",
+    "Doc-Lib",
+    "Doc-office",
+    "Other",
+];
+
+/// Typologie de repli quand rien ne permet de trancher.
+pub(crate) const TYPOLOGIE_DEFAUT: &str = "Other";
+
+pub(crate) fn validate_typologie(s: &str) -> bool {
+    TYPOLOGIES.contains(&s)
+}
+
+/// Typologie auto-détectée depuis le contenu du dossier : du code s'il y a des
+/// sources (`src/`), une application si un binaire est déclaré, une
+/// bibliothèque sinon. Sans source, `Other` — la détection ne devine pas un
+/// document.
+pub(crate) fn typologie_auto(dir: &Path) -> &'static str {
+    let a_src = dir.join("src").is_dir();
+    let a_manifeste = dir.join("Cargo.toml").is_file();
+    if a_src || a_manifeste {
+        // `src/main.rs` ou un `[[bin]]` : application ; sinon bibliothèque.
+        if dir.join("src/main.rs").is_file() || dir.join("src/bin").is_dir() {
+            "Code-App"
+        } else {
+            "Code-Lib"
+        }
+    } else {
+        TYPOLOGIE_DEFAUT
+    }
 }
 
 /// Tarif horaire manuel recevable : fini, et positif ou nul.
@@ -588,6 +629,8 @@ pub(crate) struct ProjectEntry {
     pub(crate) last_session_cost_local: String,
     /// L'entrée est une bibliothèque de code réutilisable.
     pub(crate) est_bibliotheque: bool,
+    /// Typologie du projet (voir [`TYPOLOGIES`]).
+    pub(crate) typologie: String,
     pub(crate) last_agent: String,
     pub(crate) last_time_created: String,
     pub(crate) last_session_context_pct: String,
@@ -755,6 +798,13 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                     .map(date_jj_mm_yyyy)
                     .unwrap_or_else(date_du_jour)
             };
+            // Migration : une typologie absente (ancien registre) est
+            // auto-détectée depuis le contenu du dossier.
+            let typologie = if validate_typologie(&p.typologie) {
+                p.typologie.clone()
+            } else {
+                typologie_auto(&dir).to_string()
+            };
             ProjectEntry {
                 id,
                 name: p.name,
@@ -808,6 +858,7 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 tarif_web_secteur: p.tarif_web_secteur,
                 tarif_web_pays: p.tarif_web_pays.clone(),
                 est_bibliotheque: p.est_bibliotheque,
+                typologie,
             }
         })
         .collect::<Vec<ProjectEntry>>();
@@ -2026,6 +2077,7 @@ fn garder_metadonnees(
     // changer que via une déclaration explicite (édition source, rattrapage).
     aligner_date!(date_debug);
     aligner_date!(date_release);
+    aligner!(typologie);
     aligner!(last_compile_debug_secs);
     aligner!(last_compile_release_secs);
     aligner!(last_target_debug_secs);
@@ -2152,6 +2204,7 @@ pub(crate) fn save_registry_full(
             total_valorisation: p.total_valorisation.clone(),
             tarif_resume: p.tarif_resume.clone(),
             est_bibliotheque: p.est_bibliotheque,
+            typologie: p.typologie.clone(),
             // Les refus de cohérence sont gérés par `save_refus`, jamais par la
             // vue d'usage `ProjectEntry` : on préserve la valeur persistée.
             refus_coherence: existants
@@ -2288,6 +2341,7 @@ pub(crate) fn reindex_from_disk(
             tarif_web_secteur: false,
             tarif_web_pays: String::new(),
             est_bibliotheque: est_lib,
+            typologie: typologie_auto(dir).to_string(),
         });
         added += 1;
     };
@@ -2911,6 +2965,7 @@ mod tests
                 total_valorisation: String::new(),
                 tarif_resume: String::new(),
                 est_bibliotheque: false,
+                typologie: "Other".to_string(),
             }],
         )
         .unwrap();
@@ -2990,6 +3045,7 @@ mod tests
                     total_valorisation: String::new(),
                     tarif_resume: String::new(),
                     est_bibliotheque: false,
+                    typologie: "Other".to_string(),
             }],
             )
             .unwrap();
@@ -3053,6 +3109,7 @@ mod tests
             total_valorisation: String::new(),
             tarif_resume: String::new(),
             est_bibliotheque: false,
+            typologie: "Other".to_string(),
         }
     }
 
@@ -3082,6 +3139,52 @@ mod tests
         p.est_bibliotheque = true;
         super::deriver_bibliotheques(std::slice::from_mut(&mut p), &libs);
         assert!(p.est_bibliotheque, "la mention explicite ne se perd pas");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// La typologie est auto-détectée depuis le contenu : une appli a un
+    /// binaire (`src/main.rs`), une lib n'en a pas, un dossier vide est
+    /// `Other`.
+    #[test]
+    fn typologie_auto_distingue_appli_lib_et_other() {
+        let dir = temp_registry("typologie-auto");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::write(app.join("src/main.rs"), "fn main() {}").unwrap();
+        assert_eq!(super::typologie_auto(&app), "Code-App");
+
+        let lib = dir.join("lib");
+        fs::create_dir_all(lib.join("src")).unwrap();
+        fs::write(lib.join("src/lib.rs"), "").unwrap();
+        assert_eq!(super::typologie_auto(&lib), "Code-Lib");
+
+        let vide = dir.join("vide");
+        fs::create_dir_all(&vide).unwrap();
+        assert_eq!(super::typologie_auto(&vide), "Other");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Une typologie absente d'un ancien registre est migrée par auto-détection
+    /// au chargement.
+    #[test]
+    fn la_typologie_absente_est_migree_au_chargement() {
+        let dir = temp_registry("typologie-migration");
+        let projet = dir.join("app");
+        fs::create_dir_all(projet.join("src")).unwrap();
+        fs::write(projet.join("src/main.rs"), "fn main() {}").unwrap();
+        let registre = dir.join("projects.json");
+        let json = serde_json::json!({
+            "projects": {
+                "app": {
+                    "name": "app",
+                    "path": projet.to_str().unwrap(),
+                    "description": ""
+                }
+            }
+        });
+        fs::write(&registre, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let projets = super::load_registry(&registre).unwrap();
+        assert_eq!(projets[0].typologie, "Code-App", "auto-détectée à la lecture");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3829,6 +3932,7 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             total_valorisation: String::new(),
             tarif_resume: String::new(),
             est_bibliotheque: false,
+            typologie: "Other".to_string(),
         }
     }
 
@@ -4143,6 +4247,7 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             total_valorisation: String::new(),
             tarif_resume: String::new(),
             est_bibliotheque: false,
+            typologie: "Other".to_string(),
         }
     }
 

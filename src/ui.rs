@@ -1091,7 +1091,7 @@ fn render_contenu_projet(
       .borders(Borders::NONE)
       .style(opaque);
 
-    let active = state.active_field.min(7);
+    let active = state.active_field.min(8);
     // Même règle que le formulaire de création, via le helper commun : la
     // frappe en cours l'emporte sur la valeur validée.
     let current_value = |state: &ProjectEditState, field: usize| -> String
@@ -1105,6 +1105,7 @@ fn render_contenu_projet(
             4 => state.outils.probe_release.as_str(),
             5 => state.outils.build_release.as_str(),
             6 => state.pending_description.as_str(),
+            7 => state.pending_typologie.as_str(),
             _ => "o/N",
           };
         let placeholder = match field
@@ -1144,6 +1145,7 @@ fn render_contenu_projet(
         ("Sonde Release ", "commande -V (vide : sonde auto)"),
         ("Build Release ", "commande de build (vide : Cargo)"),
         ("Description   ", "texte libre non vide"),
+        ("Typologie     ", "Code-App · Code-Lib · Doc-Lib · Doc-office · Other"),
         ("Enregistrer ? ", "Variante Debug seule enregistrée"),
       ];
     let vals = [
@@ -1154,6 +1156,7 @@ fn render_contenu_projet(
         current_value(state, 4),
         current_value(state, 5),
         current_value(state, 6),
+        current_value(state, 7),
       ];
 
     // Version et Statut : une rangée chacun, sous une rangée vide d'amorce.
@@ -1201,7 +1204,7 @@ fn render_contenu_projet(
     // rangées en tête (vide + Version + Statut + 4 outils + 2 binaires), quatre
     // en pied.
     let hauteur = area.height as usize;
-    let zone_haut = 9usize;
+    let zone_haut = 10usize;
     let zone_bas = 4usize;
     let zone_h = hauteur.saturating_sub(zone_haut + zone_bas).max(1);
 
@@ -1277,7 +1280,7 @@ fn render_contenu_projet(
               }
           };
         Line::from(vec![
-            Span::styled(labels[7].0, lbl_style(7)),
+            Span::styled(labels[8].0, lbl_style(8)),
             Span::styled(" : ", Style::default().fg(Color::DarkGray)),
             Span::styled("[Oui]", choix(true)),
             Span::styled(" / ", Style::default().fg(Color::DarkGray)),
@@ -1293,6 +1296,7 @@ fn render_contenu_projet(
       ligne_champ(3),
       ligne_champ(4),
       ligne_champ(5),
+      ligne_champ(7),
       ligne_binaire_debug,
       ligne_binaire_release,
     ];
@@ -1310,6 +1314,10 @@ fn render_contenu_projet(
       if state.status_menu_open
         {
           "↑/↓ Naviguer · Entrée valider · Échap annuler · Frappe filtrer"
+        }
+      else if state.typologie_menu_open
+        {
+          "↑/↓ Naviguer · Entrée valider · Échap annuler"
         }
       else if state.editing
         {
@@ -1346,10 +1354,13 @@ fn render_contenu_projet(
         else
           {
             // Sans bordure : ligne 0 = rangée vide, puis les champs simples
-            // (Version, Statut, outils) chacun sur une rangée.
+            // (Version, Statut, outils, Typologie) chacun sur une rangée. La
+            // Typologie (champ 7) vient après les outils, d'où sa rangée
+            // propre ; son menu n'entre jamais en édition texte.
             let value_x = area.x + labels[active].0.chars().count() as u16 + 3;
             let dans_champ = colonne_curseur(&state.input_buffer, state.input_offset);
-            (value_x + dans_champ as u16, area.y + 1 + active as u16)
+            let rang = if active == 7 { 7 } else { 1 + active };
+            (value_x + dans_champ as u16, area.y + rang as u16)
           };
         let cursor_x = cursor_x.min(area.x.saturating_add(area.width).saturating_sub(1));
         let cursor_y = cursor_y.min(area.y.saturating_add(area.height).saturating_sub(1));
@@ -1403,6 +1414,43 @@ fn render_contenu_projet(
           };
         let pblock = Block::default()
           .title(title)
+          .borders(Borders::ALL)
+          .border_style(Style::default().fg(Color::Cyan))
+          .style(Style::default().bg(Color::Black));
+        let ppar = Paragraph::new(popup).block(pblock);
+        f.render_widget(ppar, parea);
+      }
+    // Menu déroulant Typologie (champ 7) : popup opaque sous sa ligne.
+    if state.typologie_menu_open
+      {
+        let items = crate::typologies_liste();
+        let visible = items.len().min(5);
+        let width = items.iter().map(|s| s.chars().count()).max().unwrap_or(12) + 2;
+        let px = (area.x + 3).min(area.x.saturating_add(area.width).saturating_sub(width as u16));
+        // Superposé à la rangée de la Typologie (`area.y + 7`).
+        let py = area.y + 7;
+        let parea = Rect {
+            x: px,
+            y: py,
+            width: width as u16,
+            height: (visible + 2) as u16,
+          };
+        let parea = parea.intersection(area);
+        f.render_widget(Clear, parea);
+        let mut popup: Vec<Line> = Vec::new();
+        for (idx, item) in items.iter().enumerate().take(visible) {
+            let style = if idx == state.typologie_cursor
+              {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+              }
+            else
+              {
+                Style::default().fg(Color::White)
+              };
+            popup.push(Line::from(Span::styled(*item, style)));
+          }
+        let pblock = Block::default()
+          .title(" Typologie ")
           .borders(Borders::ALL)
           .border_style(Style::default().fg(Color::Cyan))
           .style(Style::default().bg(Color::Black));
@@ -3073,7 +3121,7 @@ mod tests
     fn le_champ_actif_de_l_editeur_se_voit()
       {
         let (app, _dir) = app_de_test("editeur-actif");
-        let libelles = ["Version Debug ", "Statut Debug  ", "Sonde Debug   ", "Build Debug   ", "Sonde Release ", "Build Release ", "Description   ", "Enregistrer ? "];
+        let libelles = ["Version Debug ", "Statut Debug  ", "Sonde Debug   ", "Build Debug   ", "Sonde Release ", "Build Release ", "Description   ", "Typologie     ", "Enregistrer ? "];
         for champ in 0..libelles.len()
           {
             let mut popup = popup_de_test(&app, crate::Onglet::Projet);

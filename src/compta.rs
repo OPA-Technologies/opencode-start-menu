@@ -274,6 +274,7 @@ mod tests
             last_session_cost: String::new(),
             last_session_cost_local: String::new(),
             est_bibliotheque: false,
+            typologie: "Other".to_string(),
             last_agent: String::new(),
             last_time_created: String::new(),
             last_session_context_pct: String::new(),
