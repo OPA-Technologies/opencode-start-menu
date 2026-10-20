@@ -145,6 +145,29 @@ pub(crate) fn ecrire_constantes(
     Ok(true)
   }
 
+/// Valeur littérale de la constante `nom` déclarée dans le contenu, si elle est
+/// déclarée avec un littéral `"..."`. `None` sinon (absente, ou valeur calculée).
+///
+/// Sert à préserver une constante existante (par ex. `DATE_LAST_MAJ`) quand on
+/// ne veut pas l'écraser.
+pub(crate) fn lire_constante(contenu: &str, nom: &str) -> Option<String>
+  {
+    for ligne in contenu.lines()
+      {
+        if !ligne_declare(ligne, nom)
+          {
+            continue;
+          }
+        let eq = ligne.find('=')?;
+        let apres = &ligne[eq + 1..];
+        let (_, reste) = decouper_espaces(apres);
+        let apres_q = reste.strip_prefix('"')?;
+        let fin = fin_litteral(apres_q)?;
+        return Some(apres_q[..fin].to_string());
+      }
+    None
+  }
+
 /// La constante `nom` est-elle déclarée dans le contenu ?
 fn contient_constante(contenu: &str, nom: &str) -> bool
   {

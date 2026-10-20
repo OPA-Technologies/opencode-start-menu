@@ -324,6 +324,14 @@ pub(crate) struct Project {
     last_compile_debug_secs: u64,
     #[serde(default)]
     last_compile_release_secs: u64,
+    /// Epoch secs du dernier mtime de cible `target/<profil>` pris en compte
+    /// pour un projet **sans sonde `-V` exploitable**. Sert de référence
+    /// anti-boucle : tant que le mtime de la cible n'a pas dépassé cette
+    /// valeur, la date de base n'est pas réécrite.
+    #[serde(default)]
+    last_target_debug_secs: u64,
+    #[serde(default)]
+    last_target_release_secs: u64,
     // Champ historique (uniquement pour migrer les anciens registres).
     #[serde(default)]
     last_compile_secs: u64,
@@ -616,6 +624,10 @@ pub(crate) struct ProjectEntry {
     /// variante (mtimes de target/debug et target/release). 0 = jamais.
     pub(crate) last_compile_debug_secs: u64,
     pub(crate) last_compile_release_secs: u64,
+    /// Epoch secs du dernier mtime de cible `target/<profil>` pris en compte
+    /// pour un projet sans sonde `-V` exploitable (référence anti-boucle).
+    pub(crate) last_target_debug_secs: u64,
+    pub(crate) last_target_release_secs: u64,
     /// Snapshots des métadonnées par variante, posés uniquement par un build
     /// validé (popup de détection, rattrapage, reconstruction documentée).
     /// La variante Release ne suit jamais le Debug : sans build release validé
@@ -675,7 +687,16 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
             // Une seule traversée pour l'ensemble des horodatages affichés :
             // global, target/debug, target/release et sources.
             let t = project_times(&dir);
-            let modified = t.overall.map(format_mod_time).unwrap_or_else(|| "—".to_string());
+            // « Modifié » suit la cible construite quand elle existe (Debug
+            // d'abord, Release ensuite), et l'ensemble du dossier sinon : la
+            // date affichée reste cohérente avec la vérité du projet, sans être
+            // noyée sous les fichiers de `.git` ou de `target/incremental`.
+            let modified = t
+                .debug
+                .or(t.release)
+                .or(t.overall)
+                .map(format_mod_time)
+                .unwrap_or_else(|| "—".to_string());
             let debug_modified = t
                 .debug
                 .map(format_mod_time)
@@ -774,6 +795,8 @@ pub(crate) fn load_registry(path: &Path) -> Result<Vec<ProjectEntry>> {
                 release_modified,
                 last_compile_debug_secs: last_debug_secs,
                 last_compile_release_secs: last_release_secs,
+                last_target_debug_secs: p.last_target_debug_secs,
+                last_target_release_secs: p.last_target_release_secs,
                 debug_snapshot: p.debug_snapshot.clone(),
                 release_snapshot: p.release_snapshot.clone(),
                 version_manually_edited: p.version_manually_edited,
@@ -2005,6 +2028,8 @@ fn garder_metadonnees(
     aligner_date!(date_release);
     aligner!(last_compile_debug_secs);
     aligner!(last_compile_release_secs);
+    aligner!(last_target_debug_secs);
+    aligner!(last_target_release_secs);
     aligner!(debug_snapshot);
     aligner!(release_snapshot);
   }
@@ -2098,6 +2123,8 @@ pub(crate) fn save_registry_full(
             build_release: p.build_release.clone(),
             last_compile_debug_secs: p.last_compile_debug_secs,
             last_compile_release_secs: p.last_compile_release_secs,
+            last_target_debug_secs: p.last_target_debug_secs,
+            last_target_release_secs: p.last_target_release_secs,
             debug_snapshot: p.debug_snapshot.clone(),
             release_snapshot: p.release_snapshot.clone(),
             // Ancien champ : remis à zéro après migration (géré par default).
@@ -2188,9 +2215,15 @@ pub(crate) fn reindex_from_disk(
         if name.is_empty() {
             return;
         }
-        let modified = last_modified(dir).unwrap_or_else(|| "—".to_string());
         let debug_time = variant_modified_time(dir, "debug");
         let release_time = variant_modified_time(dir, "release");
+        // « Modifié » suit la cible construite quand elle existe, l'ensemble du
+        // dossier sinon (voir `load_registry`).
+        let modified = debug_time
+            .or(release_time)
+            .or_else(|| last_modified_time(dir))
+            .map(format_mod_time)
+            .unwrap_or_else(|| "—".to_string());
         let debug_modified =
             debug_time.map(format_mod_time).unwrap_or_else(|| "jamais compilée".to_string());
         let release_modified =
@@ -2242,6 +2275,8 @@ pub(crate) fn reindex_from_disk(
             release_modified,
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            last_target_debug_secs: 0,
+            last_target_release_secs: 0,
             debug_snapshot: None,
             release_snapshot: None,
             version_manually_edited: false,
@@ -2353,10 +2388,6 @@ pub(crate) fn date_du_jour() -> String {
     chrono::Local::now().format("%d-%m-%Y").to_string()
 }
 
-fn last_modified(dir: &Path) -> Option<String> {
-    last_modified_time(dir).map(format_mod_time)
-}
-
 /// Quatre réponses pour une seule traversée de l'arborescence d'un projet.
 ///
 /// Chaque appel séparé à `last_modified_time` / `variant_modified` reparcourt
@@ -2438,6 +2469,17 @@ pub(crate) fn variant_modified(dir: &Path, profile: &str) -> Option<String> {
 pub(crate) fn variant_modified_time(dir: &Path, profile: &str) -> Option<std::time::SystemTime>
   {
     last_modified_time(&dir.join("target").join(profile))
+  }
+
+/// mtime de référence d'un projet pour l'affichage et le tri « Modifié » :
+/// la cible construite quand elle existe (Debug, puis Release), l'ensemble du
+/// dossier sinon. Aligné sur ce que `load_registry`/`reindex` posent dans
+/// `ProjectEntry::modified`.
+pub(crate) fn cible_modified_time(dir: &Path) -> Option<std::time::SystemTime>
+  {
+    variant_modified_time(dir, "debug")
+        .or_else(|| variant_modified_time(dir, "release"))
+        .or_else(|| last_modified_time(dir))
   }
 
 /// Date de modification la plus récente parmi les sources suivies par
@@ -2849,13 +2891,15 @@ mod tests
                 build_release: String::new(),
                 debug_modified: String::new(),
                 release_modified: String::new(),
-last_compile_debug_secs: 0,
-            last_compile_release_secs: 0,
-            debug_snapshot: None,
-            release_snapshot: None,
-            version_manually_edited: false,
-            source_hash: String::new(),
-            tarif_mode: default_tarif_mode(),
+                last_compile_debug_secs: 0,
+                last_compile_release_secs: 0,
+                last_target_debug_secs: 0,
+                last_target_release_secs: 0,
+                debug_snapshot: None,
+                release_snapshot: None,
+                version_manually_edited: false,
+                source_hash: String::new(),
+                tarif_mode: default_tarif_mode(),
                 tarif_manual: 0.0,
                 tarif_web_series: Vec::new(),
                 tarif_web_fetched_ms: 0,
@@ -2926,24 +2970,26 @@ last_compile_debug_secs: 0,
                     build_release: String::new(),
                     debug_modified: String::new(),
                     release_modified: String::new(),
-last_compile_debug_secs: 0,
-                last_compile_release_secs: 0,
-                debug_snapshot: None,
-                release_snapshot: None,
-                version_manually_edited: false,
-                source_hash: String::new(),
-                tarif_mode: default_tarif_mode(),
-                tarif_manual: 0.0,
-                tarif_web_series: Vec::new(),
-                tarif_web_fetched_ms: 0,
-                tarif_web_secteur: false,
-                tarif_web_pays: String::new(),
-                last_duree: String::new(),
-                total_duree: String::new(),
-                last_valorisation: String::new(),
-                total_valorisation: String::new(),
-                tarif_resume: String::new(),
-                est_bibliotheque: false,
+                    last_compile_debug_secs: 0,
+                    last_compile_release_secs: 0,
+                    last_target_debug_secs: 0,
+                    last_target_release_secs: 0,
+                    debug_snapshot: None,
+                    release_snapshot: None,
+                    version_manually_edited: false,
+                    source_hash: String::new(),
+                    tarif_mode: default_tarif_mode(),
+                    tarif_manual: 0.0,
+                    tarif_web_series: Vec::new(),
+                    tarif_web_fetched_ms: 0,
+                    tarif_web_secteur: false,
+                    tarif_web_pays: String::new(),
+                    last_duree: String::new(),
+                    total_duree: String::new(),
+                    last_valorisation: String::new(),
+                    total_valorisation: String::new(),
+                    tarif_resume: String::new(),
+                    est_bibliotheque: false,
             }],
             )
             .unwrap();
@@ -2989,6 +3035,8 @@ last_compile_debug_secs: 0,
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            last_target_debug_secs: 0,
+            last_target_release_secs: 0,
             debug_snapshot: None,
             release_snapshot: None,
             version_manually_edited: false,
@@ -3763,6 +3811,8 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            last_target_debug_secs: 0,
+            last_target_release_secs: 0,
             debug_snapshot: None,
             release_snapshot: None,
             version_manually_edited: false,
@@ -4075,6 +4125,8 @@ ILO:DF(1.0),FRA,A,EAR_EHRA_NB,SEX_T,ECO_ISIC4_J,CUR_TYPE_LCU,2025,20.0,,NB,CR,0,
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            last_target_debug_secs: 0,
+            last_target_release_secs: 0,
             debug_snapshot: None,
             release_snapshot: None,
             version_manually_edited: false,

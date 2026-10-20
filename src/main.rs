@@ -2609,23 +2609,35 @@ fn executer_maj_base(app: &mut App, id: &str) -> Result<()>
           return Ok(());
         };
     let obs = coherence::observer(&app.projects[idx]);
-    // Variante Debug : binaire s'il répond au contrat, sinon manifeste.
+    // Variante Debug : binaire s'il répond au contrat, sinon manifeste. La date
+    // vient du binaire ; à défaut d'un `-V`, la cible `target/debug` (mtime) est
+    // le dernier recours — c'est la seule vérité d'un projet non compilé.
     let (version_d, statut_d, date_d) = match &obs.debug
       {
         Some(e) if !e.version.is_empty() =>
           (e.version.clone(), e.statut.clone(), e.date.clone()),
-        _ => (obs.sources_version.clone(), String::new(), String::new()),
+        _ =>
+          (
+            obs.sources_version.clone(),
+            String::new(),
+            obs.cible_date_debug.clone().unwrap_or_default(),
+          ),
       };
-    if version_d.is_empty()
+    if version_d.is_empty() && date_d.is_empty()
       {
         anyhow::bail!("aucune version à aligner");
       }
-    // Variante Release : sonde ou fiche, jamais empruntée au Debug.
+    // Variante Release : sonde ou fiche, jamais empruntée au Debug. Sans `-V`,
+    // la cible `target/release` (mtime) prend le relais.
     let (version_r, statut_r, date_r) = match &obs.release
       {
         Some(e) if !e.version.is_empty() =>
           (e.version.clone(), e.statut.clone(), e.date.clone()),
-        _ => (String::new(), String::new(), String::new()),
+        _ => (
+            String::new(),
+            String::new(),
+            obs.cible_date_release.clone().unwrap_or_default(),
+        ),
       };
     registry::accepter_modification(format!("{id}:version_debug"));
     registry::accepter_modification(format!("{id}:status_debug"));
@@ -2634,13 +2646,20 @@ fn executer_maj_base(app: &mut App, id: &str) -> Result<()>
     registry::accepter_modification(format!("{id}:version_release"));
     registry::accepter_modification(format!("{id}:status_release"));
     let p = &mut app.projects[idx];
-    p.version_debug = version_d.clone();
-    // Le statut suit toujours la vérité sondée, y compris vers le vide :
-    // un statut obsolète ne doit pas survivre à un binaire qui ne le déclare
-    // plus.
-    p.status_debug = statut_d.clone();
-    p.version = version_d;
-    p.status = statut_d;
+    // Version/statut ne sont écrits que si une vérité les porte : un binaire
+    // `-V`, ou le manifeste. Sans rien de tel (projet sans code), la base
+    // garde ses valeurs — seule sa date suit la cible.
+    let debug_declare = obs.debug.is_some() || !obs.sources_version.is_empty();
+    if debug_declare
+      {
+        p.version_debug = version_d.clone();
+        // Le statut suit toujours la vérité sondée, y compris vers le vide :
+        // un statut obsolète ne doit pas survivre à un binaire qui ne le
+        // déclare plus.
+        p.status_debug = statut_d.clone();
+        p.version = version_d;
+        p.status = statut_d;
+      }
     if !version_r.is_empty()
       {
         p.version_release = version_r;
@@ -2903,11 +2922,36 @@ fn version_cible(entry: &registry::ProjectEntry) -> String
       }
   }
 
+/// Date à figer dans `DATE_LAST_MAJ` lors d'une conformisation.
+///
+/// Si `RELEASE` et `STATUT` du source portent déjà la cible, rien ne change :
+/// la date déjà déclarée est préservée (une conformisation ne périme pas un
+/// code qui n'a pas bougé). Sinon le source est réellement réécrit : la date
+/// prend celle du jour.
+fn date_conformisation(contenu: &str, version: &str, statut: &str) -> String
+  {
+    let deja_aligne = conformite::lire_constante(contenu, "RELEASE").as_deref() == Some(version)
+        && conformite::lire_constante(contenu, "STATUT").as_deref() == Some(statut);
+    if deja_aligne
+      {
+        conformite::lire_constante(contenu, "DATE_LAST_MAJ").unwrap_or_default()
+      }
+    else
+      {
+        aujourd_hui()
+      }
+  }
+
 /// Conforme le module principal d'un projet au contrat `-V`, puis reconstruit
 /// Debug pour que le binaire publié reflète le code corrigé.
 ///
 /// L'écriture est confinée au module principal : aucune autre source n'est
 /// touchée, et une bibliothèque (sans binaire) n'est jamais conforme.
+///
+/// `DATE_LAST_MAJ` n'est réécrite que si le source change réellement : une
+/// conformisation qui ne corrige rien (RELEASE et STATUT déjà alignés)
+/// préserve la date déjà déclarée. Une conformisation ne doit pas périmer la
+/// date d'un code qui n'a pas bougé.
 fn conformer_et_rebuild(app: &mut App, id: &str, statut: &str) -> Result<()>
   {
     let Some(idx) = app.projects.iter().position(|p| p.id == id)
@@ -2927,8 +2971,13 @@ fn conformer_et_rebuild(app: &mut App, id: &str, statut: &str) -> Result<()>
           anyhow::bail!("module principal introuvable (bibliothèque sans binaire ?)");
         };
     let contenu = fs::read_to_string(&module)?;
+    // Décidée par le source lui-même : si `RELEASE` porte déjà la version cible
+    // et `STATUT` le statut cible, corriger la date serait la seule écriture —
+    // or rien n'a changé, la date doit rester celle de la dernière vraie
+    // modification. On la réinjecte donc telle quelle.
+    let date = date_conformisation(&contenu, &version, statut);
     let (nouveau, modifie) =
-      conformite::conformer_constantes(&contenu, &version, statut, &aujourd_hui());
+      conformite::conformer_constantes(&contenu, &version, statut, &date);
     if modifie
       {
         write_atomic(&module, &nouveau)?;
@@ -4240,6 +4289,37 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
             // Modification de code détectée
             let baseline = entry.source_hash.is_empty();
             entry.source_hash = current_hash.clone();
+            // La modification du source vaut mise à jour des constantes : quand
+            // le module principal en porte, `DATE_LAST_MAJ` prend la date de la
+            // dernière modification du source (le fichier, pas le jour de
+            // détection — un rescan tardif ne doit pas antidater une modif
+            // ancienne). Les langages sans module Rust relèvent d'opencode.
+            let date_maj = registry::source_modified_time(&entry.path)
+                .map(registry::date_jj_mm_yyyy)
+                .unwrap_or_else(registry::date_du_jour);
+            let version_source = if entry.version_debug.is_empty()
+              {
+                entry.version.clone()
+              }
+            else
+              {
+                entry.version_debug.clone()
+              };
+            if !version_source.is_empty()
+                && conformite::ecrire_constantes(
+                    &entry.path,
+                    &version_source,
+                    &entry.status_debug,
+                    &date_maj,
+                )
+                .unwrap_or(false)
+              {
+                registry::accepter_modification(format!("{}:date_debug", entry.id));
+                entry.date_debug = date_maj.clone();
+                // Le hash suit la source réécrite : sans ce recalcul, le rescan
+                // suivant y verrait une modification de plus et rebumperait.
+                entry.source_hash = registry::compute_source_hash(&entry.path);
+            }
             // Constat documenté : une nouvelle compilation est détectée sur le
             // disque, la référence de compilation et le snapshot Debug suivent
             // le binaire (sa vérité). Le snapshot fige la version DEJA en
@@ -4387,6 +4467,13 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
                 ));
             }
           }
+        // Cible sans code : quand aucun binaire `-V` ne répond (projet sans
+        // source compilée, ou langage non couvert par la sonde), la date de
+        // base suit le mtime de la cible `target/<profil>`. Le binaire fait
+        // toujours foi quand il existe : on ne retombe sur le mtime qu'à
+        // défaut. Les deux champs epoch bornent la réécriture (anti-boucle).
+        maj_date_cible(entry, "debug");
+        maj_date_cible(entry, "release");
         t_autopatch += debut.elapsed();
         if signature_persistee(entry) != avant
           {
@@ -4461,6 +4548,61 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
     Ok(())
   }
 
+/// La date de base d'une variante suit la cible `target/<profil>` quand aucun
+/// binaire `-V` n'y répond : c'est le dernier recours, réservé aux projets dont
+/// la sonde ne dit rien (pas de code compilé, ou langage non couvert).
+///
+/// Le binaire fait d'abord foi : s'il répond au contrat `-V`, sa date est la
+/// vérité et le mtime est ignoré. Anti-boucle : l'epoch du mtime est mémorisé
+/// (`last_target_*_secs`), et la date n'est réécrite que si le mtime l'a
+/// dépassé.
+fn maj_date_cible(entry: &mut ProjectEntry, profil: &str)
+  {
+    // Un binaire sondable répond : c'est lui qui fait foi, pas le mtime.
+    if variante::lire_variante_avec_sonde(&entry.path, profil, entry.sonde(profil)).is_some()
+      {
+        return;
+      }
+    let Some(mtime) = registry::variant_modified_time(&entry.path, profil)
+      else
+        {
+          return;
+        };
+    let Ok(duree) = mtime.duration_since(std::time::UNIX_EPOCH)
+      else
+        {
+          return;
+        };
+    let secs = duree.as_secs();
+    let (date_actuelle, champ_secs) = if profil == "release"
+      {
+        (entry.date_release.clone(), entry.last_target_release_secs)
+      }
+    else
+      {
+        (entry.date_debug.clone(), entry.last_target_debug_secs)
+      };
+    let date = registry::date_jj_mm_yyyy(mtime);
+    if secs <= champ_secs && date == date_actuelle
+      {
+        return;
+      }
+    if profil == "release"
+      {
+        registry::accepter_modification(format!("{}:date_release", entry.id));
+        registry::accepter_modification(format!("{}:last_target_release_secs", entry.id));
+        entry.date_release = date;
+        entry.last_target_release_secs = secs;
+      }
+    else
+      {
+        registry::accepter_modification(format!("{}:date_debug", entry.id));
+        registry::accepter_modification(format!("{}:last_target_debug_secs", entry.id));
+        entry.date_debug = date;
+        entry.last_target_debug_secs = secs;
+      }
+  }
+
 /// Signature des champs persistés qu'un rescan peut modifier : sert à ne
 /// réécrire le registre que si quelque chose a réellement changé.
 fn signature_persistee(e: &ProjectEntry) -> String
@@ -4495,6 +4637,8 @@ fn signature_persistee(e: &ProjectEntry) -> String
       e.tarif_web_secteur.to_string(),
       e.last_compile_debug_secs.to_string(),
       e.last_compile_release_secs.to_string(),
+      e.last_target_debug_secs.to_string(),
+      e.last_target_release_secs.to_string(),
       e.version_manually_edited.to_string(),
       e.date_debug.clone(),
       e.date_release.clone(),
@@ -4584,7 +4728,7 @@ fn sort_projects(projects: &mut Vec<ProjectEntry>, order: SortOrder) {
         .map(|p| match order
           {
             SortOrder::Name => CleTri::Nom(p.name.to_lowercase()),
-            SortOrder::Modified => CleTri::Modifie(registry::last_modified_time(&p.path)),
+            SortOrder::Modified => CleTri::Modifie(registry::cible_modified_time(&p.path)),
           })
         .collect();
 
@@ -5019,6 +5163,8 @@ fn handle_creation_input(
                         release_modified: "jamais compilée".to_string(),
                         last_compile_debug_secs: 0,
                         last_compile_release_secs: 0,
+                        last_target_debug_secs: 0,
+                        last_target_release_secs: 0,
                         debug_snapshot: None,
                         release_snapshot: None,
                         version_manually_edited: false,
@@ -5284,14 +5430,15 @@ fn apply_edit(app: &mut App, state: &ProjectEditState) -> bool {
         let date = registry::date_du_jour();
         let _ = set_manifest_version(&p.path, &p.version_debug);
         // Un projet sans module Rust (ou non inscriptible) conserve son
-        // édition en base : l'écart sera exposé par la conformité.
+        // édition en base : l'écart sera exposé par la conformité. La date de
+        // base ne suit que si le module a réellement été réécrit.
         if conformite::ecrire_constantes(
             &p.path,
             &p.version_debug,
             &p.status_debug,
             &date,
         )
-        .is_ok()
+        .unwrap_or(false)
         {
             p.date_debug = date;
         }
@@ -6163,6 +6310,8 @@ mod tests
             release_modified: String::new(),
             last_compile_debug_secs: 0,
             last_compile_release_secs: 0,
+            last_target_debug_secs: 0,
+            last_target_release_secs: 0,
             debug_snapshot: None,
             release_snapshot: None,
             version_manually_edited: false,
@@ -7281,6 +7430,7 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
     fn l_edition_d_un_projet_sans_module_reste_en_base()
       {
         let mut app = app_avec_projet();
+        let date_avant = app.projects[0].date_debug.clone();
         let mut state = super::ProjectEditState::from_project(&app.projects[0], 0);
         state.pending_version = "3.1.4".to_string();
         state.pending_status = "Deprecated".to_string();
@@ -7288,7 +7438,110 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
         assert!(super::apply_edit(&mut app, &state));
         assert_eq!(app.projects[0].version_debug, "3.1.4");
         assert_eq!(app.projects[0].status_debug, "Deprecated");
+        // Aucune source réécrite : la date de base ne bouge pas (elle ne prend
+        // pas la date du jour comme si le module avait été retouché).
+        assert_eq!(
+          app.projects[0].date_debug, date_avant,
+          "sans module écrit, la date de base ne bouge pas"
+        );
       }
+
+    /// La date de base d'une variante suit le mtime de `target/<profil>` quand
+    /// aucun binaire `-V` ne répond : dernier recours pour un projet dont la
+    /// sonde ne dit rien.
+    #[test]
+    fn maj_date_cible_suit_le_mtime_sans_binaire()
+      {
+        let dir = temp_dir("maj-date-cible");
+        let projet = dir.join("projet");
+        fs::create_dir_all(projet.join("target/debug")).unwrap();
+        let mut p = entry("projet", "Projet", projet.clone());
+        super::maj_date_cible(&mut p, "debug");
+        let mtime = super::registry::variant_modified_time(&projet, "debug").unwrap();
+        assert_eq!(p.date_debug, super::registry::date_jj_mm_yyyy(mtime));
+        assert!(p.last_target_debug_secs > 0, "epoch du mtime mémorisé");
+        // Idempotent : un second passage ne réécrit rien.
+        let secs = p.last_target_debug_secs;
+        super::maj_date_cible(&mut p, "debug");
+        assert_eq!(p.last_target_debug_secs, secs);
+      }
+
+    /// Un binaire `-V` répondant au contrat couvre la cible : sa date fait foi,
+    /// le mtime est ignoré et la date de base ne suit pas le dossier.
+    #[test]
+    fn maj_date_cible_ignore_le_mtime_si_un_binaire_repond()
+      {
+        let dir = temp_dir("maj-date-cible-binaire");
+        let projet = dir.join("projet");
+        let cible = projet.join("target/debug/projet");
+        fs::create_dir_all(cible.parent().unwrap()).unwrap();
+        fs::write(&cible, "#!/bin/sh\necho \"2.0.0_Stable (05-05-2026)\"\n").unwrap();
+        let mut droits = fs::metadata(&cible).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            droits.set_mode(0o755);
+        }
+        fs::set_permissions(&cible, droits).unwrap();
+        let mut p = entry("projet", "Projet", projet.clone());
+        super::maj_date_cible(&mut p, "debug");
+        assert_eq!(p.date_debug, "", "le binaire fait foi, le mtime est ignoré");
+        assert_eq!(p.last_target_debug_secs, 0);
+      }
+
+    /// Une conformisation qui ne change rien au source (RELEASE et STATUT déjà
+    /// alignés) PRÉSERVE la `DATE_LAST_MAJ` du module : elle ne périme pas un
+    /// code qui n'a pas bougé.
+    #[test]
+    fn conformer_preserve_la_date_si_rien_ne_change()
+      {
+        let contenu = "const RELEASE: &str = \"1.0.0\";\n\
+            const STATUT: &str = \"Stable\";\n\
+            const DATE_LAST_MAJ: &str = \"01-01-2020\";\n\
+            fn main() {}\n";
+        assert_eq!(
+            super::date_conformisation(contenu, "1.0.0", "Stable"),
+            "01-01-2020",
+            "déjà aligné : la date du module est préservée",
+        );
+        assert_eq!(
+            super::date_conformisation(contenu, "2.0.0", "Stable"),
+            super::aujourd_hui(),
+            "version à corriger : le source est réécrit, date du jour",
+        );
+        assert_eq!(
+            super::date_conformisation(contenu, "1.0.0", "Release"),
+            super::aujourd_hui(),
+            "statut à corriger : date du jour",
+        );
+      }
+
+    /// Le tri « Modifié » s'aligne sur `target/debug` : un projet dont la cible
+    /// est ancienne passe derrière un projet à la cible récente, même si ses
+    /// sources hors cible sont récentes.
+    #[test]
+    fn le_tri_modifie_suit_la_cible_debug()
+      {
+        let dir = temp_dir("tri-modifie-cible");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::create_dir_all(a.join("target/debug")).unwrap();
+        fs::create_dir_all(b.join("target/debug")).unwrap();
+        // `a` : cible ancienne, source hors cible récente. `b` : cible récente.
+        reculer_mtime(&a.join("target/debug"), 3_600);
+        reculer_mtime(&b.join("target/debug"), 0);
+        fs::write(a.join("recent.txt"), "x").unwrap();
+        let ta = super::registry::cible_modified_time(&a).unwrap();
+        let tb = super::registry::cible_modified_time(&b).unwrap();
+        assert!(ta < tb, "la cible prime sur une source hors cible plus récente");
+      }
+
+    /// Recule (best effort) le mtime d'un chemin de `secs` secondes.
+    fn reculer_mtime(chemin: &Path, secs: u64) {
+        let Ok(f) = fs::File::open(chemin) else { return };
+        let instant = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let _ = f.set_modified(instant);
+    }
 
     /// Les commandes d'outils éditables (sonde et build, par variante) sont
     /// reportées sur le projet, rognées. Ce sont des réglages, pas des
@@ -8145,6 +8398,8 @@ fn hide_cursor(&mut self) -> std::io::Result<()> { self.0.hide_cursor().map_err(
                 release_modified: String::new(),
                 last_compile_debug_secs: 0,
                 last_compile_release_secs: 0,
+                last_target_debug_secs: 0,
+                last_target_release_secs: 0,
                 debug_snapshot: None,
                 release_snapshot: None,
                 version_manually_edited: false,

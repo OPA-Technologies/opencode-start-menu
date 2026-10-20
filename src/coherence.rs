@@ -76,6 +76,9 @@ pub(crate) enum Ecart
     BinaireHorsContrat { variante: Variante },
     /// Un statut déclaré n'appartient pas à la liste connue d'op.
     StatutHorsListe { variante: Variante, statut: String },
+    /// Une cible `target/<profil>` existe mais ne répond pas au contrat `-V` :
+    /// sa vérité est alors son mtime. La date de base ne le suit pas.
+    DateCibleDesynchronisee { variante: Variante, base: String, cible: String },
   }
 
 impl Ecart
@@ -101,6 +104,8 @@ impl Ecart
               format!("hors-contrat:{}", variante.profil()),
             Ecart::StatutHorsListe { variante, statut } =>
               format!("statut:{}:{statut}", variante.profil()),
+            Ecart::DateCibleDesynchronisee { variante, base, cible } =>
+              format!("date-cible:{}:{base}->{cible}", variante.profil()),
           }
       }
 
@@ -117,6 +122,7 @@ impl Ecart
             Ecart::FicheBuildPerimee { .. } => Action::MajBase,
             Ecart::BinaireHorsContrat { .. } => Action::ConformerCode,
             Ecart::StatutHorsListe { .. } => Action::CorrigerStatut,
+            Ecart::DateCibleDesynchronisee { .. } => Action::MajBase,
           }
       }
 
@@ -141,6 +147,11 @@ impl Ecart
               format!("le binaire {} ne publie pas le contrat -V", variante.libelle()),
             Ecart::StatutHorsListe { variante, statut } =>
               format!("statut {} inconnu (« {statut} »)", variante.libelle()),
+            Ecart::DateCibleDesynchronisee { variante, base, cible } =>
+              format!(
+                "la date {} de la base ({base}) ne suit pas la cible ({cible})",
+                variante.libelle()
+              ),
           }
       }
 
@@ -158,7 +169,8 @@ impl Ecart
           Ecart::ReleaseDivergeDeBase { .. } => Some(Variante::Release),
           Ecart::FicheBuildPerimee { variante }
           | Ecart::BinaireHorsContrat { variante }
-          | Ecart::StatutHorsListe { variante, .. } => Some(*variante),
+          | Ecart::StatutHorsListe { variante, .. }
+          | Ecart::DateCibleDesynchronisee { variante, .. } => Some(*variante),
           Ecart::DebugDivergeDeRelease { .. } => None,
         }
     }
@@ -248,6 +260,14 @@ pub(crate) struct Observations
     pub(crate) base_status_debug: String,
     pub(crate) base_version_release: String,
     pub(crate) base_status_release: String,
+    /// Date déclarée de la base par variante (`jj-mm-yyyy`).
+    pub(crate) base_date_debug: String,
+    pub(crate) base_date_release: String,
+    /// Vérité de la cible `target/<profil>` quand aucun binaire `-V` n'y
+    /// répond : sa date de dernière modification (`jj-mm-yyyy`). `None` si la
+    /// cible est absente, ou si un binaire sondable la couvre.
+    pub(crate) cible_date_debug: Option<String>,
+    pub(crate) cible_date_release: Option<String>,
   }
 
 /// Diagnostic de cohérence d'un projet.
@@ -298,6 +318,27 @@ fn etiquette(etat: &EtatVariante) -> String
 pub(crate) fn diagnostiquer(obs: &Observations) -> Diagnostic
   {
     let mut ecarts: Vec<Ecart> = Vec::new();
+
+    // Désynchronisation de date sur une cible sans `-V` : la cible existe mais
+    // ne publie pas le contrat, sa vérité est donc son mtime. Vaut même sans
+    // code (manifeste) : la cible est le seul fait disponible.
+    for (variante, base, cible) in [
+        (Variante::Debug, &obs.base_date_debug, &obs.cible_date_debug),
+        (Variante::Release, &obs.base_date_release, &obs.cible_date_release),
+      ]
+      {
+        if let Some(c) = cible
+            && !c.is_empty()
+            && base != c
+          {
+            ecarts.push(Ecart::DateCibleDesynchronisee {
+                variante,
+                base: base.clone(),
+                cible: c.clone(),
+            });
+          }
+      }
+
     if !obs.a_du_code
       {
         return Diagnostic { ecarts };
@@ -428,15 +469,37 @@ pub(crate) fn diagnostiquer(obs: &Observations) -> Diagnostic
 pub(crate) fn observer(entry: &ProjectEntry) -> Observations
   {
     let a_du_code = entry.path.join("Cargo.toml").is_file();
-    if !a_du_code
-      {
-        return Observations::default();
-      }
     let secs = |t: std::time::SystemTime| {
         t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
     };
     let debug_mtime = registry::variant_modified_time(&entry.path, "debug").and_then(secs);
     let release_mtime = registry::variant_modified_time(&entry.path, "release").and_then(secs);
+
+    // Sans manifeste, seules les dates de cible (mtime, faute de `-V`) sont
+    // observables : c'est le dernier recours pour un projet non compilé.
+    if !a_du_code
+      {
+        let date_cible = |mtime: Option<u64>| {
+            mtime.map(|s| {
+                registry::date_jj_mm_yyyy(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s))
+            })
+        };
+        return Observations {
+            a_du_code,
+            base_date_debug: entry.date_debug.clone(),
+            base_date_release: entry.date_release.clone(),
+            cible_date_debug: date_cible(debug_mtime),
+            cible_date_release: date_cible(release_mtime),
+            debug_mtime,
+            release_mtime,
+            base_version: entry.version.clone(),
+            base_version_debug: entry.version_debug.clone(),
+            base_status_debug: entry.status_debug.clone(),
+            base_version_release: entry.version_release.clone(),
+            base_status_release: entry.status_release.clone(),
+            ..Observations::default()
+        };
+      }
 
     // État d'une variante : la fiche fait foi si elle décrit le binaire présent
     // (mtime égal) ; sinon on interroge le binaire.
@@ -474,6 +537,21 @@ pub(crate) fn observer(entry: &ProjectEntry) -> Observations
     };
 
     let sources_mtime = registry::source_modified_time(&entry.path).and_then(secs);
+    // Date de cible pour une variante sans `-V` : mtime, dernier recours.
+    let cible_date = |etat: &Option<EtatVariante>, mtime: Option<u64>| {
+        if etat.is_some()
+          {
+            None
+          }
+        else
+          {
+            mtime.map(|s| {
+                registry::date_jj_mm_yyyy(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s))
+            })
+          }
+    };
+    let cible_date_debug = cible_date(&debug, debug_mtime);
+    let cible_date_release = cible_date(&release, release_mtime);
     Observations {
         a_du_code,
         sources_version: entry.version.clone(),
@@ -491,6 +569,10 @@ pub(crate) fn observer(entry: &ProjectEntry) -> Observations
         base_status_debug: entry.status_debug.clone(),
         base_version_release: entry.version_release.clone(),
         base_status_release: entry.status_release.clone(),
+        base_date_debug: entry.date_debug.clone(),
+        base_date_release: entry.date_release.clone(),
+        cible_date_debug,
+        cible_date_release,
     }
   }
 
@@ -526,6 +608,10 @@ mod tests
             base_status_debug: "Release".to_string(),
             base_version_release: "1.0.0".to_string(),
             base_status_release: "Release".to_string(),
+            base_date_debug: "14-10-2026".to_string(),
+            base_date_release: "14-10-2026".to_string(),
+            cible_date_debug: None,
+            cible_date_release: None,
         }
       }
 
@@ -541,6 +627,48 @@ mod tests
       {
         let o = Observations { a_du_code: false, ..obs_projet_coherent() };
         assert!(diagnostiquer(&o).est_vide());
+      }
+
+    /// Une cible sans `-V` dont la date de base ne suit pas le mtime : l'écart
+    /// est exposé même sans code (manifeste) — la cible est le seul fait.
+    #[test]
+    fn une_cible_sans_contrat_desynchronise_la_date_de_base()
+      {
+        let o = Observations {
+            a_du_code: false,
+            base_date_debug: "01-01-2026".to_string(),
+            cible_date_debug: Some("02-01-2026".to_string()),
+            ..obs_projet_coherent()
+        };
+        let d = diagnostiquer(&o);
+        assert_eq!(
+            d.ecarts,
+            vec![Ecart::DateCibleDesynchronisee {
+                variante: Variante::Debug,
+                base: "01-01-2026".to_string(),
+                cible: "02-01-2026".to_string(),
+            }],
+        );
+        assert_eq!(d.actions(), vec![Action::MajBase]);
+      }
+
+    /// Un binaire `-V` couvre la cible : sa date fait foi, le mtime est ignoré
+    /// (pas d'écart de date de cible).
+    #[test]
+    fn un_binaire_au_contrat_annule_l_ecart_de_date_cible()
+      {
+        let o = Observations {
+            base_date_debug: "01-01-2026".to_string(),
+            cible_date_debug: None,
+            ..obs_projet_coherent()
+        };
+        assert!(!diagnostiquer(&o)
+            .ecarts
+            .contains(&Ecart::DateCibleDesynchronisee {
+                variante: Variante::Debug,
+                base: "01-01-2026".to_string(),
+                cible: "02-01-2026".to_string(),
+            }));
       }
 
     #[test]
@@ -748,6 +876,11 @@ mod tests
             Ecart::StatutHorsListe {
                 variante: Variante::Debug,
                 statut: "Zorglub".to_string(),
+            },
+            Ecart::DateCibleDesynchronisee {
+                variante: Variante::Debug,
+                base: "01-01-2026".to_string(),
+                cible: "02-01-2026".to_string(),
             },
         ];
         for e in ecarts
