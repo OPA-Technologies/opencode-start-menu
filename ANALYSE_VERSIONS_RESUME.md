@@ -59,6 +59,34 @@ Ex. `0.50.4_Stable (15-10-2026) · base 0.50.5_Terminée`. Concerné : `op -V
 7. Commandes d'outils éditables (sonde et build par variante) et
    reconstruction automatique (`lancer_build`).
 
+## Typologie (chantier 2)
+
+Champ `typologie` du registre, fermé : `Code-App | Code-Lib | Doc-Lib |
+Doc-office | Other`. Migré à la lecture par auto-détection (`src/` → `Code-*`,
+sinon `Other`). Choix dans l'édition `p` (onglet Projet, champ 7), sur le
+modèle du menu Statut. Il décide si op confie à opencode l'écriture des
+constantes (`Code-*`) ou se contente du mtime de cible.
+
+## Date universelle et cible (chantier 1)
+
+- **Volet 3** — `DATE_LAST_MAJ` n'est réécrite que si le source change
+  réellement : `date_conformisation` préserve la date si `RELEASE`/`STATUT`
+  sont déjà alignés ; le rescan date depuis le mtime source ; `maj_date_cible`
+  fait suivre la date de base au mtime de `target/<profil>` quand aucun `-V`
+  n'y répond (le binaire fait toujours foi).
+- **Volet 4** — 9ᵉ écart `DateCibleDesynchronisee` (action `MajBase`), exposé
+  même sans manifeste : la cible `target/<profil>` est le seul fait.
+- **`modified` et tri « Modifié »** alignés sur `target/debug` puis `release`
+  puis l'ensemble du dossier (`registry::cible_modified_time`).
+
+## Orchestration des constantes (chantier 2)
+
+opencode-start-menu est chef d'orchestre : Rust est réécrit directement par le
+menu, les autres langages sont délégués à opencode via une consigne ponctuelle
+(`OPENCODE_INSTRUCTION`), portée par le plugin `projects-starter.ts` et
+honorée aussi en Module/Bare. Le plugin déployé provient de
+`config/plugins/projects-starter.ts` (via `build/setup-config.sh`).
+
 ## Ancien document (obsolète)
 
 L'analyse d'origine portait sur `-V` renvoyant la version du manifeste et sur

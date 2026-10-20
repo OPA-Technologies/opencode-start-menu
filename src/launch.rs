@@ -49,15 +49,28 @@ fn report(status: std::process::ExitStatus) -> Result<()>
 /// Chemin emprunté par [`LaunchKind::Module`] : le répertoire n'a aucune
 /// session, rien donc à reprendre, mais `--root` doit continuer de
 /// fonctionner comme pour une reprise.
-fn lancer_sans_resume(dir: &Path, sudo: bool, project_dir: &str) -> Result<()>
+///
+/// `instruction`, quand elle est posée, est transmise via
+/// OPENCODE_INSTRUCTION : la session ouverte la reçoit comme mission.
+fn lancer_sans_resume(
+  dir: &Path,
+  sudo: bool,
+  project_dir: &str,
+  instruction: Option<&str>,
+) -> Result<()>
   {
     let status = if sudo
       {
-        let cmd = format!(
-          "cd {} && OPENCODE_PROJECT_DIR={} opencode-wrap",
+        let mut cmd = format!(
+          "cd {} && OPENCODE_PROJECT_DIR={}",
           shell_quote(&dir.to_string_lossy()),
           shell_quote(project_dir),
         );
+        if let Some(ins) = instruction
+          {
+            cmd.push_str(&format!(" OPENCODE_INSTRUCTION={}", shell_quote(ins)));
+          }
+        cmd.push_str(" opencode-wrap");
         Command::new("sudo")
           .args(["-i", "sh", "-c", &cmd])
           .status()
@@ -65,9 +78,13 @@ fn lancer_sans_resume(dir: &Path, sudo: bool, project_dir: &str) -> Result<()>
       }
     else
       {
-        Command::new("opencode-wrap")
-          .env("OPENCODE_PROJECT_DIR", project_dir)
-          .current_dir(dir)
+        let mut cmd = Command::new("opencode-wrap");
+        cmd.env("OPENCODE_PROJECT_DIR", project_dir);
+        if let Some(ins) = instruction
+          {
+            cmd.env("OPENCODE_INSTRUCTION", ins);
+          }
+        cmd.current_dir(dir)
           .status()
           .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?
       };
@@ -139,6 +156,13 @@ pub(crate) fn session_existante(db_path: &Path, dir: &Path) -> bool
 /// Vierge : `opencode-wrap` est lancé sans argument dans `dir` ; aucun résumé,
 /// aucune todo, aucune liste de projets, aucune session à rouvrir.
 ///
+/// `instruction` : mission ponctuelle confiée à opencode, transmise via
+/// OPENCODE_INSTRUCTION. Elle sert de chef d'orchestre aux constantes du
+/// contrat pour les projets dont le menu ne connaît pas le format (langages
+/// non-Rust) : la session ouvre puis exécute la consigne (réécrire RELEASE,
+/// STATUT, DATE_LAST_MAJ dans le format du langage). Honorée aussi en Module
+/// et Bare, où aucune session préalable n'existe.
+///
 /// Le wrapper `opencode-wrap` capture le % de contexte à la sortie d'opencode
 /// et l'enregistre dans la base SQLite pour l'affichage dans opencode-start-menu.
 pub(crate) fn run_launch_sequence(
@@ -146,6 +170,19 @@ pub(crate) fn run_launch_sequence(
   name: &str,
   dir: &Path,
   sudo: bool,
+) -> Result<()>
+  {
+    run_launch_sequence_avec(kind, name, dir, sudo, None)
+  }
+
+/// Variante de [`run_launch_sequence`] portant une instruction ponctuelle pour
+/// opencode (variable `OPENCODE_INSTRUCTION`).
+pub(crate) fn run_launch_sequence_avec(
+  kind: LaunchKind,
+  name: &str,
+  dir: &Path,
+  sudo: bool,
+  instruction: Option<&str>,
 ) -> Result<()>
   {
     // Verrou : indispensable dès qu'une session peut toucher le registre
@@ -171,12 +208,18 @@ pub(crate) fn run_launch_sequence(
     // Le wrapper capture le % contexte à la sortie et met à jour la DB.
     let dir_str = dir.to_string_lossy().to_string();
     let project_dir = dir_str.clone();
+    let instruction = instruction.filter(|i| !i.trim().is_empty());
 
     match kind
       {
         LaunchKind::Bare =>
           {
-            let status = Command::new("opencode-wrap")
+            let mut cmd = Command::new("opencode-wrap");
+            if let Some(ins) = instruction
+              {
+                cmd.env("OPENCODE_INSTRUCTION", ins);
+              }
+            let status = cmd
               .current_dir(dir)
               .status()
               .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?;
@@ -185,7 +228,7 @@ pub(crate) fn run_launch_sequence(
 
         // Aucune session à reprendre : même exécution qu'une session
         // vierge, mais le verrou est posé et `--root` reste honoré.
-        LaunchKind::Module => lancer_sans_resume(dir, sudo, &project_dir),
+        LaunchKind::Module => lancer_sans_resume(dir, sudo, &project_dir, instruction),
 
         LaunchKind::Resume =>
           {
@@ -204,12 +247,17 @@ pub(crate) fn run_launch_sequence(
               {
                 // Avec sudo, on passe le chemin du projet via variable d'environnement
                 // pour que le wrapper sache quelle session mettre à jour
-                let cmd = format!(
-                  "cd {} && OPENCODE_AUTO_RESUME={} OPENCODE_PROJECT_DIR={} opencode-wrap --continue",
+                let mut cmd = format!(
+                  "cd {} && OPENCODE_AUTO_RESUME={} OPENCODE_PROJECT_DIR={}",
                   shell_quote(&dir.to_string_lossy()),
                   shell_quote(&prompt),
                   shell_quote(&project_dir),
                 );
+                if let Some(ins) = instruction
+                  {
+                    cmd.push_str(&format!(" OPENCODE_INSTRUCTION={}", shell_quote(ins)));
+                  }
+                cmd.push_str(" opencode-wrap --continue");
                 Command::new("sudo")
                   .args(["-i", "sh", "-c", &cmd])
                   .status()
@@ -217,11 +265,15 @@ pub(crate) fn run_launch_sequence(
               }
             else
               {
-                Command::new("opencode-wrap")
-                  .env("OPENCODE_AUTO_RESUME", &prompt)
+                let mut cmd = Command::new("opencode-wrap");
+                cmd.env("OPENCODE_AUTO_RESUME", &prompt)
                   .env("OPENCODE_PROJECT_DIR", &project_dir)
-                  .arg("--continue")
-                  .current_dir(dir)
+                  .arg("--continue");
+                if let Some(ins) = instruction
+                  {
+                    cmd.env("OPENCODE_INSTRUCTION", ins);
+                  }
+                cmd.current_dir(dir)
                   .status()
                   .map_err(|e| anyhow!("échec du lancement d'opencode-wrap : {e}"))?
               };
@@ -350,5 +402,24 @@ mod tests
             "le chemin canonique doit être rapproché du chemin affiché"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Le plugin amorceur lit les deux variables que le menu émet : sans cette
+    /// correspondance, une consigne ponctuelle tomberait dans le vide.
+    #[test]
+    fn le_plugin_lit_les_deux_variables_du_menu() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/plugins/projects-starter.ts"
+        ))
+        .expect("la source du plugin est versionnée dans le dépôt");
+        assert!(
+            src.contains("OPENCODE_AUTO_RESUME"),
+            "le plugin doit honorer le résumé de relance"
+        );
+        assert!(
+            src.contains("OPENCODE_INSTRUCTION"),
+            "le plugin doit honorer la consigne ponctuelle"
+        );
     }
   }

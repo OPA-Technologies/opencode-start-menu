@@ -94,4 +94,15 @@ if [ -d "$REPO/config/skills" ]
     printf 'Skills déployés : config/skills -> skills\n'
   fi
 
+# --- Plugins --------------------------------------------------------------
+# Le plugin projects-starter amorce la session voulue par le menu (résumé de
+# relance via OPENCODE_AUTO_RESUME, consigne ponctuelle via
+# OPENCODE_INSTRUCTION) et affiche la liste des projets en lancement manuel.
+if [ -d "$REPO/config/plugins" ]
+  then
+    mkdir -p "$OPENCODE_CONF/plugins"
+    cp -a "$REPO/config/plugins/." "$OPENCODE_CONF/plugins/"
+    printf 'Plugins déployés : config/plugins -> plugins\n'
+  fi
+
 printf 'Déploiement terminé. Les prochaines sessions opencode relisent les règles.\n'
