@@ -594,30 +594,30 @@ pub(crate) fn fiche_pour_affichage(
     Some((fiche.version.clone(), fiche.statut.clone(), fiche.date.clone()))
   }
 
-/// Vérité binaire à afficher : priorise la fiche cohérente, sinon sonde si
-/// `sonder` est vrai (coût ponctuel, réservé aux affichages en ligne de
-/// commande — jamais au rendu TUI).
+/// Vérité binaire à afficher.
+///
+/// En ligne de commande (`sonder == true`) : lecture directe du binaire
+/// (`-V`) à chaque appel. Le registre ne sert qu'en complément d'affichage
+/// si les deux divergent.
+///
+/// En TUI : on n'affiche le snapshot que s'il décrit encore le binaire
+/// présent ; sinon « — » plutôt qu'une fiche périmée.
 pub(crate) fn affichage_variante_binaire(
   p: &registry::ProjectEntry,
   profil: &str,
   sonder: bool,
-  ) -> Option<(String, String, String)>
-  {
-    if let Some(v) = fiche_pour_affichage(p, profil)
-      {
-        return Some(v);
-      }
-    if !sonder
-      {
+) -> Option<(String, String, String)> {
+    if sonder {
+        let sonde_cmd = p.sonde(profil);
+        if let Some(lv) = variante::lire_variante(&p.path, profil, sonde_cmd) && !lv.etat.version.is_empty() {
+            return Some((lv.etat.version, lv.etat.statut, lv.etat.date));
+        }
+        // Sonde demandée mais pas de lecture contractuelle : rien d'affiché
+        // plutôt que de deviner depuis un cache potentiellement faux.
         return None;
-      }
-    let sonde_cmd = p.sonde(profil);
-    if let Some(lv) = variante::lire_variante_avec_sonde(&p.path, profil, sonde_cmd)
-      {
-        return Some((lv.etat.version, lv.etat.statut, lv.etat.date));
-      }
-    None
-  }
+    }
+    fiche_pour_affichage(p, profil)
+}
 
 // --- Édition de texte : les gestes standards viennent de `op-tui::edit`,
 // --- l'application ne fait que traduire les touches du terminal.
@@ -4569,58 +4569,39 @@ fn rescan_repertoire(app: &mut App, progress: &mut Progress) -> Result<()>
   }
 
 /// La date de base d'une variante suit la cible `target/<profil>` quand aucun
-/// binaire `-V` n'y répond : c'est le dernier recours, réservé aux projets dont
-/// la sonde ne dit rien (pas de code compilé, ou langage non couvert).
-///
-/// Le binaire fait d'abord foi : s'il répond au contrat `-V`, sa date est la
-/// vérité et le mtime est ignoré. Anti-boucle : l'epoch du mtime est mémorisé
-/// (`last_target_*_secs`), et la date n'est réécrite que si le mtime l'a
-/// dépassé.
+/// binaire `-V` n'y répond : dernier recours. Le binaire contractuel fait
+/// toujours foi.
 fn maj_date_cible(entry: &mut ProjectEntry, profil: &str)
   {
-    // Un binaire sondable répond : c'est lui qui fait foi, pas le mtime.
-    if variante::lire_variante_avec_sonde(&entry.path, profil, entry.sonde(profil)).is_some()
-      {
+    // Un binaire sondable répond : vérité contractuelle, on ne touche pas à la date.
+    if variante::lire_variante(&entry.path, profil, entry.sonde(profil)).is_some() {
         return;
-      }
-    let Some(mtime) = registry::variant_modified_time(&entry.path, profil)
-      else
-        {
-          return;
-        };
-    let Ok(duree) = mtime.duration_since(std::time::UNIX_EPOCH)
-      else
-        {
-          return;
-        };
+    }
+    let Some(mtime) = registry::variant_modified_time(&entry.path, profil) else {
+        return;
+    };
+    let Ok(duree) = mtime.duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
     let secs = duree.as_secs();
-    let (date_actuelle, champ_secs) = if profil == "release"
-      {
-        (entry.date_release.clone(), entry.last_target_release_secs)
-      }
-    else
-      {
-        (entry.date_debug.clone(), entry.last_target_debug_secs)
-      };
     let date = registry::date_jj_mm_yyyy(mtime);
-    if secs <= champ_secs && date == date_actuelle
-      {
-        return;
-      }
-    if profil == "release"
-      {
+    if profil == "release" {
+        if secs <= entry.last_target_release_secs && date == entry.date_release {
+            return;
+        }
         registry::accepter_modification(format!("{}:date_release", entry.id));
         registry::accepter_modification(format!("{}:last_target_release_secs", entry.id));
         entry.date_release = date;
         entry.last_target_release_secs = secs;
-      }
-    else
-      {
+    } else {
+        if secs <= entry.last_target_debug_secs && date == entry.date_debug {
+            return;
+        }
         registry::accepter_modification(format!("{}:date_debug", entry.id));
         registry::accepter_modification(format!("{}:last_target_debug_secs", entry.id));
         entry.date_debug = date;
         entry.last_target_debug_secs = secs;
-      }
+    }
   }
 
 /// Signature des champs persistés qu'un rescan peut modifier : sert à ne

@@ -82,6 +82,13 @@ pub(crate) fn lire_variante_avec_sonde(
       })
   }
 
+/// Lit la vérité d'une variante depuis son binaire. `None` si introuvable
+/// ou non contractuelle.
+pub(crate) fn lire_variante(dir: &Path, profil: &str, sonde: Option<&str>) -> Option<LectureVariante>
+  {
+    lire_variante_avec_sonde(dir, profil, sonde)
+  }
+
 /// Cible auto d'une variante : binaire Cargo, sinon artefact non-Cargo.
 ///
 /// Un projet sans manifeste (script, outil multi-langages) expose quand même
