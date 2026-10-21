@@ -596,27 +596,20 @@ pub(crate) fn fiche_pour_affichage(
 
 /// Vérité binaire à afficher.
 ///
-/// En ligne de commande (`sonder == true`) : lecture directe du binaire
-/// (`-V`) à chaque appel. Le registre ne sert qu'en complément d'affichage
-/// si les deux divergent.
-///
-/// En TUI : on n'affiche le snapshot que s'il décrit encore le binaire
-/// présent ; sinon « — » plutôt qu'une fiche périmée.
+/// - `sonder = true` (CLI, one-shot) : lecture directe du binaire (`-V`)
+/// - `sonder = false` (TUI) : lecture directe du binaire pour rester
+///   cohérent avec la réalité
 pub(crate) fn affichage_variante_binaire(
   p: &registry::ProjectEntry,
   profil: &str,
   sonder: bool,
 ) -> Option<(String, String, String)> {
-    if sonder {
-        let sonde_cmd = p.sonde(profil);
-        if let Some(lv) = variante::lire_variante(&p.path, profil, sonde_cmd) && !lv.etat.version.is_empty() {
-            return Some((lv.etat.version, lv.etat.statut, lv.etat.date));
-        }
-        // Sonde demandée mais pas de lecture contractuelle : rien d'affiché
-        // plutôt que de deviner depuis un cache potentiellement faux.
+    let prefer_cache = !sonder;
+    let v = variante::verite_variante(&p.path, profil, p.sonde(profil), prefer_cache)?;
+    if v.etat.version.is_empty() {
         return None;
     }
-    fiche_pour_affichage(p, profil)
+    Some((v.etat.version, v.etat.statut, v.etat.date))
 }
 
 // --- Édition de texte : les gestes standards viennent de `op-tui::edit`,

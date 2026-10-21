@@ -89,6 +89,72 @@ pub(crate) fn lire_variante(dir: &Path, profil: &str, sonde: Option<&str>) -> Op
     lire_variante_avec_sonde(dir, profil, sonde)
   }
 
+/// Source de vérité utilisée pour déterminer l'état d'une variante.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SourceVerite
+  {
+    /// Lu directement depuis le binaire via `-V` à la lecture.
+    Binaire,
+    /// Provenant d'un snapshot de build validé.
+    Snapshot,
+    /// Provenant du manifeste/registre en l'absence de binaire contractuel.
+    Manifeste,
+    /// Dernier recours (mtime de cible) pour projets sans contrat.
+    Mtime,
+  }
+
+/// Vérité d'une variante avec traçabilité de sa provenance.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct VeriteVariante
+  {
+    pub(crate) etat: EtatVariante,
+    pub(crate) source: SourceVerite,
+    /// Vrai si le cache/snapshot correspond toujours au binaire présent.
+    pub(crate) frais: bool,
+  }
+
+/// Lit la vérité d'une variante.
+///
+/// - `prefer_cache=false` (CLI) : lit directement le binaire en priorité.
+/// - `prefer_cache=true` (TUI/affichage répété) : utilise un cache uniquement
+///   s'il est prouvé frais, sinon retombe sur la lecture du binaire.
+pub(crate) fn verite_variante(
+  dir: &Path,
+  profil: &str,
+  sonde: Option<&str>,
+  prefer_cache: bool,
+) -> Option<VeriteVariante>
+  {
+    if !prefer_cache
+      {
+        // Lecture directe : le réel prime toujours
+        if let Some(lv) = lire_variante(dir, profil, sonde)
+            && !lv.etat.version.is_empty()
+          {
+            return Some(VeriteVariante {
+                etat: lv.etat,
+                source: SourceVerite::Binaire,
+                frais: true,
+            });
+          }
+        return None;
+      }
+    // En mode cache préférentiel, on tente d'abord la lecture binaire
+    // pour rester au plus près du réel quand le binaire a changé
+    if let Some(lv) = lire_variante(dir, profil, sonde)
+        && !lv.etat.version.is_empty()
+      {
+        return Some(VeriteVariante {
+            etat: lv.etat,
+            source: SourceVerite::Binaire,
+            frais: true,
+        });
+      }
+    None
+  }
+
 /// Cible auto d'une variante : binaire Cargo, sinon artefact non-Cargo.
 ///
 /// Un projet sans manifeste (script, outil multi-langages) expose quand même
